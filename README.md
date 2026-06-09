@@ -201,6 +201,9 @@ only reacts to a 401. See
   Registration (Pocket-ID, etc.)
 - **[Audit log](./docs/audit-log.md)**: reading, filtering, redacting,
   pruning
+- **[Recipe: Better Auth on Convex](./docs/recipes/better-auth.md)**:
+  opaque-token `resolveIdentity`, split-domain discovery, and browser
+  login continuation for `@convex-dev/better-auth` as the IdP
 - **[Testing](./docs/testing.md)**: convex-test patterns, identity
   injection, swappable authorizers
 
