@@ -1,0 +1,3 @@
+# Default owner for everything in the repo. Makes the ruleset's
+# require_code_owner_review actually route reviews instead of being a no-op.
+* @tfohlmeister

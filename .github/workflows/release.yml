@@ -24,6 +24,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Gated by the `release` environment: publishing requires manual
+    # approval from a required reviewer, so a stray or malicious tag
+    # push can't trigger an npm publish unattended.
+    environment: release
     permissions:
       contents: read
       id-token: write
