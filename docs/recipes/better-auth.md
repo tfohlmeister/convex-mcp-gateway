@@ -4,6 +4,11 @@
 the OAuth 2.1 / OIDC authorization server for the gateway via Better Auth's `mcp`
 plugin. Three things differ from the "validated JWT" default and need handling.
 
+> **See also:** This recipe uses Better Auth *directly* as the authorization
+> server. If you instead want the gateway to bridge browser clients to an
+> upstream IdP that lacks Dynamic Client Registration, see
+> [OAuth bridge mode](../oauth-bridge.md).
+
 ## 1. Access tokens are opaque → use `resolveIdentity`
 
 Better Auth's `mcp` / `oidcProvider` issues **opaque** access tokens (even with

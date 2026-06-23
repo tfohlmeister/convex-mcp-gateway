@@ -10,6 +10,11 @@ This is **opt-in**. The default ["dumb" pass-through mode](./authorization.md),
 where your `authorize` callback is the entire auth story, keeps
 working unchanged.
 
+> **See also:** Using [`@convex-dev/better-auth`](https://github.com/get-convex/better-auth)
+> directly as the authorization server (opaque tokens, split-domain discovery,
+> browser login continuation) is covered in the
+> [Better Auth recipe](./recipes/better-auth.md).
+
 ## What the bridge does
 
 ![OAuth bridge mode end-to-end flow](./diagrams/oauth-bridge.svg)
