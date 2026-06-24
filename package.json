@@ -55,8 +55,6 @@
     "test:watch": "vitest --typecheck --clearScreen false",
     "check": "pnpm run build:codegen && pnpm run typecheck && pnpm run test && pnpm run lint",
     "preversion": "pnpm install --frozen-lockfile && pnpm run build:clean && pnpm run test && pnpm run typecheck && pnpm run lint",
-    "alpha": "pnpm version prerelease --preid alpha && git push --follow-tags",
-    "release": "pnpm version patch && git push --follow-tags",
     "version": "prettier -w CHANGELOG.md && git add CHANGELOG.md"
   },
   "keywords": [

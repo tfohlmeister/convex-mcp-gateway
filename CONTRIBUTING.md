@@ -35,20 +35,21 @@ codegen step requires a running local backend.
 
 ## Releasing
 
-Versions are tag-driven: pushing `v<x.y.z>` to `main` triggers
-`.github/workflows/release.yml`, which builds and publishes to npm. Tags
-are produced by these scripts:
+Releases are automated with
+[release-please](https://github.com/googleapis/release-please). On every
+push to `main` it reads the Conventional Commits since the last release
+and maintains a "release PR" that bumps the version (`feat` minor, `fix`
+patch, `feat!` or `BREAKING CHANGE` major) and updates `CHANGELOG.md`.
 
-```sh
-pnpm run release            # bumps patch, tags, pushes
-pnpm run alpha              # bumps prerelease, tags as alpha, pushes
-```
+To cut a release, merge that PR. release-please then creates the
+`v<x.y.z>` tag and the GitHub release, and the publish job in
+`.github/workflows/release.yml` runs. That job is gated by the `release`
+environment, so a required reviewer still approves the publish. No version
+is hardcoded and there is no local release ceremony.
 
-Both run `preversion` first, which executes the full check pipeline so a
-broken release is impossible.
-
-Requires repo secret `NPM_TOKEN` with publish rights on the package's
-npm scope.
+Publishing uses npm Trusted Publishing (OIDC), so no `NPM_TOKEN` secret is
+needed. The Trusted Publisher is registered for workflow file
+`release.yml`.
 
 ## Tests
 
@@ -82,9 +83,12 @@ markdown render and the HTML wrapper before pushing.
 
 ## Commit messages
 
-Follow Conventional Commits where it fits, but don't agonize. The
-release tooling does not parse commit messages; readability for
-reviewers matters more than tag conformance.
+Follow [Conventional Commits](https://www.conventionalcommits.org): the
+prefix now drives the next version. `fix:` triggers a patch, `feat:` a
+minor, and `feat!:` or a `BREAKING CHANGE:` footer a major bump. Other
+types (`chore:`, `docs:`, `ci:`, `refactor:`) do not bump the version and
+are hidden from the changelog by default. Keep the subject readable;
+reviewers read it too.
 
 ## Pull requests
 
