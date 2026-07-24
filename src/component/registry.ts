@@ -13,6 +13,7 @@ const toolReturnValidator = v.object({
   inputSchema: v.any(),
   outputSchema: v.optional(v.any()),
   identityArg: v.optional(v.string()),
+  protocolMetadata: v.optional(v.any()),
   metadata: v.optional(v.any()),
 });
 

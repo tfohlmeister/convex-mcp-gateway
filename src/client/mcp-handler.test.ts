@@ -42,7 +42,17 @@ function createComponent() {
   } as unknown as ComponentApi;
 }
 
-function createCtx(component: ComponentApi) {
+type RegisteredTool = {
+  name: string;
+  description: string;
+  kind: "query" | "mutation" | "action";
+  functionHandle: string;
+  inputSchema: unknown;
+  outputSchema?: unknown;
+  protocolMetadata?: Record<string, unknown>;
+};
+
+function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
   let resourcesFingerprint: string | null = null;
   let resources: Array<{
     uri: string;
@@ -82,7 +92,7 @@ function createCtx(component: ComponentApi) {
           return null;
         }
         if (ref === component.registry.listTools) {
-          return [];
+          return tools;
         }
         if (ref === component.registry.listResources) {
           return resources;
@@ -234,7 +244,47 @@ async function readJson(response: Response) {
   };
 }
 
-describe("handleMcpRequest resources", () => {
+describe("handleMcpRequest metadata and resources", () => {
+  test("tools/list preserves registered protocol metadata", async () => {
+    const component = createComponent();
+    const protocolMetadata = {
+      title: "Get entity context",
+      annotations: { readOnlyHint: true },
+      _meta: { ui: { resourceUri: "ui://lonir/entity-context.html" } },
+      securitySchemes: [{ type: "oauth2", scopes: ["openid"] }],
+    };
+    const { ctx } = createCtx(component, [
+      {
+        name: "get_context",
+        description: "Read entity context",
+        kind: "query",
+        functionHandle: "function://get_context",
+        inputSchema: { type: "object" },
+        protocolMetadata,
+      },
+    ]);
+
+    const initialized = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        { id: 2, method: "tools/list" },
+        initialized.headers.get("mcp-session-id")!,
+      ),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(await readJson(response)).toMatchObject({
+      result: { tools: [{ name: "get_context", ...protocolMetadata }] },
+    });
+  });
+
   test("initialize returns instructions when initializeInstructions is set", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);

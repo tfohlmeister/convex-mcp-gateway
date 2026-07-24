@@ -67,6 +67,28 @@ describe("defineMcp* name validation", () => {
   });
 });
 
+describe("defineMcp* protocol metadata", () => {
+  test("retains protocol metadata for registration", () => {
+    const tool = (defineMcpQuery as unknown as (c: unknown) => unknown)({
+      name: "get_context",
+      description: "Read entity context",
+      fn: {},
+      args: {},
+      title: "Get entity context",
+      annotations: { readOnlyHint: true },
+      _meta: { ui: { resourceUri: "ui://lonir/entity-context.html" } },
+      securitySchemes: [{ type: "oauth2", scopes: ["openid"] }],
+    });
+
+    expect(tool).toMatchObject({
+      title: "Get entity context",
+      annotations: { readOnlyHint: true },
+      _meta: { ui: { resourceUri: "ui://lonir/entity-context.html" } },
+      securitySchemes: [{ type: "oauth2", scopes: ["openid"] }],
+    });
+  });
+});
+
 describe("defineMcp* identityArg (inputSchema + compile-time safety)", () => {
   type QueryRef<Args extends Record<string, unknown>> = FunctionReference<
     "query",

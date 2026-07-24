@@ -17,9 +17,11 @@ import {
   convexValidatorToJsonSchema,
   resourcePathFromWellKnownRequest,
   type McpCaller,
+  type McpToolAnnotations,
   type McpToolDefinition,
   type McpToolKind,
   type McpToolRegistration,
+  type McpToolSecurityScheme,
 } from "../shared.js";
 import {
   describeResourceProblem,
@@ -42,10 +44,12 @@ export type {
   McpAuthorizerDecision,
   McpAuthorizerHandler,
   McpCaller,
+  McpToolAnnotations,
   McpToolDefinition,
   McpToolFunctionReference,
   McpToolKind,
   McpToolRegistration,
+  McpToolSecurityScheme,
 } from "../shared.js";
 export type {
   HandleMcpRequestOptions,
@@ -245,6 +249,14 @@ interface McpToolConfigBase<
    * before dispatch, so the tool never runs unscoped.
    */
   identityArg?: McpCallerArgKeys<ArgsV>;
+  /** Optional display title advertised in `tools/list`. */
+  title?: string;
+  /** MCP behavior hints advertised in `tools/list`. */
+  annotations?: McpToolAnnotations;
+  /** Client-specific protocol metadata advertised in `tools/list`. */
+  _meta?: Record<string, unknown>;
+  /** Authentication schemes advertised in `tools/list`. */
+  securitySchemes?: McpToolSecurityScheme[];
   /**
    * Free-form metadata stored alongside the tool registration. The
    * component never inspects this; it is surfaced to the host's
@@ -312,6 +324,14 @@ function build<
       : {}),
     ...(config.identityArg !== undefined
       ? { identityArg: config.identityArg }
+      : {}),
+    ...(config.title !== undefined ? { title: config.title } : {}),
+    ...(config.annotations !== undefined
+      ? { annotations: config.annotations }
+      : {}),
+    ...(config._meta !== undefined ? { _meta: config._meta } : {}),
+    ...(config.securitySchemes !== undefined
+      ? { securitySchemes: config.securitySchemes }
       : {}),
     ...(config.metadata !== undefined ? { metadata: config.metadata } : {}),
   } as McpToolDefinition & { fn: Ref; kind: Kind };
@@ -683,6 +703,19 @@ async function syncDeclaredResourceTemplates(
   });
 }
 
+function toolProtocolMetadata(tool: McpToolRegistration) {
+  return {
+    ...(tool.title !== undefined ? { title: tool.title } : {}),
+    ...(tool.annotations !== undefined
+      ? { annotations: tool.annotations }
+      : {}),
+    ...(tool._meta !== undefined ? { _meta: tool._meta } : {}),
+    ...(tool.securitySchemes !== undefined
+      ? { securitySchemes: tool.securitySchemes }
+      : {}),
+  };
+}
+
 /**
  * Resolve a declarative tool list into the registry's row shape,
  * creating a `functionHandle` per tool. Shared by `register` and the
@@ -702,6 +735,7 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
         : {}),
+      protocolMetadata: toolProtocolMetadata(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
     })),
   );
@@ -723,6 +757,7 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
       inputSchema: tool.inputSchema ?? null,
       outputSchema: tool.outputSchema ?? null,
       identityArg: tool.identityArg ?? null,
+      protocolMetadata: toolProtocolMetadata(tool),
       metadata: tool.metadata ?? null,
     }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -817,6 +852,7 @@ export class McpGateway {
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
         : {}),
+      protocolMetadata: toolProtocolMetadata(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
     });
   }
