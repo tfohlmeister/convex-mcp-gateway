@@ -84,7 +84,7 @@
   <text x="240" y="252" fill="#52534e" font-size="11"
         font-family="ui-monospace, monospace">any</text>
   <text x="96" y="272" fill="#65655c" font-size="9"
-        font-family="ui-monospace, monospace" font-style="italic">host-defined: scopes · roles · public · auditArgs</text>
+        font-family="ui-monospace, monospace" font-style="italic">host-defined: scopes · roles · public · auditArgs · auditErrorMessage</text>
 
   <!-- ============================================================ -->
   <!-- Entity: config  (top-right, singleton)                       -->

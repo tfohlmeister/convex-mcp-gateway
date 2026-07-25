@@ -19,7 +19,7 @@ caller sees.
 | `identitySubject` | `string \| null` | Caller's `identity.subject` resolved by the host's `/mcp/` `httpAction`, or null for anonymous |
 | `durationMs` | `number` | Wall-clock time from dispatch start to finish |
 | `errorCode` | `number` (optional) | JSON-RPC code on `denied` / `error` outcomes |
-| `errorMessage` | `string` (optional) | Human-readable reason |
+| `errorMessage` | `string` (optional) | Human-readable reason; omitted for error outcomes when the tool sets `metadata.auditErrorMessage: false` |
 
 Two indexes are pre-built: `by_toolName` and `by_outcome`. The query
 helper iterates them; you don't need to add your own.
@@ -126,6 +126,25 @@ defineMcpMutation({
 For shape-preserving transformation (e.g. truncate a long string,
 hash a PII field), use `auditArgs: false` and write a richer summary
 into your own table.
+
+## Redacting error messages
+
+Tool errors are stored verbosely by default so operators can diagnose
+failures. If a tool can throw messages containing credentials or other
+sensitive values, set `metadata.auditErrorMessage` to `false`. The audit row
+still records `outcome: "error"` and `errorCode`, but omits `errorMessage`:
+
+```ts
+defineMcpMutation({
+  name: "secrets_import",
+  fn: api.secrets.import,
+  args: { blob: v.string() },
+  metadata: { auditErrorMessage: false },
+}),
+```
+
+This controls audit-table persistence only. The original exception still
+reaches the Convex deployment log and any configured log stream.
 
 ## Retention / pruning
 

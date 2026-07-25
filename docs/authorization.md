@@ -279,7 +279,10 @@ defineMcpMutation({
 ```
 
 The audit row still records who, when, outcome, and duration; only `args`
-is affected. See [audit-log.md](./audit-log.md) for the full audit schema.
+is affected. Set `metadata.auditErrorMessage: false` as well when a tool's thrown
+errors may contain secrets; this preserves the error outcome and code without
+persisting the error text. See [audit-log.md](./audit-log.md) for the full
+audit schema.
 
 ## Common pitfalls
 
