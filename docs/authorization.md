@@ -56,10 +56,14 @@ the JSON-RPC error to `-32001 Unauthorized` and adds a
 begin the OAuth flow). Anything else maps to `-32003 Forbidden` without
 discovery hints.
 
-If your callback **throws**, the gateway treats it as `-32603 Authorizer
-threw: ...` and writes an audit row with outcome `error`. Throw only for
-"the policy itself is broken" cases (DB unreachable, malformed config);
-for "user is not allowed" cases, return `{ allowed: false, reason }`.
+If your callback **throws**, the caller gets `-32603 Authorization check
+failed` and the gateway writes an audit row with outcome `error` holding
+the full `Authorizer threw: ...` text. The exception message never
+reaches the caller: it can quote a token, a signed URL, or an upstream
+response, and the caller is an LLM. Throw only for "the policy itself is
+broken" cases (DB unreachable, malformed config); for "user is not
+allowed" cases, return `{ allowed: false, reason }`, where `reason` is
+yours to write and does reach the caller verbatim.
 
 ## Two modes: `call` and `list`
 
@@ -289,10 +293,12 @@ audit schema.
 - **Forgetting to pass `authorize`.** `gateway.handleMcpRequest(ctx,
   request, { authorize })` is the only public entry point. Without the
   options object you'll get a TypeScript error at compile time.
-- **Throwing for "user error" cases.** The gateway treats authorize
-  throws as `-32603 Authorizer threw: ...` (audit outcome `error`)
-  because that signals "the policy itself is broken, retry won't help".
-  For "user not allowed", return `{ allowed: false, reason }` instead.
+- **Throwing for "user error" cases.** An authorize throw signals "the
+  policy itself is broken, retry won't help": the caller gets a generic
+  `-32603 Authorization check failed` with no explanation, and only the
+  audit row records why. For "user not allowed", return
+  `{ allowed: false, reason }` instead, so the caller learns something
+  actionable.
 - **Mode-sensitive logic that breaks tools/list.** If you write
   `if (mode === "list") return { allowed: false }` you'll hide all your
   tools from clients. Default visibility should match callability.

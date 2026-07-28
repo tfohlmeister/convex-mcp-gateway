@@ -165,6 +165,37 @@ When `resources/read` receives a URI:
    with `null`) is isolated and logged; it surfaces as an internal error
    (`-32603`) only if nothing else serves the URI.
 
+### What the caller is told when a read fails
+
+A thrown exception message never reaches the MCP client. The caller gets
+`-32603 Resource read failed`; the full text goes to the audit row and
+the Convex deployment log, both server-side. This mirrors what
+`dispatch.runTool` does for tools, and for the same reason: an accidental
+throw can quote a signed URL, an `Authorization` header, or an upstream
+response body, and the caller is an LLM that may relay it onward.
+
+To send a specific message to the caller on purpose, throw `ConvexError`:
+
+```ts
+defineMcpResource({
+  uri: "invoice://latest",
+  name: "Latest invoice",
+  read: async (ctx) => {
+    const invoice = await ctx.runQuery(api.invoices.latest, {});
+    if (!invoice) throw new ConvexError("No invoice for this account yet");
+    return [{ uri: "invoice://latest", text: JSON.stringify(invoice) }];
+  },
+});
+```
+
+Two things are deliberately still verbatim on the wire, because both are
+written by the gateway and name only a field, never your data:
+
+- descriptor/content contract violations (`resource.uri must be a
+  non-empty string`, `content item must include text or blob`), so a
+  provider bug stays diagnosable from the client
+- `Resource not found: <uri>`, which only echoes the URI the caller sent
+
 ### `uriTemplate` syntax (level 1)
 
 Only **RFC 6570 level-1** simple placeholders are supported:

@@ -146,6 +146,13 @@ defineMcpMutation({
 This controls audit-table persistence only. The original exception still
 reaches the Convex deployment log and any configured log stream.
 
+The MCP caller never saw that text to begin with: unexpected throws reach
+it as `Tool execution failed` (tools) or `Resource read failed`
+(resources), and a throwing authorize callback as `Authorization check
+failed`. Only a deliberate `ConvexError` is passed through verbatim. So
+the audit row and the deployment log are the two places the full text
+exists, and this option removes one of them.
+
 ## Retention / pruning
 
 The component does not prune the audit table on its own; the host

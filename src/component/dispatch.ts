@@ -1,8 +1,8 @@
-import { ConvexError, v } from "convex/values";
+import { v } from "convex/values";
 import type { FunctionHandle } from "convex/server";
 import { action, mutation } from "./_generated/server.js";
 import { api, internal } from "./_generated/api.js";
-import { mcpCallerValidator } from "../shared.js";
+import { isDeliberateConvexError, mcpCallerValidator } from "../shared.js";
 
 const dispatchResultValidator = v.union(
   v.object({ ok: v.literal(true), data: v.any() }),
@@ -142,17 +142,11 @@ export const runTool = action({
       // (e.g. "Invoice not found"). Anything else is treated as an
       // unexpected internal error and the wire gets a generic
       // message; the audit row still records the full text.
-      //
-      // The instanceof check covers the in-process case; the
-      // `name === "ConvexError"` fallback catches the case where the
-      // error crossed a Convex function boundary (ctx.runQuery /
-      // runMutation / runAction reconstruct the error with the
-      // proper `name` but the class identity can differ across
-      // module resolution boundaries inside convex-test).
-      const isConvexError =
-        err instanceof ConvexError ||
-        (err instanceof Error && err.name === "ConvexError");
-      const wireMessage = isConvexError ? fullMessage : "Tool execution failed";
+      // `isDeliberateConvexError` is shared with the host's resource
+      // paths so both classify errors the same way.
+      const wireMessage = isDeliberateConvexError(err)
+        ? fullMessage
+        : "Tool execution failed";
       wireError = { code: -32000, message: wireMessage };
       auditError = {
         code: -32000,

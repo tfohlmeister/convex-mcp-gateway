@@ -1555,7 +1555,10 @@ describe("authorize callback throws (end-to-end)", () => {
       error?: { code: number; message: string };
     };
     expect(callBody.error?.code).toBe(-32603);
-    expect(callBody.error?.message).toMatch(/Authorizer threw/);
+    // The caller learns the check failed, not why: the reason is
+    // `Authorizer threw: <exception text>` and stays server-side.
+    expect(callBody.error?.message).toBe("Authorization check failed");
+    expect(callBody.error?.message).not.toMatch(/Authorizer threw/);
 
     // The denial path writes an audit row with outcome "error".
     const entries = await t.run(async (ctx) =>
