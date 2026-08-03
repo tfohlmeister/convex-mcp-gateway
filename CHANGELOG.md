@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.6.0...v0.6.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* harden tool protocol metadata passthrough ([#16](https://github.com/tfohlmeister/convex-mcp-gateway/issues/16)) ([c5c6bbf](https://github.com/tfohlmeister/convex-mcp-gateway/commit/c5c6bbf4d282a8bcf991556dd1833caa18d31e98))
+* preserve tool protocol metadata ([#10](https://github.com/tfohlmeister/convex-mcp-gateway/issues/10)) ([6b1bde8](https://github.com/tfohlmeister/convex-mcp-gateway/commit/6b1bde812c041253109d87157a574792e939a21c))
+
 ## [0.6.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.5.0...v0.6.0) (2026-07-28)
 
 
