@@ -121,6 +121,42 @@ describe("dispatch.runTool", () => {
       username: "alice",
     });
   });
+
+  test("metadata.auditErrorMessage=false omits persisted error text", async () => {
+    const t = newTest();
+    await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(api.invoices.markPaid);
+      await ctx.runMutation(components.mcpGateway.registry.replaceTools, {
+        tools: [
+          {
+            name: "secret_failure",
+            description: "Demo of error-message redaction.",
+            kind: "mutation",
+            functionHandle: handle,
+            inputSchema: { type: "object" },
+            metadata: { auditErrorMessage: false },
+          },
+        ],
+      });
+    });
+
+    const result = await t.action(components.mcpGateway.dispatch.runTool, {
+      name: "secret_failure",
+      args: { id: "not-a-valid-invoice-id" },
+      auditIdentitySubject: null,
+    });
+    expect(result.ok).toBe(false);
+
+    const entries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, {
+        toolName: "secret_failure",
+      }),
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.outcome).toBe("error");
+    expect(entries[0]!.errorCode).toBe(-32000);
+    expect(entries[0]!.errorMessage).toBeUndefined();
+  });
 });
 
 // =================================================================
@@ -151,6 +187,42 @@ describe("dispatch.recordAuthDenial", () => {
       errorCode: -32001,
       errorMessage: "Unauthorized",
       identitySubject: null,
+    });
+  });
+
+  test("keeps denied reasons when auditErrorMessage is false", async () => {
+    const t = newTest();
+    await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(api.invoices.summary);
+      await ctx.runMutation(components.mcpGateway.registry.registerTool, {
+        name: "invoices_summary",
+        description: "Summarize invoices.",
+        kind: "query",
+        functionHandle: handle,
+        inputSchema: { type: "object" },
+        metadata: { auditErrorMessage: false },
+      });
+    });
+
+    await t.mutation(components.mcpGateway.dispatch.recordAuthDenial, {
+      name: "invoices_summary",
+      args: {},
+      auditIdentitySubject: null,
+      outcome: "denied",
+      errorCode: -32001,
+      errorMessage: "Unauthorized",
+      durationMs: 3,
+    });
+
+    const entries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, {
+        toolName: "invoices_summary",
+      }),
+    );
+    expect(entries[0]).toMatchObject({
+      outcome: "denied",
+      errorCode: -32001,
+      errorMessage: "Unauthorized",
     });
   });
 });
@@ -1483,7 +1555,10 @@ describe("authorize callback throws (end-to-end)", () => {
       error?: { code: number; message: string };
     };
     expect(callBody.error?.code).toBe(-32603);
-    expect(callBody.error?.message).toMatch(/Authorizer threw/);
+    // The caller learns the check failed, not why: the reason is
+    // `Authorizer threw: <exception text>` and stays server-side.
+    expect(callBody.error?.message).toBe("Authorization check failed");
+    expect(callBody.error?.message).not.toMatch(/Authorizer threw/);
 
     // The denial path writes an audit row with outcome "error".
     const entries = await t.run(async (ctx) =>
@@ -1495,6 +1570,60 @@ describe("authorize callback throws (end-to-end)", () => {
     expect(errorEntry).toBeDefined();
     expect(errorEntry?.errorCode).toBe(-32603);
     expect(errorEntry?.errorMessage).toMatch(/Authorizer threw/);
+  });
+
+  test("auditErrorMessage=false omits a throwing authorizer's error text", async () => {
+    const t = newTest();
+    await t.mutation(internal.mcp.registerDefaults, {});
+    await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(api.invoices.summary);
+      await ctx.runMutation(components.mcpGateway.registry.registerTool, {
+        name: "invoices_summary",
+        description: "Summarize invoices.",
+        kind: "query",
+        functionHandle: handle,
+        inputSchema: { type: "object" },
+        metadata: { auditErrorMessage: false },
+      });
+    });
+
+    const initRes = await t.fetch("/mcp-throws/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18" },
+      }),
+    });
+    const session = initRes.headers.get("mcp-session-id")!;
+    await t.fetch("/mcp-throws/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": session,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "invoices_summary", arguments: {} },
+      }),
+    });
+
+    const entries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, {
+        toolName: "invoices_summary",
+      }),
+    );
+    const errorEntry = entries.find((entry) => entry.outcome === "error");
+    expect(errorEntry).toMatchObject({ outcome: "error", errorCode: -32603 });
+    expect(errorEntry?.errorMessage).toBeUndefined();
   });
 
   test("tools/list against a throwing authorize drops every tool silently (logged)", async () => {

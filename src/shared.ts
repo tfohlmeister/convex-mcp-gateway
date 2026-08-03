@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import type { FunctionReference } from "convex/server";
 import type {
   GenericValidator,
@@ -218,6 +218,32 @@ export interface McpAuthorizerArgs {
 export interface McpAuthorizerDecision {
   allowed: boolean;
   reason?: string;
+}
+
+/**
+ * Is this a `ConvexError`, i.e. a message the host threw on purpose?
+ *
+ * The gateway treats `ConvexError` as the deliberate caller-facing
+ * channel: its message reaches the MCP client verbatim. Every other
+ * throw is an accident (a failed `fetch` quoting a signed URL, a driver
+ * error echoing a connection string) and only ever reaches the client
+ * as a generic message.
+ *
+ * The `instanceof` check covers the in-process case; the
+ * `name === "ConvexError"` fallback catches errors that crossed a Convex
+ * function boundary (`ctx.runQuery` / `runMutation` / `runAction`
+ * reconstruct the error with the proper `name`, but the class identity
+ * can differ across module resolution boundaries inside `convex-test`).
+ *
+ * Lives in `shared.ts` because the component (`dispatch.runTool`) and the
+ * host (`mcp-handler`'s resource paths) must classify errors identically;
+ * two copies of this predicate would be two chances to drift.
+ */
+export function isDeliberateConvexError(err: unknown): boolean {
+  return (
+    err instanceof ConvexError ||
+    (err instanceof Error && err.name === "ConvexError")
+  );
 }
 
 /**

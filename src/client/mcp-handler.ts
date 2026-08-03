@@ -1,6 +1,7 @@
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
   buildProtectedResourceMetadataUrl,
+  isDeliberateConvexError,
   parseAuthorizerDecision,
   type McpAuthorizerArgs,
   type McpAuthorizerDecision,
@@ -430,6 +431,27 @@ const FORBIDDEN = -32003;
 const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 
+/**
+ * What the MCP client is told when host code threw instead of returning
+ * a decision or declining cleanly.
+ *
+ * The gateway never puts an accidental exception message on the wire:
+ * a thrown error can quote a signed URL, an `Authorization` header, a
+ * provider response, or a connection string, and the caller is an LLM
+ * (often relaying to a third party). `dispatch.runTool` has always done
+ * this for tool execution; these constants extend the same rule to the
+ * authorize callbacks and the resource paths.
+ *
+ * The full text is not lost: it goes to the audit row and to the Convex
+ * deployment log, both server-side. Hosts that want a specific message
+ * to reach the caller throw `ConvexError`, the deliberate channel.
+ */
+const GENERIC_AUTHORIZER_ERROR = "Authorization check failed";
+const GENERIC_RESOURCE_READ_ERROR = "Resource read failed";
+const GENERIC_RESOURCE_LIST_ERROR = "Resource listing failed";
+const GENERIC_RESOURCE_TEMPLATES_LIST_ERROR =
+  "Resource template listing failed";
+
 function resolveCorsOrigin(
   cors: McpCorsOption | undefined,
   requestOrigin: string | null,
@@ -547,6 +569,37 @@ function isJsonRpcNotificationOrResponse(message: JsonRpcMessage): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * A violation of the gateway's own provider contract: a descriptor or a
+ * read result that doesn't match the MCP shape. The message is written
+ * here and names only the offending field, never host data, so it is
+ * safe to return to the caller (and telling a developer *which* field is
+ * wrong is the whole point). It gets its own class so the wire/audit
+ * split can tell it apart from an arbitrary host exception.
+ */
+class ResourceContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResourceContractError";
+  }
+}
+
+/**
+ * Split a thrown error into the text the audit row keeps and the text
+ * the MCP client is allowed to see. Mirrors what `dispatch.runTool` does
+ * for tool execution: a deliberate `ConvexError` passes through,
+ * everything else collapses to `generic`.
+ */
+function splitErrorText(
+  err: unknown,
+  generic: string,
+): { full: string; wire: string } {
+  const full = err instanceof Error ? err.message : String(err);
+  const deliberate =
+    isDeliberateConvexError(err) || err instanceof ResourceContractError;
+  return { full, wire: deliberate ? full : generic };
 }
 
 function sseEvent(id: number, payload: string): string {
@@ -1346,7 +1399,7 @@ async function handlePost(
         for (const resource of providerResources) {
           const problem = describeResourceProblem(resource);
           if (problem) {
-            throw new Error(
+            throw new ResourceContractError(
               `resources/list provider returned an invalid resource: ${problem}`,
             );
           }
@@ -1398,7 +1451,8 @@ async function handlePost(
         }
         body = jsonResultEnvelope(message.id, { resources });
       } catch (err) {
-        const messageText = err instanceof Error ? err.message : String(err);
+        const { full, wire } = splitErrorText(err, GENERIC_RESOURCE_LIST_ERROR);
+        console.error("[mcp-gateway] resources/list failed", err);
         if (shouldAuditResource(options.auditResources, "list")) {
           await safeRecordResourceAudit(ctx, component, {
             resourceOperation: "list",
@@ -1407,10 +1461,10 @@ async function handlePost(
             identitySubject: auditIdentitySubject,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
-            errorMessage: messageText,
+            errorMessage: full,
           });
         }
-        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, messageText);
+        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, wire);
       }
       break;
     }
@@ -1458,7 +1512,7 @@ async function handlePost(
         for (const template of byUriTemplate.values()) {
           const problem = describeResourceTemplateProblem(template);
           if (problem) {
-            throw new Error(
+            throw new ResourceContractError(
               `resources/templates/list provider returned an invalid template: ${problem}`,
             );
           }
@@ -1494,7 +1548,11 @@ async function handlePost(
         }
         body = jsonResultEnvelope(message.id, { resourceTemplates });
       } catch (err) {
-        const messageText = err instanceof Error ? err.message : String(err);
+        const { full, wire } = splitErrorText(
+          err,
+          GENERIC_RESOURCE_TEMPLATES_LIST_ERROR,
+        );
+        console.error("[mcp-gateway] resources/templates/list failed", err);
         if (shouldAuditResource(options.auditResources, "templatesList")) {
           await safeRecordResourceAudit(ctx, component, {
             resourceOperation: "templates_list",
@@ -1503,10 +1561,10 @@ async function handlePost(
             identitySubject: auditIdentitySubject,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
-            errorMessage: messageText,
+            errorMessage: full,
           });
         }
-        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, messageText);
+        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, wire);
       }
       break;
     }
@@ -1596,7 +1654,14 @@ async function handlePost(
             errorMessage: reason,
           });
         }
-        body = jsonErrorEnvelope(message.id, code, reason);
+        // Same split as the `tools/call` denial: a returned reason is
+        // host-authored and goes to the caller, a thrown one carries
+        // exception text and stays in the audit row above.
+        body = jsonErrorEnvelope(
+          message.id,
+          code,
+          resourceAuthz.threw ? GENERIC_AUTHORIZER_ERROR : reason,
+        );
         break;
       }
       try {
@@ -1606,7 +1671,12 @@ async function handlePost(
         // null; a throw must not be *more* powerful than declining, so we
         // isolate it, log it, and keep trying the remaining providers (then
         // the templates).
-        let providerError: string | null = null;
+        //
+        // Two texts per throw: `full` for the audit row, `wire` for the
+        // caller. They differ unless the provider threw ConvexError on
+        // purpose, so an accidental exception can't ship a signed URL or
+        // an upstream response body to the LLM.
+        let providerError: { full: string; wire: string } | null = null;
         const serveContents = async (contents: McpResourceContent[]) => {
           // Validate handler output before returning it. Invalid contents
           // are a provider bug; throw so the outer catch turns it into a
@@ -1615,7 +1685,7 @@ async function handlePost(
           // provider-decline that falls through to the next provider.)
           const problem = describeResourceContentsProblem(contents);
           if (problem) {
-            throw new Error(
+            throw new ResourceContractError(
               `resources/read provider returned invalid contents: ${problem}`,
             );
           }
@@ -1641,7 +1711,7 @@ async function handlePost(
           try {
             contents = await provider.read(ctx, { uri, identity });
           } catch (err) {
-            providerError = err instanceof Error ? err.message : String(err);
+            providerError = splitErrorText(err, GENERIC_RESOURCE_READ_ERROR);
             console.error(
               "[mcp-gateway] resource provider threw during resources/read",
               provider.name,
@@ -1672,7 +1742,7 @@ async function handlePost(
             try {
               contents = await provider.read(ctx, { uri, params, identity });
             } catch (err) {
-              providerError = err instanceof Error ? err.message : String(err);
+              providerError = splitErrorText(err, GENERIC_RESOURCE_READ_ERROR);
               console.error(
                 "[mcp-gateway] resource template threw during resources/read",
                 provider.template.uriTemplate,
@@ -1697,7 +1767,9 @@ async function handlePost(
           // served" (a real fault → INTERNAL_ERROR), so a bug isn't reported
           // to the client as a benign miss.
           const code = providerError ? INTERNAL_ERROR : INVALID_PARAMS;
-          const errorMessage = providerError ?? `Resource not found: ${uri}`;
+          // "Resource not found" is gateway-authored and safe either way;
+          // a provider throw splits into audit text and caller text.
+          const notFound = `Resource not found: ${uri}`;
           if (shouldAuditResource(options.auditResources, "read")) {
             await safeRecordResourceAudit(ctx, component, {
               resourceUri: uri,
@@ -1707,13 +1779,22 @@ async function handlePost(
               identitySubject: auditIdentitySubject,
               durationMs: Date.now() - start,
               errorCode: code,
-              errorMessage,
+              errorMessage: providerError?.full ?? notFound,
             });
           }
-          body = jsonErrorEnvelope(message.id, code, errorMessage);
+          body = jsonErrorEnvelope(
+            message.id,
+            code,
+            providerError?.wire ?? notFound,
+          );
         }
       } catch (err) {
-        const messageText = err instanceof Error ? err.message : String(err);
+        // Hard faults: invalid provider contents, a throwing audit path,
+        // anything the per-provider isolation above didn't catch. The
+        // caller gets a generic message, so log the cause here too, the
+        // audit row alone would make this hard to trace.
+        const { full, wire } = splitErrorText(err, GENERIC_RESOURCE_READ_ERROR);
+        console.error("[mcp-gateway] resources/read failed", uri, err);
         if (shouldAuditResource(options.auditResources, "read")) {
           await safeRecordResourceAudit(ctx, component, {
             resourceUri: uri,
@@ -1723,10 +1804,10 @@ async function handlePost(
             identitySubject: auditIdentitySubject,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
-            errorMessage: messageText,
+            errorMessage: full,
           });
         }
-        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, messageText);
+        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, wire);
       }
       break;
     }
@@ -1918,6 +1999,10 @@ async function handlePost(
           : /^unauth/i.test(reason)
             ? UNAUTHORIZED
             : FORBIDDEN;
+        // A returned `reason` is host-authored and meant for the caller;
+        // a thrown one is `Authorizer threw: <exception text>` and must
+        // not reach the wire. The audit row below keeps the full text.
+        const wireReason = threw ? GENERIC_AUTHORIZER_ERROR : reason;
         // Record the rejection in the audit log so operators see who
         // tried what and was denied (or what made the authorizer throw).
         try {
@@ -1956,19 +2041,24 @@ async function handlePost(
               requestUrl.origin,
               mcpPath,
             );
-            raw = new Response(jsonErrorEnvelope(message.id, code, reason), {
-              status: 401,
-              headers: {
-                "content-type": "application/json",
-                "www-authenticate": `Bearer resource_metadata="${metadataUrl}"`,
-                ...(issueSessionHeader ? { "mcp-session-id": sessionId } : {}),
+            raw = new Response(
+              jsonErrorEnvelope(message.id, code, wireReason),
+              {
+                status: 401,
+                headers: {
+                  "content-type": "application/json",
+                  "www-authenticate": `Bearer resource_metadata="${metadataUrl}"`,
+                  ...(issueSessionHeader
+                    ? { "mcp-session-id": sessionId }
+                    : {}),
+                },
               },
-            });
+            );
             body = "";
             break;
           }
         }
-        body = jsonErrorEnvelope(message.id, code, reason);
+        body = jsonErrorEnvelope(message.id, code, wireReason);
         break;
       }
 

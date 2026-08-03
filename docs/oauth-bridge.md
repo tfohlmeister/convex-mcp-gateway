@@ -64,6 +64,14 @@ const UPSTREAM_CLIENT_ID = "00000000-0000-0000-0000-000000000000";
 // distribution headaches). The host's `authorize` callback will see
 // `args.identity = { subject, claims }` for valid tokens, `null`
 // for anonymous/invalid.
+//
+// NOTE: if your IdP serves more than one client/resource, this is not
+// enough on its own: userinfo accepts ANY valid token from that IdP,
+// so a token minted for a different client could reach your tools. Add
+// a resource-audience binding (require your MCP resource URL in the
+// token's `aud`). See "Strict IdPs" under Pitfalls below. It is also
+// mandatory with Fosite-based IdPs (Pocket-ID 2.10+), whose
+// multi-audience tokens Convex JWT validation rejects outright.
 const resolveIdentity: McpIdentityResolver = async (token) => {
   const r = await fetch(`${UPSTREAM_ISSUER}/api/oidc/userinfo`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -250,14 +258,65 @@ doesn't help, claude.ai asks anyway. Don't bother filtering scopes
 to "fix" client behaviour; either the upstream issues an id_token or
 it doesn't.
 
-### RFC 8707 audience binding is best-effort
+### Strict IdPs (Fosite-based, e.g. Pocket-ID 2.10+): audience registration and multi-audience tokens
 
 MCP 2025-06-18 §6.4 wants tokens audience-bound to the MCP resource
-URL. Many IdPs (Pocket-ID 2.x, others) ignore the `resource`
-parameter and just set `aud: [client_id]`. Most clients we've tested
-accept that, but a strict client would reject it. Resolving this
-requires re-signing tokens at the bridge (with our own keys + JWKS),
-out of scope for now.
+URL. Older IdPs ignored the `resource` parameter and just set
+`aud: [client_id]`, which most clients accept. **Stricter OAuth stacks
+reversed this and break the flow in two places.** Pocket-ID 2.10
+migrated to the [Fosite](https://github.com/ory/fosite) library, which
+enforces RFC 8707:
+
+1. **`/authorize` rejects an unregistered `resource` with
+   `invalid_request`** ("The 'resource' or 'scope' parameter is
+   invalid"), *before* the user ever sees a login screen, so it looks
+   like discovery is broken. Fosite only accepts a `resource` value
+   that is a registered audience. In Pocket-ID: create an API
+   (Settings → APIs) whose audience equals your MCP resource URL, add
+   at least one permission to it, and grant that permission to the MCP
+   client on its "API access" tab (which stays greyed out at
+   `0 / 0 permissions` until the API has one). Without this, claude.ai
+   dies at discovery.
+
+2. **The issued access token then carries a MULTI-VALUED `aud`**,
+   typically `[<resource URL>, <issuer URL>]` (Fosite appends the
+   issuer as a second audience). This is the subtle one: Convex's
+   built-in JWT validation (`ctx.auth.getUserIdentity()` /
+   `auth.config.ts`) **hard-rejects any token that carries an audience
+   it does not trust.** It selects the provider whose `applicationID`
+   is in `aud`, then rejects the token because the *other* audience
+   (the issuer URL) is untrusted, with no config surface to whitelist
+   it. Result: every `/mcp` call 401s if you rely on Convex JWT
+   validation, even though the token is perfectly valid.
+
+   **Fix: resolve identity via `resolveIdentity` (userinfo), never via
+   Convex's `auth.config.ts`, with these IdPs.** userinfo ignores the
+   audience array, so it accepts the token. Bind to your resource
+   yourself, so a token minted for a *different* client at the same IdP
+   (whose `aud` lacks your resource URL) cannot be replayed to your
+   tools:
+
+   ```ts
+   const resolveIdentity: McpIdentityResolver = async (token) => {
+     // Bind to our resource: reject tokens whose aud does not include
+     // our MCP resource URL. The decode is unsigned; the userinfo call
+     // below is what proves signature + liveness.
+     if (!decodeAud(token).includes(MCP_RESOURCE)) return null;
+     const r = await fetch(`${UPSTREAM_ISSUER}/api/oidc/userinfo`, {
+       headers: { Authorization: `Bearer ${token}` },
+     });
+     if (!r.ok) return null;
+     const u = await r.json();
+     return { subject: u.sub, claims: u };
+   };
+   ```
+
+   The alternative, if you would rather not register an audience at the
+   IdP: strip the `resource` param in *both* your `/oauth/authorize`
+   and `/oauth/token` proxies so the token stays `aud: [client_id,
+   issuer]`, and bind on the client id instead. Either way, the
+   multi-audience token rules out Convex's `getUserIdentity()` as the
+   validation path for these IdPs.
 
 ### Pre-registering claude.ai's redirect URI
 

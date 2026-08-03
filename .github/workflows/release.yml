@@ -1,9 +1,13 @@
 name: Release
 
-# Publishes the package to npm whenever a tag matching `v*` is pushed.
-# Tags are produced by running `pnpm run release` (patch) or
-# `pnpm run alpha` (prerelease) locally; that script bumps the version,
-# commits, tags, and pushes.
+# Release automation via release-please.
+#
+# On every push to `main`, release-please reads the Conventional Commits
+# since the last release and maintains a "release PR" that bumps the version
+# (feat -> minor, fix -> patch, feat!/BREAKING CHANGE -> major) and updates
+# CHANGELOG.md. Merging that PR creates the GitHub release and the `vX.Y.Z`
+# tag, which flips `release_created` and runs the publish job below in the
+# same workflow run. No version is hardcoded; no local release ceremony.
 #
 # Authentication is via npm Trusted Publishing (OIDC), not NPM_TOKEN.
 # On npmjs.com -> package settings -> Trusted Publisher, register:
@@ -11,28 +15,48 @@ name: Release
 #   organization:     tfohlmeister
 #   repository:       convex-mcp-gateway
 #   workflow filename: release.yml
-# The `id-token: write` permission below lets npm verify the workflow
-# is the one configured as the trusted publisher; `--provenance` is
-# added automatically by `npm publish` under OIDC, but we set it
-# explicitly to be unambiguous.
+# The filename stays `release.yml`, so that config is unchanged. The
+# `id-token: write` permission on the publish job lets npm verify the
+# workflow; `--provenance` is set explicitly to be unambiguous.
+#
+# Prereleases (alpha/beta/rc) are not configured here; wire them through
+# release-please prerelease config if needed.
+
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+
+permissions: {}
 
 jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+
   publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Gated by the `release` environment: publishing requires manual
-    # approval from a required reviewer, so a stray or malicious tag
-    # push can't trigger an npm publish unattended.
+    # Gated by the `release` environment: publishing still requires manual
+    # approval from a required reviewer, even after the release PR is merged.
     environment: release
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
@@ -59,14 +83,5 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
-      - name: Detect prerelease tag
-        id: tag
-        run: |
-          if [[ "${GITHUB_REF_NAME}" =~ -(alpha|beta|rc) ]]; then
-            echo "tag=$(echo "$GITHUB_REF_NAME" | sed -E 's/.*-(alpha|beta|rc).*/\1/')" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish to npm
-        run: pnpm publish --no-git-checks --provenance --access public --tag ${{ steps.tag.outputs.tag }}
+        run: pnpm publish --no-git-checks --provenance --access public --tag latest

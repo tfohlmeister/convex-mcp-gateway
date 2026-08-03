@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.5.0...v0.6.0) (2026-07-28)
+
+
+### Features
+
+* redact sensitive tool error messages from audit logs ([10d4061](https://github.com/tfohlmeister/convex-mcp-gateway/commit/10d4061fd7692d1cff95b2ec5dcdbcced50a8556))
+
+
+### Bug Fixes
+
+* keep accidental exception text off the MCP wire ([407fad2](https://github.com/tfohlmeister/convex-mcp-gateway/commit/407fad22c261fb65a91a3ed3fbaaaf3377a22942))
+
 ## 0.5.0 (2026-06-24)
 
 ### Added

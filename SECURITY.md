@@ -5,7 +5,7 @@
 If you believe you have found a security vulnerability in
 `convex-mcp-gateway`, **please do not open a public GitHub issue**.
 
-Instead, email the maintainers at <thorben@fohlm.com> with:
+Instead, email the maintainers at <thorben@fohlmeister.com> with:
 
 - A description of the issue and its impact
 - Steps to reproduce, or a proof of concept

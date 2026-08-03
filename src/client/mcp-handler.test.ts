@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { ConvexError } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
   defineMcpResource,
@@ -774,6 +775,105 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(readCalls).toBe(0);
   });
 
+  test("a throwing authorizeResource keeps its exception text off the wire", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+    const resource = defineMcpResource({
+      uri: "docs://secret",
+      name: "Secret",
+      read: async () => [{ uri: "docs://secret", text: "secret" }],
+    });
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      resources: [resource],
+      authorizeResource: async () => {
+        throw new Error("scope lookup failed: bearer sk-live-abc123");
+      },
+      auditResources: { read: true },
+    };
+
+    const init = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/read",
+          params: { uri: "docs://secret" },
+        },
+        sessionId!,
+      ),
+      component,
+      options,
+    );
+
+    const body = await readJson(read);
+    expect(body).toMatchObject({
+      error: { code: -32603, message: "Authorization check failed" },
+    });
+    expect(JSON.stringify(body)).not.toContain("sk-live-abc123");
+    // Operators still get the full reason, server-side.
+    expect(state.resourceAuditEntries).toMatchObject([
+      {
+        resourceUri: "docs://secret",
+        outcome: "error",
+        errorCode: -32603,
+        errorMessage: expect.stringContaining("sk-live-abc123"),
+      },
+    ]);
+  });
+
+  test("a deliberate authorizeResource denial keeps its reason on the wire", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const resource = defineMcpResource({
+      uri: "docs://secret",
+      name: "Secret",
+      read: async () => [{ uri: "docs://secret", text: "secret" }],
+    });
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      resources: [resource],
+      authorizeResource: async () => ({
+        allowed: false,
+        reason: "Unauthorized: sign in first",
+      }),
+    };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+
+    const read = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/read",
+          params: { uri: "docs://secret" },
+        },
+        sessionId!,
+      ),
+      component,
+      options,
+    );
+
+    expect(await readJson(read)).toMatchObject({
+      error: { code: -32001, message: "Unauthorized: sign in first" },
+    });
+  });
+
   test("authorizeResource throw hides only that resource during resources/list", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
@@ -1053,7 +1153,7 @@ describe("handleMcpRequest metadata and resources", () => {
       uri: "docs://broken",
       name: "Broken",
       read: async () => {
-        throw new Error("read failed");
+        throw new Error("read failed: token=sk-live-abc123");
       },
     });
 
@@ -1085,8 +1185,55 @@ describe("handleMcpRequest metadata and resources", () => {
         resources: [resource],
       },
     );
+    // The caller gets the fault, not the exception text: a thrown
+    // message can quote credentials, and the caller is an LLM.
+    const body = await readJson(read);
+    expect(body).toMatchObject({
+      error: { code: -32603, message: "Resource read failed" },
+    });
+    expect(JSON.stringify(body)).not.toContain("sk-live-abc123");
+  });
+
+  test("a resource read handler's ConvexError still reaches the caller", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const resource = defineMcpResource({
+      uri: "docs://missing",
+      name: "Missing",
+      read: async () => {
+        throw new ConvexError("Document is archived");
+      },
+    });
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        resources: [resource],
+      },
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+
+    const read = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/read",
+          params: { uri: "docs://missing" },
+        },
+        sessionId!,
+      ),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        resources: [resource],
+      },
+    );
     expect(await readJson(read)).toMatchObject({
-      error: { code: -32603, message: "read failed" },
+      error: { code: -32603, message: "Document is archived" },
     });
   });
 
@@ -1492,9 +1639,10 @@ describe("handleMcpRequest metadata and resources", () => {
         auditResources: { read: true },
       },
     );
-    // A template throw is a real fault, not a "not found".
+    // A template throw is a real fault, not a "not found". The caller
+    // learns that much and no more; the audit row keeps the full text.
     expect(await readJson(read)).toMatchObject({
-      error: { code: -32603, message: "upstream weather API down" },
+      error: { code: -32603, message: "Resource read failed" },
     });
     expect(state.resourceAuditEntries).toMatchObject([
       {
@@ -1502,8 +1650,50 @@ describe("handleMcpRequest metadata and resources", () => {
         resourceOperation: "read",
         outcome: "error",
         errorCode: -32603,
+        errorMessage: "upstream weather API down",
       },
     ]);
+  });
+
+  test("resources/read: a template's ConvexError still reaches the caller", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const template = defineMcpResourceTemplate({
+      uriTemplate: "weather://{city}/current",
+      name: "Weather",
+      read: async () => {
+        throw new ConvexError("No station for that city");
+      },
+    });
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      resourceTemplates: [template],
+    };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+
+    const read = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/read",
+          params: { uri: "weather://london/current" },
+        },
+        sessionId!,
+      ),
+      component,
+      options,
+    );
+    expect(await readJson(read)).toMatchObject({
+      error: { code: -32603, message: "No station for that city" },
+    });
   });
 
   test("resources/read: a throwing template does not mask a later serving template", async () => {

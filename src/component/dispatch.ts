@@ -1,8 +1,8 @@
-import { ConvexError, v } from "convex/values";
+import { v } from "convex/values";
 import type { FunctionHandle } from "convex/server";
 import { action, mutation } from "./_generated/server.js";
 import { api, internal } from "./_generated/api.js";
-import { mcpCallerValidator } from "../shared.js";
+import { isDeliberateConvexError, mcpCallerValidator } from "../shared.js";
 
 const dispatchResultValidator = v.union(
   v.object({ ok: v.literal(true), data: v.any() }),
@@ -106,11 +106,11 @@ export const runTool = action({
     //     deliberate ConvexError, because tool authors can't be
     //     trusted to omit secrets from arbitrary thrown messages
     //     (e.g. fetch errors that quote URLs containing credentials).
-    //   - `audit`: what lands in the audit table. Always verbose,
-    //     operators need the full text to debug regressions, and the
-    //     audit table is server-side (no leak risk by default).
+    //   - `audit`: what lands in the audit table. Verbose by default,
+    //     but tools that can quote credentials or other sensitive values
+    //     may opt out of persisted error text with metadata.auditErrorMessage.
     let wireError: { code: number; message: string } | null = null;
-    let auditError: { code: number; message: string } | null = null;
+    let auditError: { code: number; message?: string } | null = null;
     try {
       const handle = tool.functionHandle as FunctionHandle<
         "query" | "mutation" | "action"
@@ -142,19 +142,16 @@ export const runTool = action({
       // (e.g. "Invoice not found"). Anything else is treated as an
       // unexpected internal error and the wire gets a generic
       // message; the audit row still records the full text.
-      //
-      // The instanceof check covers the in-process case; the
-      // `name === "ConvexError"` fallback catches the case where the
-      // error crossed a Convex function boundary (ctx.runQuery /
-      // runMutation / runAction reconstruct the error with the
-      // proper `name` but the class identity can differ across
-      // module resolution boundaries inside convex-test).
-      const isConvexError =
-        err instanceof ConvexError ||
-        (err instanceof Error && err.name === "ConvexError");
-      const wireMessage = isConvexError ? fullMessage : "Tool execution failed";
+      // `isDeliberateConvexError` is shared with the host's resource
+      // paths so both classify errors the same way.
+      const wireMessage = isDeliberateConvexError(err)
+        ? fullMessage
+        : "Tool execution failed";
       wireError = { code: -32000, message: wireMessage };
-      auditError = { code: -32000, message: fullMessage };
+      auditError = {
+        code: -32000,
+        ...(shouldAuditErrorMessage(tool) ? { message: fullMessage } : {}),
+      };
     }
 
     // Audit happens AFTER the handler resolves and OUTSIDE the tool's
@@ -170,7 +167,12 @@ export const runTool = action({
       identitySubject: request.auditIdentitySubject,
       durationMs: Date.now() - start,
       ...(auditError
-        ? { errorCode: auditError.code, errorMessage: auditError.message }
+        ? {
+            errorCode: auditError.code,
+            ...(auditError.message !== undefined
+              ? { errorMessage: auditError.message }
+              : {}),
+          }
         : {}),
     });
 
@@ -223,7 +225,11 @@ export const recordAuthDenial = mutation({
       identitySubject: request.auditIdentitySubject,
       durationMs: request.durationMs,
       errorCode: request.errorCode,
-      errorMessage: request.errorMessage,
+      ...(request.outcome !== "error" ||
+      tool === null ||
+      shouldAuditErrorMessage(tool)
+        ? { errorMessage: request.errorMessage }
+        : {}),
     });
     return null;
   },
@@ -321,3 +327,16 @@ async function safeRecordAudit(
 // authorize-callback return values without keeping two copies in sync.
 // Re-export keeps `dispatch.test.ts` and any host that imports it stable.
 export { parseAuthorizerDecision } from "../shared.js";
+
+/**
+ * Error text is persisted by default for backward compatibility. Sensitive
+ * tools can set `metadata.auditErrorMessage: false` to retain the outcome and
+ * error code without storing an exception message that may quote credentials.
+ */
+function shouldAuditErrorMessage(tool: RegisteredTool): boolean {
+  const meta = tool.metadata as
+    | { auditErrorMessage?: false | true }
+    | null
+    | undefined;
+  return meta?.auditErrorMessage !== false;
+}
