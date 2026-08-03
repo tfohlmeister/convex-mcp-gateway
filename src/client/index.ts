@@ -703,8 +703,16 @@ async function syncDeclaredResourceTemplates(
   });
 }
 
-function toolProtocolMetadata(tool: McpToolRegistration) {
-  return {
+/**
+ * Collect the client-facing protocol fields into the single column the
+ * registry stores. Returns `undefined` when the tool declares none, so
+ * the row stays free of an empty object and matches how every other
+ * optional field is written.
+ */
+function toolProtocolMetadata(
+  tool: McpToolRegistration,
+): Record<string, unknown> | undefined {
+  const protocolMetadata = {
     ...(tool.title !== undefined ? { title: tool.title } : {}),
     ...(tool.annotations !== undefined
       ? { annotations: tool.annotations }
@@ -714,6 +722,15 @@ function toolProtocolMetadata(tool: McpToolRegistration) {
       ? { securitySchemes: tool.securitySchemes }
       : {}),
   };
+  return Object.keys(protocolMetadata).length > 0
+    ? protocolMetadata
+    : undefined;
+}
+
+/** `toolProtocolMetadata` as a spreadable registry row fragment. */
+function protocolMetadataField(tool: McpToolRegistration) {
+  const protocolMetadata = toolProtocolMetadata(tool);
+  return protocolMetadata !== undefined ? { protocolMetadata } : {};
 }
 
 /**
@@ -735,7 +752,7 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
         : {}),
-      protocolMetadata: toolProtocolMetadata(tool),
+      ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
     })),
   );
@@ -757,7 +774,7 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
       inputSchema: tool.inputSchema ?? null,
       outputSchema: tool.outputSchema ?? null,
       identityArg: tool.identityArg ?? null,
-      protocolMetadata: toolProtocolMetadata(tool),
+      protocolMetadata: toolProtocolMetadata(tool) ?? null,
       metadata: tool.metadata ?? null,
     }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -852,7 +869,7 @@ export class McpGateway {
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
         : {}),
-      protocolMetadata: toolProtocolMetadata(tool),
+      ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
     });
   }

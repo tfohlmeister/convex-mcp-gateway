@@ -67,9 +67,18 @@ export interface McpToolAnnotations {
   [key: string]: unknown;
 }
 
-export type McpToolSecurityScheme =
-  | { type: "noauth"; [key: string]: unknown }
-  | { type: "oauth2"; scopes: string[]; [key: string]: unknown };
+/**
+ * A single entry of a tool's `securitySchemes`. The field is still a
+ * draft addition to the MCP Tool spec and the gateway only passes it
+ * through, so the shape stays open: `type` plus whatever the scheme
+ * carries (`scopes` for `oauth2`, nothing for `noauth`). Pinning the
+ * union here would reject schemes the spec adds later without buying
+ * any runtime safety.
+ */
+export interface McpToolSecurityScheme {
+  type: string;
+  [key: string]: unknown;
+}
 
 export interface McpToolDefinition {
   name: string;

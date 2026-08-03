@@ -2558,6 +2558,65 @@ describe("tool protocol metadata", () => {
     for (const key of ["title", "annotations", "_meta", "securitySchemes"]) {
       expect(listed).not.toHaveProperty(key);
     }
+
+    // ...and the row itself carries no empty `protocolMetadata` object,
+    // so a tool that declares nothing stores nothing.
+    const stored = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.registry.getTool, {
+        name: "invoices_list",
+      }),
+    );
+    expect(stored).not.toBeNull();
+    expect(stored).not.toHaveProperty("protocolMetadata");
+  });
+
+  test("protocol metadata cannot shadow the registry's own columns", async () => {
+    const t = newTest();
+    // Only reachable by calling the component mutation directly, where
+    // `protocolMetadata` is `v.any()` and the client-side whitelist in
+    // `toolProtocolMetadata` is bypassed. tools/list must still report
+    // the stored name and inputSchema, not the injected ones.
+    //
+    // Registered *after* initialize: initialize reconciles the declared
+    // catalog through replaceTools, which would drop this row again.
+    const session = await initialize(t);
+    await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(api.invoices.summary);
+      await ctx.runMutation(components.mcpGateway.registry.registerTool, {
+        name: "spoof_probe",
+        description: "the real description",
+        kind: "query",
+        functionHandle: handle,
+        inputSchema: { type: "object" },
+        protocolMetadata: {
+          title: "Probe",
+          name: "spoofed_tool",
+          description: "spoofed description",
+          inputSchema: { type: "string" },
+        },
+        metadata: { public: true },
+      });
+    });
+
+    const res = await rpc(t, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const body = (await res.json()) as {
+      result: { tools: Array<Record<string, unknown>> };
+    };
+    const listed = body.result.tools.find(
+      (tool) => tool.name === "spoof_probe",
+    );
+    expect(listed).toBeDefined();
+    expect(listed?.description).toBe("the real description");
+    expect(listed?.inputSchema).toEqual({ type: "object" });
+    // The one non-colliding key still passes through.
+    expect(listed?.title).toBe("Probe");
+    expect(
+      body.result.tools.find((tool) => tool.name === "spoofed_tool"),
+    ).toBeUndefined();
   });
 });
 

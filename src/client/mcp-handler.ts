@@ -1928,6 +1928,11 @@ async function handlePost(
         }
         if (decision.allowed) {
           visible.push({
+            // Spread first so the registry's own columns always win.
+            // `protocolMetadata` is stored as `v.any()`, so a caller
+            // reaching the component mutation directly could otherwise
+            // shadow `name` or `inputSchema` on the wire.
+            ...(tool.protocolMetadata ?? {}),
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema,
@@ -1937,7 +1942,6 @@ async function handlePost(
             ...(tool.outputSchema !== undefined
               ? { outputSchema: tool.outputSchema }
               : {}),
-            ...(tool.protocolMetadata ?? {}),
           });
         }
       }
