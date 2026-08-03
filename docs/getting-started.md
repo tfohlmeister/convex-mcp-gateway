@@ -131,12 +131,33 @@ defineMcpQuery({
 See [architecture.md → Identity propagation](./architecture.md#identity-propagation)
 for the full data flow.
 
+**Protocol metadata (optional)**: four fields go straight onto the tool
+entry in `tools/list`, so MCP clients see them:
+
+```ts
+defineMcpQuery({
+  name: "invoices_summary",
+  fn: api.invoices.summary,
+  args: {},
+  title: "Invoice summary",                  // human-readable label
+  annotations: { readOnlyHint: true },       // MCP behavior hints
+  _meta: { "example.com/category": "invoices" }, // client-specific data
+  securitySchemes: [{ type: "noauth" }],     // draft MCP spec, passthrough
+}),
+```
+
+The gateway stores these as one `protocolMetadata` object and never
+reads them. Omit a field and it does not appear on the wire.
+`securitySchemes` is not yet in the stable MCP Tool specification; the
+gateway passes it through unchanged for clients that track the draft.
+
 `defineMcp{Query,Mutation,Action}` validates `args` against
 `FunctionArgs<typeof fn>` at compile time. Passing the wrong validator or
 the wrong function kind is a type error, not a runtime surprise.
 
 `metadata` is host-defined free-form data. The gateway never inspects it;
 your authorize callback (step 4) reads it for public/role/scope checks.
+It stays server-side, unlike the four protocol fields above.
 
 **No manual registration step.** Because step 4 passes this array to
 `handleMcpRequest`, the registry is reconciled on `initialize` and again
@@ -144,6 +165,12 @@ whenever the list changes, you do not run anything by hand. The
 reconcile is change-detected: the list is fingerprinted and the registry
 is only rewritten when something actually changed, so an unchanged list
 costs a single cheap lookup per connect, not a rewrite.
+
+> **Upgrading.** The fingerprint now covers the protocol metadata
+> fields, so the first `initialize` after this upgrade sees a changed
+> fingerprint and rewrites the registry once, even if your tool list is
+> unchanged. This is a single extra mutation on the first connect. No
+> action is necessary.
 
 > **Imperative alternative.** If you'd rather populate the registry from
 > a mutation (dynamic/plugin catalogs), call `gateway.register(ctx,

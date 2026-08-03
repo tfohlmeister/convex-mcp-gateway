@@ -172,6 +172,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           metadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         } | null,
         Name
       >;
@@ -228,6 +229,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           metadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         }>,
         Name
       >;
@@ -270,6 +272,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           metadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         },
         string,
         Name
@@ -321,6 +324,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             metadata?: any;
             name: string;
             outputSchema?: any;
+            protocolMetadata?: any;
           }>;
         },
         null,

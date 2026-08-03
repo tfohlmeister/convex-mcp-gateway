@@ -385,6 +385,12 @@ type RegisteredTool = {
   inputSchema: unknown;
   outputSchema?: unknown;
   identityArg?: string;
+  protocolMetadata?: {
+    title?: string;
+    annotations?: unknown;
+    _meta?: unknown;
+    securitySchemes?: unknown;
+  };
   metadata?: unknown;
 };
 
@@ -1931,6 +1937,7 @@ async function handlePost(
             ...(tool.outputSchema !== undefined
               ? { outputSchema: tool.outputSchema }
               : {}),
+            ...(tool.protocolMetadata ?? {}),
           });
         }
       }

@@ -2453,6 +2453,115 @@ describe("declarative tools option (auto-sync on initialize)", () => {
 });
 
 // =================================================================
+// Tool protocol metadata (title / annotations / _meta /
+// securitySchemes). These run against the component's real argument
+// validators, unlike the mocked-component unit tests in
+// src/client/*.test.ts. Convex `v.object` rejects unknown fields, so a
+// field that reaches the registry write path without a matching
+// validator entry fails here and only here.
+// =================================================================
+describe("tool protocol metadata", () => {
+  const EXPECTED = {
+    title: "Invoice summary",
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    _meta: { "example.com/category": "invoices" },
+    securitySchemes: [{ type: "noauth" }],
+  };
+
+  test("declarative sync stores it and tools/list advertises it", async () => {
+    const t = newTest();
+    // No registerDefaults: initialize reconciles the declared catalog
+    // through replaceTools, the mutation whose validator must accept
+    // protocolMetadata.
+    const session = await initialize(t);
+
+    const res = await rpc(t, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const body = (await res.json()) as {
+      result: { tools: Array<{ name: string }> };
+    };
+    expect(body.result.tools).toEqual([
+      expect.objectContaining({ name: "invoices_summary", ...EXPECTED }),
+    ]);
+  });
+
+  test("imperative register stores it and tools/list advertises it", async () => {
+    const t = newTest();
+    // registerDefaults goes through gateway.register, a separate write
+    // path from the declarative sync above.
+    await t.mutation(internal.mcp.registerDefaults, {});
+    const session = await initialize(t);
+
+    const res = await rpc(t, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const body = (await res.json()) as {
+      result: { tools: Array<{ name: string }> };
+    };
+    expect(body.result.tools).toEqual([
+      expect.objectContaining({ name: "invoices_summary", ...EXPECTED }),
+    ]);
+  });
+
+  test("registerTool accepts protocolMetadata and getTool round-trips it", async () => {
+    const t = newTest();
+    // The single-tool mutation is reachable from gateway.registerTool
+    // and has its own argument validator, so it needs its own coverage.
+    const stored = await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(api.invoices.summary);
+      await ctx.runMutation(components.mcpGateway.registry.registerTool, {
+        name: "solo_tool",
+        description: "registered one at a time",
+        kind: "query",
+        functionHandle: handle,
+        inputSchema: { type: "object" },
+        protocolMetadata: EXPECTED,
+      });
+      return await ctx.runQuery(components.mcpGateway.registry.getTool, {
+        name: "solo_tool",
+      });
+    });
+
+    expect(stored?.protocolMetadata).toEqual(EXPECTED);
+  });
+
+  test("tools without protocol metadata stay free of the extra keys", async () => {
+    const t = newTest();
+    await t.mutation(internal.mcp.registerDefaults, {});
+    const tAdmin = t.withIdentity({
+      subject: "carol",
+      roles: ["finance.admin"],
+    } as unknown as Parameters<typeof t.withIdentity>[0]) as ReturnType<
+      typeof newTest
+    >;
+    const session = await initialize(tAdmin);
+
+    const res = await rpc(tAdmin, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const body = (await res.json()) as {
+      result: { tools: Array<Record<string, unknown>> };
+    };
+    const listed = body.result.tools.find(
+      (tool) => tool.name === "invoices_list",
+    );
+    expect(listed).toBeDefined();
+    // An empty protocolMetadata object must not leak `title: undefined`
+    // style keys onto the wire.
+    for (const key of ["title", "annotations", "_meta", "securitySchemes"]) {
+      expect(listed).not.toHaveProperty(key);
+    }
+  });
+});
+
+// =================================================================
 // Resources: the example mounts a concrete resource (invoices://summary),
 // an RFC 6570 template (invoice://{id}), a per-resource authorizer, opt-in
 // read audit, and the subscription capability. These exercise the full

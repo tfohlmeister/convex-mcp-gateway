@@ -58,6 +58,19 @@ export type JsonSchema =
 
 export type McpToolKind = "query" | "mutation" | "action";
 
+export interface McpToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+  [key: string]: unknown;
+}
+
+export type McpToolSecurityScheme =
+  | { type: "noauth"; [key: string]: unknown }
+  | { type: "oauth2"; scopes: string[]; [key: string]: unknown };
+
 export interface McpToolDefinition {
   name: string;
   description: string;
@@ -72,6 +85,10 @@ export interface McpToolDefinition {
    * `defineMcp{Query,Mutation,Action}`.
    */
   outputSchema?: JsonSchema;
+  title?: string;
+  annotations?: McpToolAnnotations;
+  _meta?: Record<string, unknown>;
+  securitySchemes?: McpToolSecurityScheme[];
   /**
    * Name of the tool function argument the gateway fills server-side
    * with the resolved caller identity (`{ subject, claims }`). When set:
