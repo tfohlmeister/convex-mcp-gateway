@@ -69,6 +69,13 @@ export const tools: McpToolRegistration[] = [
     // block in every tools/call response. Type-checked against
     // the Convex function's actual return type at compile time.
     returns: v.object({ total: v.float64() }),
+    // Client-facing protocol metadata: advertised verbatim on this
+    // tool in `tools/list`. Distinct from `metadata` below, which the
+    // client never sees.
+    title: "Invoice summary",
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    _meta: { "example.com/category": "invoices" },
+    securitySchemes: [{ type: "noauth" }],
     // The host's authorize callback in http.ts treats `public:
     // true` as the opt-in for unauthenticated calls.
     metadata: { public: true },

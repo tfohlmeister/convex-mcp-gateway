@@ -170,9 +170,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
-          protocolMetadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         } | null,
         Name
       >;
@@ -227,9 +227,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
-          protocolMetadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         }>,
         Name
       >;
@@ -270,9 +270,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
-          protocolMetadata?: any;
           name: string;
           outputSchema?: any;
+          protocolMetadata?: any;
         },
         string,
         Name
@@ -322,9 +322,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             inputSchema: any;
             kind: "query" | "mutation" | "action";
             metadata?: any;
-            protocolMetadata?: any;
             name: string;
             outputSchema?: any;
+            protocolMetadata?: any;
           }>;
         },
         null,

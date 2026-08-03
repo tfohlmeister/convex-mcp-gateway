@@ -105,13 +105,14 @@ cron if needed.
 When the host passes the declarative `tools` option to
 `handleMcpRequest`, the registry is reconciled on each `initialize`. The
 sync is change-detected: the gateway fingerprints the list (function
-names + schemas + metadata, no handle creation) and compares it against
-the `config.toolsFingerprint` stored at the last sync. On a match it does
-nothing, so the steady-state cost per connection is a single cheap
-lookup; only an actual change triggers the atomic `replaceTools`. A sync
-failure (e.g. a duplicate tool name) fails the `initialize` loudly and
-logs the cause. Hosts that prefer to register imperatively omit `tools`
-and call `gateway.register` from a mutation instead.
+names + schemas + protocol metadata + metadata, no handle creation) and
+compares it against the `config.toolsFingerprint` stored at the last
+sync. On a match it does nothing, so the steady-state cost per
+connection is a single cheap lookup; only an actual change triggers the
+atomic `replaceTools`. A sync failure (e.g. a duplicate tool name) fails
+the `initialize` loudly and logs the cause. Hosts that prefer to
+register imperatively omit `tools` and call `gateway.register` from a
+mutation instead.
 
 ## Request flow: `tools/call`
 
