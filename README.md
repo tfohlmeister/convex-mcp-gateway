@@ -224,10 +224,42 @@ When a tool input schema marks a string, safe integer, or boolean property
 with `x-mcp-header`, the matching `Mcp-Param-<name>` header must carry the
 same value; integers are compared numerically, so `42.0` matches `42`.
 Schemas that place this extension anywhere but a plain chain of `properties`
-keys are rejected at registration time, with the tool name in the error. The
-gateway does not resolve `$ref` or composition for routing headers.
+keys are rejected at registration time, with the tool name in the error.
 Base64-encoded routing headers must decode to at most 8 KiB of valid UTF-8
 without control characters.
+
+Tool schemas may use local `#/$defs/<name>` references: registration
+resolves them within hard budgets (traversal depth 64 — one unit per
+nesting level of the schema tree — 64 `$ref` expansions, and 64 KiB of
+UTF-8 in the resolved result; cycles rejected by name) and
+stores/advertises the **inlined**, self-contained schema, so clients
+never need `$ref` support and the runtime `Mcp-Param-*` walk sees exactly
+what registration validated. An `x-mcp-header` annotation authored behind
+such a reference therefore works, as long as it lands on a plain
+`properties` chain after inlining.
+
+Resolution is **reachability-driven**: definition containers (`$defs`,
+`definitions`) are pulled from only when referenced and dropped from the
+output, so an unused authoring artefact in a generated bundle — a
+self-referential type, a remote `$ref`, or simply many definitions —
+cannot fail a schema whose resolved form is fine, and the expansion
+budget counts only what ends up advertised. Everything else stays
+deliberately out: remote (`https:`) references are never fetched, `$ref`
+with adjacent keywords is rejected (2020-12 gives it `allOf` semantics,
+and composition is where static reachability ends), and annotations under
+`anyOf`/`oneOf`/`allOf` remain rejected because a branched value is not
+guaranteed present at its path.
+
+`$ref` counts as a reference only where a schema is expected, so
+reference-shaped values in data positions are not silently rewritten;
+once resolution runs, though, any reference that survives anywhere in the
+output is rejected by path rather than shipped dangling (its definitions
+are gone). Schemas with no schema-position reference are returned
+verbatim. Note that Convex rejects `$`-prefixed field names at the
+storage boundary, so a schema declaring a property literally named
+`$ref` is unstorable regardless of how this resolver treats it. Budget or
+resolution failures fail the registration/sync loudly with the tool
+named, never as a per-request error.
 
 ### Origin validation
 

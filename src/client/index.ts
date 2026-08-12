@@ -15,7 +15,9 @@ import type { ComponentApi } from "../component/_generated/component.js";
 import {
   buildResourceUrl,
   convexValidatorToJsonSchema,
+  resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
+  SCHEMA_RESOLVER_VERSION,
   type McpBeforeCallHandler,
   type McpCaller,
   type McpToolAnnotations,
@@ -83,7 +85,13 @@ export {
   buildResourceUrl,
   convexValidatorToJsonSchema,
   mcpCallerValidator,
+  resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
+  SCHEMA_MAX_REF_EXPANSIONS,
+  SCHEMA_MAX_RESOLVED_BYTES,
+  SCHEMA_MAX_STRUCTURAL_DEPTH,
+  SCHEMA_RESOLVER_VERSION,
+  type ResolvedJsonSchema,
 } from "../shared.js";
 
 export type RunQueryCtx = {
@@ -839,7 +847,9 @@ function protocolMetadataField(tool: McpToolRegistration) {
  */
 function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
   for (const tool of tools) {
-    const problem = describeToolHeaderSchemaProblem(tool.inputSchema);
+    const problem = describeToolHeaderSchemaProblem(
+      resolveToolSchemas(tool).inputSchema,
+    );
     if (problem) {
       throw new Error(
         `MCP tool "${tool.name}" has an invalid inputSchema: ${problem}.`,
@@ -848,17 +858,73 @@ function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
   }
 }
 
+type ResolvedToolSchemas = { inputSchema: unknown; outputSchema: unknown };
+
+/**
+ * Per-tool-object memo of the resolved schemas. A declarative `tools`
+ * array is a stable set of objects the host passes on every request, so
+ * keying on the tool object dedupes both the two resolutions per
+ * registration (`assertToolHeaderSchemas` + `resolveToolHandles`) and
+ * the repeat on every catalog sync, where `assertToolHeaderSchemas`
+ * runs ahead of the fingerprint short-circuit. `resolveJsonSchemaBounded`
+ * is pure over `inputSchema`/`outputSchema`, which never mutate on a
+ * registration object, so caching by identity is sound. A `WeakMap`
+ * lets one-off tool objects (imperative `registerTool`) be collected.
+ * Only successes are cached; an unresolvable schema throws (and takes
+ * the endpoint down until fixed), so recomputing that rare failure is
+ * fine.
+ */
+const resolvedSchemaCache = new WeakMap<object, ResolvedToolSchemas>();
+
+/**
+ * Resolve a tool's `inputSchema`/`outputSchema` within the bounded
+ * `$ref` budgets, failing loudly with the tool named. The RESOLVED
+ * input schema is what gets validated for `x-mcp-header` reachability,
+ * stored, and advertised: inlining at registration means the runtime
+ * `Mcp-Param-*` walk (which does not follow references) sees exactly
+ * what was validated here, so an annotation behind a `$ref` can never
+ * end up declared-but-silently-unenforced. Schemas without `$ref`s are
+ * returned verbatim. Memoized per tool object (see `resolvedSchemaCache`).
+ */
+function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
+  const cached = resolvedSchemaCache.get(tool);
+  if (cached !== undefined) return cached;
+
+  const input = resolveJsonSchemaBounded(tool.inputSchema);
+  if (input.problem !== undefined) {
+    throw new Error(
+      `MCP tool "${tool.name}" has an unresolvable inputSchema: ${input.problem}.`,
+    );
+  }
+  let resolved: ResolvedToolSchemas;
+  if (tool.outputSchema === undefined) {
+    resolved = { inputSchema: input.resolved, outputSchema: undefined };
+  } else {
+    const output = resolveJsonSchemaBounded(tool.outputSchema);
+    if (output.problem !== undefined) {
+      throw new Error(
+        `MCP tool "${tool.name}" has an unresolvable outputSchema: ${output.problem}.`,
+      );
+    }
+    resolved = { inputSchema: input.resolved, outputSchema: output.resolved };
+  }
+  resolvedSchemaCache.set(tool, resolved);
+  return resolved;
+}
+
 async function resolveToolHandles(tools: McpToolRegistration[]) {
   assertToolHeaderSchemas(tools);
   return await Promise.all(
-    tools.map(async (tool) => ({
+    tools.map(async (tool) => {
+      const schemas = resolveToolSchemas(tool);
+      return {
       name: tool.name,
       description: tool.description,
       kind: tool.kind,
       functionHandle: await createFunctionHandle(tool.fn as any),
-      inputSchema: tool.inputSchema,
-      ...(tool.outputSchema !== undefined
-        ? { outputSchema: tool.outputSchema }
+      inputSchema: schemas.inputSchema,
+      ...(schemas.outputSchema !== undefined
+        ? { outputSchema: schemas.outputSchema }
         : {}),
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
@@ -874,7 +940,8 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
         : {}),
       ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
-    })),
+      };
+    }),
   );
 }
 
@@ -912,7 +979,13 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
       metadata: tool.metadata ?? null,
     }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return JSON.stringify(normalized);
+  // The fingerprint is computed over AUTHORED schemas while the registry
+  // stores resolved ones, so a change in resolution semantics would
+  // otherwise produce an unchanged fingerprint and leave deployments
+  // advertising schemas resolved by the old rules indefinitely. Folding
+  // the resolver version in makes such a change self-healing: the next
+  // request re-syncs the catalog.
+  return JSON.stringify({ resolver: SCHEMA_RESOLVER_VERSION, normalized });
 }
 
 /**
@@ -1015,15 +1088,16 @@ export class McpGateway {
   ): Promise<void> {
     assertToolHeaderSchemas([tool]);
     assertNoImperativeBeforeCall([tool]);
+    const schemas = resolveToolSchemas(tool);
     const handle = await createFunctionHandle(tool.fn as any);
     await ctx.runMutation(this.component.registry.registerTool, {
       name: tool.name,
       description: tool.description,
       kind: tool.kind,
       functionHandle: handle,
-      inputSchema: tool.inputSchema,
-      ...(tool.outputSchema !== undefined
-        ? { outputSchema: tool.outputSchema }
+      inputSchema: schemas.inputSchema,
+      ...(schemas.outputSchema !== undefined
+        ? { outputSchema: schemas.outputSchema }
         : {}),
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }

@@ -203,12 +203,38 @@ metadata + metadata, no handle creation) and compares it against the
 nothing, so the steady-state cost is a single cheap lookup; only an
 actual change triggers the atomic `replaceTools`.
 
-A malformed catalog (a duplicate tool name, or an `x-mcp-header`
-annotation that isn't statically reachable through `properties`) fails
-the sync loudly and logs which list is at fault. That is deliberate:
-a declarative catalog is all-or-nothing, and silently dropping the
-offending tool is exactly the drift this API exists to prevent. It does
-mean one bad entry takes the endpoint down until the list is fixed.
+A malformed catalog (a duplicate tool name, an `x-mcp-header`
+annotation that isn't statically reachable through `properties`, or a
+schema whose local `$ref`s cannot be resolved within the bounded
+budgets: unknown or non-local references, cycles, adjacent keywords
+beside `$ref`, depth/expansion/size overruns, or a reference surviving in
+a position the resolver cannot inline) fails the sync loudly and
+logs which list is at fault. That is deliberate: a declarative catalog
+is all-or-nothing, and silently dropping the offending tool is exactly
+the drift this API exists to prevent. It does mean one bad entry takes
+the endpoint down until the list is fixed.
+
+Schema `$ref` resolution happens once, at registration: the registry
+stores and `tools/list` advertises the inlined, self-contained schema
+(schemas with no schema-position reference pass through verbatim).
+Inlining rather than passing `$ref` through is a security decision as
+much as a compatibility one: the runtime `Mcp-Param-*` header walk does
+not follow references, so storing the resolved schema guarantees an
+annotation validated at registration is the same one enforced per call,
+and clients that do not resolve references still get a usable schema.
+
+Two properties keep that honest. Resolution is reachability-driven —
+definition containers are consumed on demand and dropped from the
+output, so an unused definition (a recursive type or remote `$ref` in a
+generated bundle) can neither fail the catalog nor consume budget. And a
+position-independent post-walk scan rejects any reference that survives
+anywhere in the result, because the definitions it pointed at are gone;
+that check deliberately shares no keyword tables with the walker, since
+a check derived from the walker's own notion of "schema position" could
+never catch a position the walker overlooked. Because the fingerprint is
+computed over authored schemas, the resolver's version is folded into it,
+so changing resolution semantics re-syncs existing registries instead of
+leaving them advertising stale resolutions.
 
 Hosts that prefer to register imperatively omit `tools` and call
 `gateway.register` from a mutation instead; the same validation runs

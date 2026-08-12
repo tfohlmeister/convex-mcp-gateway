@@ -599,3 +599,372 @@ export function resourcePathFromWellKnownRequest(pathname: string): string {
   const rest = pathname.slice(prefix.length);
   return rest === "" ? "/" : rest;
 }
+
+// =================================================================
+// Bounded JSON Schema 2020-12 reference resolution
+// =================================================================
+
+/**
+ * Budgets for `resolveJsonSchemaBounded`. Hard limits with named
+ * errors: silently truncating a schema would advertise a contract the
+ * tool does not have, which is worse than rejecting it at registration.
+ */
+export const SCHEMA_MAX_STRUCTURAL_DEPTH = 64;
+export const SCHEMA_MAX_REF_EXPANSIONS = 64;
+export const SCHEMA_MAX_RESOLVED_BYTES = 64 * 1024;
+
+/**
+ * Version of the resolution semantics. Folded into the declarative
+ * catalog fingerprint so a change here re-syncs every registry that was
+ * written under the old rules, instead of leaving deployments
+ * advertising stale resolutions until someone edits a tool. Bump on any
+ * behavior change (new supported ref position, different budget
+ * accounting, changed drop rules).
+ */
+export const SCHEMA_RESOLVER_VERSION = 2;
+
+const LOCAL_DEFS_REF = /^#\/\$defs\/(.+)$/;
+
+/** JSON Pointer token unescape (RFC 6901): `~1` -> `/`, `~0` -> `~`. */
+function unescapeJsonPointerToken(token: string): string {
+  return token.replaceAll("~1", "/").replaceAll("~0", "~");
+}
+
+/**
+ * Keywords whose value is itself a schema. `$ref` handling is
+ * position-aware: an object key named `"$ref"` is only a reference when
+ * the object sits in a schema position; inside data keywords
+ * (`enum` / `const` / `default` / `examples`), inside unknown vendor
+ * keywords, or as a PROPERTY NAME under `properties`, it is plain data
+ * and must pass through untouched.
+ */
+const SCHEMA_VALUED_KEYWORDS = new Set([
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "contentSchema",
+  "else",
+  "if",
+  "items",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+]);
+/** Keywords whose value is a map of `name -> schema`. */
+const SCHEMA_MAP_KEYWORDS = new Set([
+  "dependentSchemas",
+  "patternProperties",
+  "properties",
+]);
+/** Keywords whose value is an array of schemas. */
+const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+/**
+ * Definition containers. Deliberately NOT walked as output positions:
+ * resolution is reachability-driven, so an entry is only resolved (and
+ * only charged against the expansion budget) when something actually
+ * references it. Walking them eagerly would let an unused authoring
+ * artefact in a generated bundle — a self-referential type, a remote
+ * `$ref`, or simply many definitions — fail a schema whose resolved
+ * form is perfectly fine, and a declarative sync is all-or-nothing.
+ */
+const DEFINITION_CONTAINER_KEYWORDS = new Set(["$defs", "definitions"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** UTF-8 byte length without `TextEncoder` (unavailable in some Convex runtimes). */
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      // Surrogate pair: 4 bytes total, consume the low surrogate too.
+      bytes += 4;
+      index += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/**
+ * Position-INDEPENDENT scan for a reference-shaped object anywhere in a
+ * resolved schema, returning its JSON path or `null`. This is the
+ * no-dangling-ref guard, and it deliberately does not share the keyword
+ * sets with the walker: a check built from the same sets is unreachable
+ * by construction (whatever the walker skips, the check would skip too),
+ * which is exactly how a `$ref` under an unhandled keyword could ship
+ * with its `$defs` already deleted.
+ */
+function findRefLikePath(node: unknown, path: string[] = []): string | null {
+  if (Array.isArray(node)) {
+    for (let index = 0; index < node.length; index += 1) {
+      const found = findRefLikePath(node[index], [...path, String(index)]);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (!isRecord(node)) return null;
+  if (typeof node.$ref === "string") {
+    return path.length === 0 ? "(root)" : path.join(".");
+  }
+  for (const [key, value] of Object.entries(node)) {
+    const found = findRefLikePath(value, [...path, key]);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * Position-aware detection: true only when a `$ref` keyword occurs at a
+ * SCHEMA position. `{ properties: { $ref: { type: "string" } } }`
+ * declares a field literally named `$ref` and contains no reference.
+ */
+function schemaContainsRef(schema: unknown): boolean {
+  if (!isRecord(schema)) return false;
+  if ("$ref" in schema) return true;
+  for (const [key, value] of Object.entries(schema)) {
+    // Definition containers are skipped on purpose: a schema whose only
+    // references live in unused definitions needs no resolution at all,
+    // and is returned verbatim with its containers (and therefore their
+    // references) intact.
+    if (DEFINITION_CONTAINER_KEYWORDS.has(key)) continue;
+    if (SCHEMA_VALUED_KEYWORDS.has(key)) {
+      // Accept the array form too (draft-07 `items`/`additionalItems`):
+      // whatever draft the client validates with, the author meant
+      // schemas, and detection must mirror expansion exactly.
+      if (Array.isArray(value)) {
+        if (value.some(schemaContainsRef)) return true;
+      } else if (schemaContainsRef(value)) {
+        return true;
+      }
+    }
+    if (SCHEMA_MAP_KEYWORDS.has(key) && isRecord(value)) {
+      for (const entry of Object.values(value)) {
+        if (schemaContainsRef(entry)) return true;
+      }
+    }
+    if (SCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)) {
+      if (value.some(schemaContainsRef)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Own-property assignment that survives keys like `"__proto__"`: a
+ * plain `out[key] = value` would hit the inherited accessor, which is a
+ * prototype-pollution hazard during the walk. This keeps the walk safe;
+ * it is NOT an end-to-end guarantee that such a field is storable,
+ * since Convex's own serialization drops a `__proto__` field (and
+ * rejects `$`-prefixed field names) at the storage boundary.
+ */
+function setOwn(
+  out: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): void {
+  Object.defineProperty(out, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+export type ResolvedJsonSchema =
+  | { resolved: unknown; problem?: undefined }
+  | { resolved?: undefined; problem: string };
+
+/**
+ * Resolve a tool schema's local `$ref`s within hard budgets, producing
+ * a self-contained schema suitable for storage and advertisement.
+ *
+ * The contract, deliberately narrow:
+ *
+ * - A schema with no `$ref` at any SCHEMA position is returned
+ *   **verbatim** (the same reference), so every schema that registers
+ *   today keeps advertising byte-identically. Detection and expansion
+ *   are position-aware: `$ref` is only a reference where a schema is
+ *   expected, never inside data keywords (`enum`, `const`, `default`,
+ *   `examples`), unknown vendor keywords, or as a property NAME. Note
+ *   this is about how the resolver INTERPRETS such values, not a
+ *   promise that they are storable: Convex rejects `$`-prefixed field
+ *   names at the storage boundary, so a schema declaring a property
+ *   named `$ref` cannot be registered whatever this function returns.
+ * - Only root-relative `#/$defs/<name>` references are supported
+ *   (single JSON Pointer token, RFC 6901 unescaped). Remote (`https:`)
+ *   references, anchors, and pointers into arbitrary schema locations
+ *   are rejected by name -- the gateway must never fetch, and a ref
+ *   into the middle of another schema has no stable meaning once the
+ *   target is rewritten.
+ * - `$ref` must be the only key of its schema object. JSON Schema
+ *   2020-12 gives adjacent keywords `allOf`-like semantics; merging
+ *   them correctly is a composition problem, and composition is
+ *   exactly where static reachability (and with it the `x-mcp-header`
+ *   binding guarantee) ends.
+ * - Resolution is **reachability-driven**: definition containers
+ *   (`$defs`, `definitions`) are never walked as output, only pulled
+ *   from when something references them. An unused definition — a
+ *   self-referential type or a remote `$ref` in a generated bundle —
+ *   therefore cannot fail a schema whose resolved form is fine, and the
+ *   expansion budget counts only definitions that end up in the output.
+ * - Expansion is bounded three ways: traversal depth (each nesting
+ *   level of the schema tree charges one), total `$ref` expansions, and
+ *   the UTF-8 size of the result. Cycles are detected via the active
+ *   reference chain, not left to the depth budget, so the error names
+ *   the cycle.
+ * - On success the root definition containers are dropped: every
+ *   reference into them has been inlined, and advertising dead
+ *   definitions would only confuse clients that do not resolve
+ *   references (which is why the gateway inlines rather than passes
+ *   `$ref` through: the advertised schema works for every client, and
+ *   the runtime `Mcp-Param-*` walk sees exactly what was validated at
+ *   registration). A reference that survives resolution anywhere in the
+ *   output — e.g. under a keyword the walker does not treat as a schema
+ *   position, or inside a nested definition container — is rejected by
+ *   name rather than shipped dangling.
+ */
+export function resolveJsonSchemaBounded(schema: unknown): ResolvedJsonSchema {
+  if (!schemaContainsRef(schema)) return { resolved: schema };
+  const root = schema as Record<string, unknown>;
+  const rawDefs = root.$defs;
+  const defs = isRecord(rawDefs) ? rawDefs : {};
+
+  let expansions = 0;
+  let problem: string | null = null;
+
+  function fail(message: string): undefined {
+    problem ??= message;
+    return undefined;
+  }
+
+  function walkSchema(
+    node: unknown,
+    depth: number,
+    activeRefs: readonly string[],
+    isRoot = false,
+  ): unknown {
+    if (problem !== null) return undefined;
+    if (depth > SCHEMA_MAX_STRUCTURAL_DEPTH) {
+      return fail(
+        `schema exceeds the structural depth budget (${SCHEMA_MAX_STRUCTURAL_DEPTH})`,
+      );
+    }
+    // Booleans are valid 2020-12 schemas; anything non-object passes
+    // through (invalid shapes are a validation concern, not ours).
+    if (!isRecord(node)) return node;
+    if ("$ref" in node) {
+      const ref = node.$ref;
+      if (Object.keys(node).length !== 1) {
+        return fail(
+          `adjacent keywords beside $ref are not supported (${JSON.stringify(ref)})`,
+        );
+      }
+      if (typeof ref !== "string") {
+        return fail("$ref must be a string");
+      }
+      const match = LOCAL_DEFS_REF.exec(ref);
+      // A single pointer token only: a `/` remaining after the $defs
+      // prefix would point into the middle of a definition.
+      if (!match || match[1].includes("/")) {
+        return fail(
+          `only local "#/$defs/<name>" references are supported (${JSON.stringify(ref)})`,
+        );
+      }
+      const key = unescapeJsonPointerToken(match[1]);
+      if (!Object.prototype.hasOwnProperty.call(defs, key)) {
+        return fail(`unknown $defs entry ${JSON.stringify(key)}`);
+      }
+      if (activeRefs.includes(key)) {
+        return fail(
+          `cyclic $ref through "#/$defs/${key}" ` +
+            `(chain: ${[...activeRefs, key].join(" -> ")})`,
+        );
+      }
+      expansions += 1;
+      if (expansions > SCHEMA_MAX_REF_EXPANSIONS) {
+        return fail(
+          `schema exceeds the $ref expansion budget (${SCHEMA_MAX_REF_EXPANSIONS})`,
+        );
+      }
+      return walkSchema(defs[key], depth + 1, [...activeRefs, key]);
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (isRoot && DEFINITION_CONTAINER_KEYWORDS.has(key)) {
+        // Consumed on demand by `$ref`, never emitted: the output is
+        // self-contained, so the container is dead weight.
+        continue;
+      }
+      if (SCHEMA_VALUED_KEYWORDS.has(key)) {
+        // Array form (draft-07 `items`/`additionalItems`): elements are
+        // schemas by author intent, resolve them like `prefixItems`.
+        setOwn(
+          out,
+          key,
+          Array.isArray(value)
+            ? value.map((entry) => walkSchema(entry, depth + 1, activeRefs))
+            : walkSchema(value, depth + 1, activeRefs),
+        );
+      } else if (SCHEMA_MAP_KEYWORDS.has(key) && isRecord(value)) {
+        const map: Record<string, unknown> = {};
+        for (const [name, entry] of Object.entries(value)) {
+          setOwn(map, name, walkSchema(entry, depth + 1, activeRefs));
+          if (problem !== null) return undefined;
+        }
+        setOwn(out, key, map);
+      } else if (SCHEMA_ARRAY_KEYWORDS.has(key) && Array.isArray(value)) {
+        setOwn(
+          out,
+          key,
+          value.map((entry) => walkSchema(entry, depth + 1, activeRefs)),
+        );
+      } else {
+        // Data keywords (enum/const/default/examples), annotations, and
+        // unknown vendor keys pass through verbatim: nothing inside
+        // them is a reference position, whatever it looks like. A
+        // ref-SHAPED object here is caught by the no-dangling-ref check
+        // after the walk, since it could not be resolved.
+        setOwn(out, key, value);
+      }
+      if (problem !== null) return undefined;
+    }
+    return out;
+  }
+
+  const resolved = walkSchema(root, 0, [], true) as
+    | Record<string, unknown>
+    | undefined;
+  if (problem !== null || resolved === undefined) {
+    return { problem: problem ?? "schema resolution failed" };
+  }
+  // No-dangling-ref guard. Position-INDEPENDENT by design (see
+  // `findRefLikePath`): the definition containers are gone from the
+  // output, so any surviving reference — under a keyword the walker
+  // treats as data, or inside a nested definition container — would
+  // otherwise ship unresolvable. Reject it by path instead.
+  const danglingPath = findRefLikePath(resolved);
+  if (danglingPath !== null) {
+    return {
+      problem:
+        `an unresolved $ref remains at ${danglingPath} after resolution ` +
+        `(the reference is in a position this resolver does not treat as ` +
+        `a schema, so it cannot be inlined)`,
+    };
+  }
+  const serialized = JSON.stringify(resolved);
+  const size = utf8ByteLength(serialized);
+  if (size > SCHEMA_MAX_RESOLVED_BYTES) {
+    return {
+      problem:
+        `resolved schema exceeds the size budget ` +
+        `(${size} > ${SCHEMA_MAX_RESOLVED_BYTES} UTF-8 bytes)`,
+    };
+  }
+  return { resolved };
+}

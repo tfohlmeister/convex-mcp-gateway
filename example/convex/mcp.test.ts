@@ -4,6 +4,7 @@ import { createFunctionHandle, type FunctionReference } from "convex/server";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import schema from "./schema.js";
 import { api, components, internal } from "./_generated/api.js";
+import { McpGateway } from "convex-mcp-gateway";
 
 const modules = import.meta.glob(["./**/*.ts", "./**/*.js", "!**/*.test.ts"]);
 const componentModules = import.meta.glob([
@@ -3028,5 +3029,115 @@ describe("MRTR (modern, e2e)", () => {
       })
     ).json()) as MrtrBody;
     expect(accepted.result?.isError).toBe(false);
+  });
+});
+
+// =================================================================
+// Bounded $ref resolution at registration: authored schemas may use
+// local #/$defs/<name> references; the registry stores and advertises
+// the inlined, self-contained schema, and the runtime Mcp-Param-*
+// walk sees exactly what registration validated.
+// =================================================================
+
+describe("bounded $ref resolution (registration + advertisement)", () => {
+  const authoredTool = {
+    name: "regional_summary",
+    description: "Summary pinned to a region routing header.",
+    kind: "query" as const,
+    functionReference: {},
+    inputSchema: {
+      type: "object",
+      properties: { region: { $ref: "#/$defs/Region" } },
+      $defs: {
+        Region: { type: "string", "x-mcp-header": "region" },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      properties: { total: { $ref: "#/$defs/Total" } },
+      $defs: { Total: { type: "number" } },
+    },
+    metadata: { public: true },
+  };
+
+  test("registerTool stores both schemas inlined, with $defs dropped", async () => {
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    await t.run(async (ctx) => {
+      await gateway.registerTool(ctx, {
+        ...authoredTool,
+        fn: api.invoices.summary,
+      } as unknown as Parameters<typeof gateway.registerTool>[1]);
+      const stored = await ctx.runQuery(
+        components.mcpGateway.registry.listTools,
+        {},
+      );
+      expect(stored).toHaveLength(1);
+      expect(stored[0]!.inputSchema).toEqual({
+        type: "object",
+        properties: {
+          region: { type: "string", "x-mcp-header": "region" },
+        },
+      });
+      expect(stored[0]!.outputSchema).toEqual({
+        type: "object",
+        properties: { total: { type: "number" } },
+      });
+    });
+  });
+
+  test("the advertised catalog serves the resolved, self-contained schema", async () => {
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    // Initialize FIRST so the mount's declarative sync has already run;
+    // the imperative upsert below then survives until the next sync.
+    const session = await initialize(t);
+    await t.run(async (ctx) => {
+      await gateway.registerTool(ctx, {
+        ...authoredTool,
+        fn: api.invoices.summary,
+      } as unknown as Parameters<typeof gateway.registerTool>[1]);
+    });
+
+    // tools/list advertises the self-contained schema: no $ref, no
+    // $defs, annotation inlined onto the properties chain. Runtime
+    // Mcp-Param-* enforcement walks this exact stored schema (the
+    // header-mismatch -32020 path is covered by the modern contract
+    // tests), so a binding authored behind a $ref cannot silently
+    // vanish between registration and enforcement.
+    const list = await rpc(t, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const listBody = (await list.json()) as {
+      result: { tools: Array<{ name: string; inputSchema: unknown }> };
+    };
+    const advertised = listBody.result.tools.find(
+      (tool) => tool.name === "regional_summary",
+    );
+    expect(advertised).toBeDefined();
+    expect(JSON.stringify(advertised!.inputSchema)).not.toContain("$ref");
+    expect(advertised!.inputSchema).toEqual({
+      type: "object",
+      properties: { region: { type: "string", "x-mcp-header": "region" } },
+    });
+  });
+
+  test("a cyclic schema fails registration loudly with the tool named", async () => {
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    await t.run(async (ctx) => {
+      await expect(
+        gateway.registerTool(ctx, {
+          ...authoredTool,
+          inputSchema: {
+            properties: { a: { $ref: "#/$defs/A" } },
+            $defs: { A: { $ref: "#/$defs/A" } },
+          },
+          fn: api.invoices.summary,
+        } as unknown as Parameters<typeof gateway.registerTool>[1]),
+      ).rejects.toThrow(/"regional_summary" has an unresolvable inputSchema/);
+    });
   });
 });
