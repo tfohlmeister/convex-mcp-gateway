@@ -5,6 +5,8 @@ import {
   defineMcpQuery,
   defineMcpResource,
   defineMcpResourceTemplate,
+  completeCall,
+  inputRequired,
   mcpCallerValidator,
   type McpResourceRegistration,
   type McpResourceTemplateProvider,
@@ -45,6 +47,59 @@ export const tools: McpToolRegistration[] = [
     description: "Mark an invoice as paid.",
     fn: api.invoices.markPaid,
     args: { id: v.id("invoices") },
+  }),
+  defineMcpMutation({
+    name: "invoices_archiveAfterConfirmation",
+    description:
+      "Ask for confirmation, then archive an invoice with a replay-safe retry.",
+    fn: api.invoices.archiveAfterConfirmation,
+    args: {
+      id: v.id("invoices"),
+      // Gateway-only: filled with the continuation's idempotency key on a
+      // hook-approved retry. Absent from tools/list, unspoofable.
+      continuationKey: v.optional(v.string()),
+    },
+    mrtrArgs: { idempotencyKey: "continuationKey" },
+    // The gateway-side confirmation state machine. The mutation above is
+    // MCP-unaware: accept dispatches it, decline finishes the call right
+    // here, and a malformed answer simply asks again.
+    beforeCall: async (_ctx, { args, inputResponses }) => {
+      const ask = () =>
+        inputRequired(
+          {
+            confirm: {
+              method: "elicitation/create",
+              params: {
+                mode: "form",
+                message: "Archive this invoice?",
+                requestedSchema: {
+                  type: "object",
+                  properties: { confirm: { type: "boolean" } },
+                  required: ["confirm"],
+                },
+              },
+            },
+          },
+          { invoiceId: args.id },
+        );
+      // First call: no responses yet, request the confirmation round.
+      if (inputResponses === undefined) return ask();
+      // Verified continuation: `inputResponses` is client-controlled,
+      // so validate every field before acting on it.
+      const confirm = inputResponses.confirm as
+        | { action?: string; content?: { confirm?: unknown } }
+        | undefined;
+      if (confirm === undefined) return ask(); // missing answer: ask again
+      if (confirm.action !== "accept" || confirm.content?.confirm !== true) {
+        // Declined (or cancelled): finish WITHOUT dispatching. The
+        // mutation never runs, gateway-side by construction.
+        return completeCall({
+          content: [{ type: "text", text: "Invoice was not archived." }],
+          isError: false,
+        });
+      }
+      return null; // accepted: dispatch, with continuationKey injected
+    },
   }),
   defineMcpQuery({
     name: "invoices_whoami",
@@ -156,7 +211,17 @@ export const registerDefaults = internalMutation({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
-    await gateway.register(ctx, tools);
+    // `beforeCall` is executable host code, so only the HTTP route's
+    // declarative `tools` path receives it. The registry still needs the
+    // serializable descriptors for component-level tests and admin tooling.
+    // The stripped row keeps `mrtrArgs`, so it registers as MRTR-gated:
+    // a handler serving it WITHOUT the matching hook (e.g. a mount that
+    // omits the `tools` option) fails such calls closed instead of
+    // dispatching without the confirmation.
+    await gateway.register(
+      ctx,
+      tools.map(({ beforeCall: _beforeCall, ...tool }) => tool),
+    );
     return null;
   },
 });

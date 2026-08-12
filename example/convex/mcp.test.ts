@@ -122,6 +122,39 @@ describe("dispatch.runTool", () => {
     });
   });
 
+  test("audits the MRTR idempotency key like any other argument", async () => {
+    const t = newTest();
+    await t.mutation(internal.mcp.registerDefaults, {});
+    const invoiceId = await t.run(async (ctx) =>
+      ctx.db.insert("invoices", { status: "open", amount: 7 }),
+    );
+
+    // Simulate a hook-approved gateway continuation: the only injected
+    // argument is the chain's idempotency key. Continuation state and
+    // input responses never reach dispatch, so nothing needs to be
+    // withheld from the audit row.
+    const result = await t.action(components.mcpGateway.dispatch.runTool, {
+      name: "invoices_archiveAfterConfirmation",
+      args: {
+        id: invoiceId,
+        continuationKey: "continuation-key-1",
+      },
+      auditIdentitySubject: "alice",
+    });
+    expect(result.ok).toBe(true);
+
+    const entries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, {
+        toolName: "invoices_archiveAfterConfirmation",
+      }),
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.args).toEqual({
+      id: invoiceId,
+      continuationKey: "continuation-key-1",
+    });
+  });
+
   test("metadata.auditErrorMessage=false omits persisted error text", async () => {
     const t = newTest();
     await t.run(async (ctx) => {
@@ -547,15 +580,28 @@ describe("authorize callback (host's http.ts)", () => {
       }),
     });
     const body = (await res.json()) as {
-      result: { tools: Array<{ name: string }> };
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema?: { properties?: Record<string, unknown> };
+        }>;
+      };
     };
-    // alice has no admin role → markPaid is hidden, list + summary +
-    // whoami visible (whoami is identity-gated but alice is authenticated).
+    // alice has no admin role → markPaid is hidden. The MRTR example, list,
+    // summary, and identity-gated whoami are visible to authenticated users.
     expect(body.result.tools.map((tool) => tool.name).sort()).toEqual([
+      "invoices_archiveAfterConfirmation",
       "invoices_list",
       "invoices_summary",
       "invoices_whoami",
     ]);
+    expect(
+      body.result.tools.find(
+        (tool) => tool.name === "invoices_archiveAfterConfirmation",
+      )?.inputSchema?.properties,
+    ).toEqual({
+      id: { type: "string", format: "convex-id", "x-convex-table": "invoices" },
+    });
   });
 
   test("admin sees the full catalog including the role-gated mutation", async () => {
@@ -586,6 +632,7 @@ describe("authorize callback (host's http.ts)", () => {
       result: { tools: Array<{ name: string }> };
     };
     expect(body.result.tools.map((tool) => tool.name).sort()).toEqual([
+      "invoices_archiveAfterConfirmation",
       "invoices_list",
       "invoices_markPaid",
       "invoices_summary",
@@ -2811,5 +2858,175 @@ describe("resources (host-mounted /mcp/)", () => {
     const body = (await res.json()) as { result?: object; error?: object };
     expect(body.result).toEqual({});
     expect(body.error).toBeUndefined();
+  });
+});
+
+// =================================================================
+// MRTR end to end (modern, real crypto + one-time redemption): the
+// gateway-side beforeCall state machine confirms, declines, re-asks,
+// and blocks decline→accept replays; the Convex mutation stays
+// MCP-unaware and idempotent on the injected continuation key.
+// =================================================================
+
+describe("MRTR (modern, e2e)", () => {
+  const CAPS = { elicitation: { form: {} } };
+
+  async function mrtrRpc(
+    t: ReturnType<typeof newTest>,
+    id: number,
+    params: Record<string, unknown>,
+  ): Promise<Response> {
+    return await t.fetch("/mcp/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "tools/call",
+        "mcp-name": "invoices_archiveAfterConfirmation",
+        authorization: "Bearer valid-userinfo-token",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: "invoices_archiveAfterConfirmation",
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": CAPS,
+          },
+          ...params,
+        },
+      }),
+    });
+  }
+
+  type MrtrBody = {
+    result?: {
+      resultType?: string;
+      requestState?: string;
+      inputRequests?: Record<string, unknown>;
+      isError?: boolean;
+      content?: Array<{ text?: string }>;
+      structuredContent?: unknown;
+    };
+    error?: { code: number; message: string };
+  };
+
+  async function seedInvoice(t: ReturnType<typeof newTest>) {
+    return await t.run(async (ctx) =>
+      ctx.db.insert("invoices", { status: "open", amount: 7 }),
+    );
+  }
+
+  test("accept: confirmation round-trip, mutation runs once, replay is idempotent", async () => {
+    const t = newTest();
+    const invoiceId = await seedInvoice(t);
+
+    const first = (await (
+      await mrtrRpc(t, 1, { arguments: { id: invoiceId } })
+    ).json()) as MrtrBody;
+    expect(first.error, JSON.stringify(first.error)).toBeUndefined();
+    expect(first.result?.resultType).toBe("input_required");
+    expect(Object.keys(first.result?.inputRequests ?? {})).toEqual([
+      "confirm",
+    ]);
+    // Nothing ran yet.
+    expect(
+      await t.run(async (ctx) => ctx.db.query("mrtrExecutions").collect()),
+    ).toHaveLength(0);
+
+    const accept = {
+      arguments: { id: invoiceId },
+      requestState: first.result!.requestState,
+      inputResponses: {
+        confirm: { action: "accept", content: { confirm: true } },
+      },
+    };
+    const accepted = (await (await mrtrRpc(t, 2, accept)).json()) as MrtrBody;
+    expect(accepted.result?.isError).toBe(false);
+    const text = accepted.result?.content?.[0]?.text ?? "";
+    expect(text).toContain('"archived": true');
+
+    // Byte-identical replay (client network retry): re-processes
+    // deterministically, the keyed mutation does not double-apply.
+    const replayed = (await (await mrtrRpc(t, 3, accept)).json()) as MrtrBody;
+    expect(replayed.result?.isError).toBe(false);
+    const executions = await t.run(async (ctx) =>
+      ctx.db.query("mrtrExecutions").collect(),
+    );
+    expect(executions).toHaveLength(1);
+  });
+
+  test("decline finishes gateway-side and cannot be replayed into an accept", async () => {
+    const t = newTest();
+    const invoiceId = await seedInvoice(t);
+
+    const first = (await (
+      await mrtrRpc(t, 1, { arguments: { id: invoiceId } })
+    ).json()) as MrtrBody;
+    const requestState = first.result!.requestState;
+
+    const declined = (await (
+      await mrtrRpc(t, 2, {
+        arguments: { id: invoiceId },
+        requestState,
+        inputResponses: { confirm: { action: "decline" } },
+      })
+    ).json()) as MrtrBody;
+    expect(declined.result?.content?.[0]?.text).toBe(
+      "Invoice was not archived.",
+    );
+    // The mutation never ran.
+    expect(
+      await t.run(async (ctx) => ctx.db.query("mrtrExecutions").collect()),
+    ).toHaveLength(0);
+
+    // Replaying the SAME continuation with a different answer must not
+    // flip the resolved decline into an accepted archive.
+    const flipped = (await (
+      await mrtrRpc(t, 3, {
+        arguments: { id: invoiceId },
+        requestState,
+        inputResponses: {
+          confirm: { action: "accept", content: { confirm: true } },
+        },
+      })
+    ).json()) as MrtrBody;
+    expect(flipped.error?.code).toBe(-32602);
+    expect(flipped.error?.message).toMatch(/already used/);
+    expect(
+      await t.run(async (ctx) => ctx.db.query("mrtrExecutions").collect()),
+    ).toHaveLength(0);
+  });
+
+  test("a malformed answer is asked again instead of erroring", async () => {
+    const t = newTest();
+    const invoiceId = await seedInvoice(t);
+    const first = (await (
+      await mrtrRpc(t, 1, { arguments: { id: invoiceId } })
+    ).json()) as MrtrBody;
+
+    const reasked = (await (
+      await mrtrRpc(t, 2, {
+        arguments: { id: invoiceId },
+        requestState: first.result!.requestState,
+        inputResponses: { unrelated: { action: "accept" } },
+      })
+    ).json()) as MrtrBody;
+    expect(reasked.result?.resultType).toBe("input_required");
+
+    // Answering the re-issued round completes the flow.
+    const accepted = (await (
+      await mrtrRpc(t, 3, {
+        arguments: { id: invoiceId },
+        requestState: reasked.result!.requestState,
+        inputResponses: {
+          confirm: { action: "accept", content: { confirm: true } },
+        },
+      })
+    ).json()) as MrtrBody;
+    expect(accepted.result?.isError).toBe(false);
   });
 });

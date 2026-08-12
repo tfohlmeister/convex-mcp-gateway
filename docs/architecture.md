@@ -96,6 +96,58 @@ declarative catalog is synchronized before discovery or dispatch. The legacy
 wire contract remains unchanged: `initialize` always uses the session path,
 including when a client incorrectly includes modern metadata.
 
+### Stateless multi-round trips (MRTR)
+
+The host-side `beforeCall` hook of a declarative tool is the MRTR state
+machine. It runs after authorization but before component dispatch, on
+the first call AND on every verified continuation, and returns one of
+three decisions: `inputRequired()` (ask the client for input — again,
+if a previous answer was incomplete, up to a hard round ceiling),
+`completeCall()` (finish the call without dispatching, e.g. a declined
+confirmation), or `null`/`undefined` (continue to the Convex function).
+The underlying function therefore stays MCP-unaware: it never parses
+input-response envelopes, and the only gateway-injected argument is the
+chain's stable idempotency key (`mrtrArgs`), which is audited like any
+other argument and which tools persist around their side effect for
+durable replay protection.
+
+Each round the gateway signs a short-lived `requestState` over the tool
+name, a digest of the public arguments (computed before the hook runs,
+so hook-side mutation cannot poison it), the authenticated caller
+subject, the chain's idempotency key, the round number, and a fresh
+continuation id. On retry it verifies all of these, then **redeems the
+continuation id once** in the component's `mrtrRedemptions` table:
+re-sending byte-identical responses is an idempotent replay, while a
+captured `requestState` replayed with different responses is rejected,
+so a resolved decision (a decline) cannot be flipped into an accept
+within the TTL. Hosts prune expired redemption rows with
+`gateway.pruneMrtrRedemptions` from a cron.
+
+Fail-closed rules: a registry row registered as MRTR-gated (it had a
+hook, or reserves `mrtrArgs`) is refused with `-32603` when served by a
+handler that has no matching `beforeCall` — imperative registrations
+and stale declarative catalogs can never dispatch without the promised
+confirmation. The hook runs on every transport, so required input is
+never silently bypassed: a legacy 2025-era request that reaches a hook
+demanding input is rejected with `-32601` (and a modern request without
+the `mrtr` option fails closed with `-32603`). Tools with a hook reject
+anonymous callers through the same audited denial path as
+`identityArg` tools (real 401 + `WWW-Authenticate`). The gateway checks
+the current request's `clientCapabilities` before returning input
+requests — per elicitation mode, accumulated across all requests of the
+round — and reports `-32021` carrying only the missing capabilities. A
+misconfigured signing secret surfaces as `-32603`, never as a client
+error. State-only continuations remain valid without `inputResponses`.
+
+Audit posture, stated explicitly: rounds that end gateway-side (an
+`input_required` response, a declined confirmation completed by the
+hook, a `-32021` capability rejection, a hook failure) write no audit
+rows, because nothing is dispatched and only the component writes tool
+audit entries. The audit log records authorization denials and actual
+dispatches — including the injected idempotency key, which links a
+dispatched call back to its confirmation chain. Hosts that need
+per-round visibility log from inside their hook.
+
 The table below describes the **legacy** session lifecycle. Modern
 requests use `POST` only; `GET` and `DELETE` play no part in them.
 

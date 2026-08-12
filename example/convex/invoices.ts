@@ -43,6 +43,41 @@ export const markPaid = mutation({
 });
 
 /**
+ * A mutation that runs only after the gateway-side MRTR `beforeCall`
+ * hook (see convex/mcp.ts) accepted the confirmation. It is entirely
+ * MCP-unaware: the hook owns the elicitation round-trip and the
+ * accept/decline decision; this function only receives its business
+ * arguments plus the gateway-injected continuation key, which makes the
+ * side effect idempotent across client retries of the same continuation.
+ */
+export const archiveAfterConfirmation = mutation({
+  args: {
+    id: v.id("invoices"),
+    continuationKey: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    // A hook-approved gateway continuation always injects the key. A
+    // call without one did not come through the confirmation flow
+    // (e.g. direct host code), so refuse the side effect.
+    if (!args.continuationKey) return { archived: false, invoiceId: args.id };
+
+    const prior = await ctx.db
+      .query("mrtrExecutions")
+      .withIndex("by_key", (q) => q.eq("key", args.continuationKey!))
+      .unique();
+    if (prior) return prior.result;
+
+    const result = { archived: true, invoiceId: args.id };
+    await ctx.db.insert("mrtrExecutions", {
+      key: args.continuationKey,
+      invoiceId: args.id,
+      result,
+    });
+    return result;
+  },
+});
+
+/**
  * Look up one invoice by id. Used by the `invoice://{id}` resource template
  * in convex/mcp.ts: the template's read handler passes the matched `{id}`
  * here as a plain string, so we `normalizeId` it (returning `null` for a

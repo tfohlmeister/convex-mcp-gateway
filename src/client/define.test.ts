@@ -144,6 +144,121 @@ describe("defineMcp* identityArg (inputSchema + compile-time safety)", () => {
   });
 });
 
+describe("defineMcp* mrtrArgs", () => {
+  type QueryRef<Args extends Record<string, unknown>> = FunctionReference<
+    "query",
+    "public",
+    Args,
+    unknown
+  >;
+
+  test("excludes the injected idempotency-key arg from inputSchema", () => {
+    const ref = {} as QueryRef<{
+      id: string;
+      continuationKey?: string;
+    }>;
+    const tool = defineMcpQuery({
+      name: "confirm_tool",
+      description: "x",
+      fn: ref,
+      args: {
+        id: v.string(),
+        continuationKey: v.optional(v.string()),
+      },
+      mrtrArgs: { idempotencyKey: "continuationKey" },
+      beforeCall: async () => null,
+    });
+    const schema = tool.inputSchema as {
+      properties?: Record<string, unknown>;
+    };
+    expect(schema.properties ?? {}).toEqual({ id: { type: "string" } });
+    expect(tool.mrtrArgs).toEqual({ idempotencyKey: "continuationKey" });
+  });
+
+  test("a hook without mrtrArgs is valid (confirmation-only tools)", () => {
+    const ref = {} as QueryRef<{ id: string }>;
+    expect(() =>
+      defineMcpQuery({
+        name: "confirm_only_tool",
+        description: "x",
+        fn: ref,
+        args: { id: v.string() },
+        beforeCall: async () => null,
+      }),
+    ).not.toThrow();
+  });
+
+  test("rejects missing, colliding, or hook-less injected args", () => {
+    expect(() =>
+      (defineMcpQuery as unknown as (c: unknown) => unknown)({
+        name: "bad_mrtr_tool",
+        description: "x",
+        fn: {},
+        args: { id: v.string() },
+        mrtrArgs: { idempotencyKey: "missing" },
+        beforeCall: async () => null,
+      }),
+    ).toThrow(/Gateway-injected arg "missing" is not a key/);
+
+    // identityArg and mrtrArgs naming the same key would make the gateway
+    // inject two different values into one argument. Must be rejected at
+    // definition time, not discovered as a broken continuation at runtime.
+    expect(() =>
+      (defineMcpQuery as unknown as (c: unknown) => unknown)({
+        name: "identity_collision_tool",
+        description: "x",
+        fn: {},
+        args: { caller: v.optional(v.any()) },
+        identityArg: "caller",
+        mrtrArgs: { idempotencyKey: "caller" },
+        beforeCall: async () => null,
+      }),
+    ).toThrow(/Gateway-injected args must be distinct/);
+
+    // The key is only injected on hook-approved continuations, so it is
+    // meaningless without the hook.
+    expect(() =>
+      (defineMcpQuery as unknown as (c: unknown) => unknown)({
+        name: "keyed_without_hook",
+        description: "x",
+        fn: {},
+        args: { continuationKey: v.optional(v.string()) },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+      }),
+    ).toThrow(/mrtrArgs requires beforeCall/);
+
+    // The key is absent on first-call and legacy dispatches, so its
+    // validator must be optional or those calls fail the Convex arg
+    // validator at runtime. Caught at define time instead.
+    expect(() =>
+      (defineMcpQuery as unknown as (c: unknown) => unknown)({
+        name: "non_optional_key",
+        description: "x",
+        fn: {},
+        args: { continuationKey: v.string() },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+        beforeCall: async () => null,
+      }),
+    ).toThrow(/must be an optional validator/);
+  });
+
+  test("requires declarative tools for beforeCall", async () => {
+    const tool = defineMcpQuery({
+      name: "confirm_tool",
+      description: "test",
+      fn: {} as QueryRef<{ continuationKey?: string }>,
+      args: { continuationKey: v.optional(v.string()) },
+      mrtrArgs: { idempotencyKey: "continuationKey" },
+      beforeCall: async () => null,
+    });
+    const gateway = new McpGateway({} as never);
+
+    await expect(gateway.register({} as never, [tool])).rejects.toThrow(
+      "imperative registration cannot run host-side hooks",
+    );
+  });
+});
+
 describe("defineMcp* outputSchema (from returns: validator)", () => {
   test("omitted returns → no outputSchema on the result", () => {
     const tool = (defineMcpQuery as unknown as (c: unknown) => any)({

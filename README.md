@@ -25,6 +25,10 @@ Built as a [Convex Component](https://www.convex.dev/components).
 - **MCP dual-era Streamable HTTP**: legacy 2025-03-26/2025-06-18 sessions
   remain supported alongside stateless 2026-07-28 requests, discovery,
   routing-header validation, and private cache hints
+- **Stateless multi-round trips**: declarative modern tools use a host-side
+  `beforeCall` hook to request input before any Convex function runs, then
+  receive HMAC-verified continuation state plus an idempotency key on retry;
+  see [Multi-round-trip requests](#multi-round-trip-requests)
 - **MCP resources**: `defineMcpResource` / `defineMcpResourceTemplate`
   serve `resources/list`, `resources/read`, and `resources/templates/list`
   (RFC 6570). Central `authorizeResource` hook, opt-in resource audit,
@@ -248,6 +252,98 @@ permissive `cors: true` silently disables the gate.
 because a Convex deployment lives at a fixed public URL rather than on
 localhost, which is the scenario DNS rebinding targets. Set it for any
 deployment that serves browser clients.
+
+### Multi-round-trip requests
+
+Modern declarative tools can request elicitation, sampling, or roots input
+without a protocol session. Enable `mrtr` with stable private key material and
+give the tool a `beforeCall` hook: it is the gateway-side state machine, run
+before the underlying Convex function on the first call AND on every verified
+continuation, so accept/decline/ask-again decisions never leak into your
+business logic:
+
+```ts
+import { completeCall, inputRequired } from "convex-mcp-gateway";
+
+defineMcpMutation({
+  name: "invoices_archiveAfterConfirmation",
+  fn: api.invoices.archiveAfterConfirmation, // MCP-unaware mutation
+  args: {
+    id: v.id("invoices"),
+    // Gateway-only: filled with the continuation's idempotency key on a
+    // hook-approved retry. Hidden from tools/list, unspoofable.
+    continuationKey: v.optional(v.string()),
+  },
+  mrtrArgs: { idempotencyKey: "continuationKey" },
+  beforeCall: async (_ctx, { args, inputResponses }) => {
+    const ask = () =>
+      inputRequired(
+        {
+          confirm: {
+            method: "elicitation/create",
+            params: { mode: "form", message: "Archive this invoice?" },
+          },
+        },
+        { invoiceId: args.id },
+      );
+    // Round one: ask before anything can run.
+    if (inputResponses === undefined) return ask();
+    const confirm = inputResponses.confirm as { action?: string } | undefined;
+    if (confirm === undefined) return ask(); // missing answer: ask again
+    if (confirm.action !== "accept") {
+      // Declined: finish WITHOUT running the mutation.
+      return completeCall({
+        content: [{ type: "text", text: "Invoice was not archived." }],
+        isError: false,
+      });
+    }
+    return null; // accepted: dispatch, with continuationKey injected
+  },
+});
+
+gateway.handleMcpRequest(ctx, request, {
+  authorize,
+  mrtr: { secret: process.env.MCP_MRTR_SECRET! },
+});
+```
+
+The gateway HMAC-signs the opaque `requestState` with a five-minute default
+TTL, binding it to the tool name, original public arguments, authenticated
+caller subject, and a per-round continuation id. Each continuation is
+additionally **redeemed once server-side**: re-sending the same responses is
+an idempotent replay, but a captured `requestState` replayed with a different
+answer (decline → accept) is rejected, so a resolved decision cannot be
+flipped within the TTL. Chains may run multiple rounds (asking again for
+missing input, per the spec's error-handling guidance) up to a hard ceiling.
+
+The hook receives the client's untrusted `inputResponses` and decoded `state`;
+neither is ever injected into the Convex function — only the chain's stable
+idempotency key is, via `mrtrArgs`, and it is audited like any other argument.
+Persist it around the tool's side effect for durable replay protection. The
+state is signed, not encrypted, so never put credentials or other secrets in
+it. Wire `gateway.pruneMrtrRedemptions` into a cron to drop expired
+redemption rows.
+
+Safety properties: the hook runs only for `tools` passed to
+`handleMcpRequest`, and a registry row registered as MRTR-gated (a hook, or
+`mrtrArgs`) **fails closed** when served by a handler without the matching
+hook — imperative registrations and stale catalogs can never dispatch
+unconfirmed. MRTR tools require an authenticated caller on every transport
+(anonymous calls get the real 401 + `WWW-Authenticate` challenge and an audit
+row). The gateway returns `-32021` — listing only the missing entries, per
+mode for elicitation — rather than sending input requests for a capability
+absent from that request's `clientCapabilities`, and supports state-only
+retries without `inputResponses`. Required input is never silently bypassed:
+the hook also runs for legacy 2025-era requests, and when it demands input
+there (or when `mrtr` is not configured), the call fails closed instead of
+dispatching. Note that rounds that end gateway-side (an `input_required`
+response, a declined confirmation, a `-32021` rejection) write no audit rows;
+the audit log records authorization denials and dispatches. See the runnable
+[example](./example/convex/mcp.ts) and its durable idempotency record in
+[invoices.ts](./example/convex/invoices.ts). `subscriptions/listen`, Tasks,
+MCP Apps, and Enterprise Managed Authorization are not advertised until a
+host provides their required durable state or long-lived delivery
+infrastructure.
 
 ## Resources
 

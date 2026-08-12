@@ -16,6 +16,7 @@ import {
   buildResourceUrl,
   convexValidatorToJsonSchema,
   resourcePathFromWellKnownRequest,
+  type McpBeforeCallHandler,
   type McpCaller,
   type McpToolAnnotations,
   type McpToolDefinition,
@@ -44,11 +45,17 @@ export type {
   McpAuthorizerArgs,
   McpAuthorizerDecision,
   McpAuthorizerHandler,
+  McpBeforeCallArgs,
+  McpBeforeCallHandler,
+  McpBeforeCallResult,
   McpCaller,
+  McpCompleteCallResult,
+  McpInputRequiredResult,
   McpToolAnnotations,
   McpToolDefinition,
   McpToolFunctionReference,
   McpToolKind,
+  McpMrtrArgs,
   McpToolRegistration,
   McpToolSecurityScheme,
 } from "../shared.js";
@@ -57,6 +64,7 @@ export type {
   McpAllowedOriginsOption,
   McpCorsOption,
   McpHandlerCtx,
+  McpMrtrOptions,
   McpIdentityResolver,
   McpResourceAuditOption,
   McpResourceAuthorizerArgs,
@@ -69,6 +77,7 @@ export type {
   McpResourceTemplateProvider,
   McpResourceTemplateReadHandler,
 } from "./mcp-handler.js";
+export { completeCall, inputRequired } from "../shared.js";
 export {
   buildProtectedResourceMetadataUrl,
   buildResourceUrl,
@@ -210,6 +219,8 @@ type McpCallerArgKeys<ArgsV extends PropertyValidators> = {
 }[keyof ArgsV] &
   string;
 
+type McpArgKey<ArgsV extends PropertyValidators> = keyof ArgsV & string;
+
 interface McpToolConfigBase<
   Ref extends AnyToolFunctionReference,
   ArgsV extends PropertyValidators,
@@ -251,6 +262,27 @@ interface McpToolConfigBase<
    * before dispatch, so the tool never runs unscoped.
    */
   identityArg?: McpCallerArgKeys<ArgsV>;
+  /**
+   * Name of the argument the gateway fills with the MRTR continuation's
+   * stable idempotency key when a verified retry continues to dispatch.
+   * Removed from the public schema and stripped from client requests.
+   * Requires `beforeCall`; distinct from `identityArg`. Optional: a tool
+   * without durable side effects does not need the key.
+   */
+  mrtrArgs?: {
+    idempotencyKey: McpArgKey<ArgsV>;
+  };
+  /**
+   * Host-side MRTR state machine, run before the underlying Convex
+   * function on the first call AND on every verified continuation
+   * (which additionally carries the decoded `state`, the client's
+   * untrusted `inputResponses`, the stable `idempotencyKey`, and the
+   * `round` number). Return `inputRequired()` for another round,
+   * `completeCall()` to end the call without dispatching (e.g. a
+   * declined confirmation), or `null`/`undefined` to continue to the
+   * Convex function, which stays MCP-unaware.
+   */
+  beforeCall?: McpBeforeCallHandler;
   /** Optional display title advertised in `tools/list`. */
   title?: string;
   /** MCP behavior hints advertised in `tools/list`. */
@@ -310,12 +342,53 @@ function build<
         `"${config.name}".`,
     );
   }
-  // The identity-injected arg is server-filled, so it must NOT appear in
-  // the schema advertised to clients (they neither see nor send it).
-  let clientArgs: PropertyValidators = config.args;
-  if (config.identityArg !== undefined) {
-    clientArgs = { ...config.args };
-    delete (clientArgs as Record<string, unknown>)[config.identityArg];
+  // Gateway-injected arguments are never part of the client contract.
+  const injectedArgs = [
+    ...(config.identityArg !== undefined ? [config.identityArg] : []),
+    ...(config.mrtrArgs !== undefined
+      ? [config.mrtrArgs.idempotencyKey]
+      : []),
+  ];
+  for (const arg of injectedArgs) {
+    if (arg === config.identityArg) continue;
+    if (!(arg in config.args)) {
+      throw new Error(
+        `Gateway-injected arg "${arg}" is not a key of args for tool ` +
+          `"${config.name}".`,
+      );
+    }
+  }
+  if (new Set(injectedArgs).size !== injectedArgs.length) {
+    throw new Error(
+      `Gateway-injected args must be distinct for tool "${config.name}".`,
+    );
+  }
+  // The key is only ever injected on a hook-approved continuation, so it
+  // is meaningless without the hook. The inverse is fine: a hook that
+  // only confirms (or completes calls itself) needs no injected key.
+  if (config.beforeCall === undefined && config.mrtrArgs !== undefined) {
+    throw new Error(`mrtrArgs requires beforeCall for tool "${config.name}".`);
+  }
+  // The key is injected only on a continuation that dispatches; a
+  // first-call approval (hook returns null) and every legacy dispatch
+  // run WITHOUT it, so its validator must be optional or the Convex
+  // function rejects those calls. Enforce it here rather than let the
+  // tool fail at runtime with an ArgumentValidationError.
+  if (config.mrtrArgs !== undefined) {
+    const keyValidator = (config.args as Record<string, GenericValidator>)[
+      config.mrtrArgs.idempotencyKey
+    ];
+    if (keyValidator?.isOptional !== "optional") {
+      throw new Error(
+        `mrtrArgs.idempotencyKey "${config.mrtrArgs.idempotencyKey}" must be ` +
+          `an optional validator (v.optional(...)) for tool "${config.name}", ` +
+          `because it is absent on first-call and legacy dispatches.`,
+      );
+    }
+  }
+  const clientArgs: PropertyValidators = { ...config.args };
+  for (const arg of injectedArgs) {
+    delete (clientArgs as Record<string, unknown>)[arg];
   }
   return {
     name: config.name,
@@ -329,6 +402,10 @@ function build<
       : {}),
     ...(config.identityArg !== undefined
       ? { identityArg: config.identityArg }
+      : {}),
+    ...(config.mrtrArgs !== undefined ? { mrtrArgs: config.mrtrArgs } : {}),
+    ...(config.beforeCall !== undefined
+      ? { beforeCall: config.beforeCall }
       : {}),
     ...(config.title !== undefined ? { title: config.title } : {}),
     ...(config.annotations !== undefined
@@ -786,10 +863,29 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
         : {}),
+      ...(tool.mrtrArgs !== undefined ? { mrtrArgs: tool.mrtrArgs } : {}),
+      // Persist the gate in the registry row itself: a row registered
+      // with a hook (or reserving the key) must fail closed when served
+      // by a handler that has no matching `beforeCall`, including via a
+      // stale declarative catalog or an imperative registration that
+      // kept `mrtrArgs`.
+      ...(tool.beforeCall !== undefined || tool.mrtrArgs !== undefined
+        ? { mrtrGated: true }
+        : {}),
       ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
     })),
   );
+}
+
+function assertNoImperativeBeforeCall(tools: McpToolRegistration[]): void {
+  const tool = tools.find((candidate) => candidate.beforeCall !== undefined);
+  if (tool) {
+    throw new Error(
+      `Tool "${tool.name}" uses beforeCall and must be passed through ` +
+        "handleMcpRequest({ tools }); imperative registration cannot run host-side hooks.",
+    );
+  }
 }
 
 /**
@@ -808,6 +904,10 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
       inputSchema: tool.inputSchema ?? null,
       outputSchema: tool.outputSchema ?? null,
       identityArg: tool.identityArg ?? null,
+      mrtrArgs: tool.mrtrArgs ?? null,
+      // Adding or removing a hook changes the stored gate flag, so it
+      // must churn the fingerprint or the row would never resync.
+      mrtrGated: tool.beforeCall !== undefined || tool.mrtrArgs !== undefined,
       protocolMetadata: toolProtocolMetadata(tool) ?? null,
       metadata: tool.metadata ?? null,
     }))
@@ -914,6 +1014,7 @@ export class McpGateway {
     tool: McpToolRegistration,
   ): Promise<void> {
     assertToolHeaderSchemas([tool]);
+    assertNoImperativeBeforeCall([tool]);
     const handle = await createFunctionHandle(tool.fn as any);
     await ctx.runMutation(this.component.registry.registerTool, {
       name: tool.name,
@@ -926,6 +1027,9 @@ export class McpGateway {
         : {}),
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
+        : {}),
+      ...(tool.mrtrArgs !== undefined
+        ? { mrtrArgs: tool.mrtrArgs, mrtrGated: true }
         : {}),
       ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
@@ -951,6 +1055,7 @@ export class McpGateway {
     ctx: RunMutationCtx,
     tools: McpToolRegistration[],
   ): Promise<void> {
+    assertNoImperativeBeforeCall(tools);
     const resolved = await resolveToolHandles(tools);
     // No fingerprint: the imperative path clears any declarative
     // fingerprint so a later `tools`-option sync re-applies.
@@ -1171,6 +1276,26 @@ export class McpGateway {
     return await ctx.runMutation(this.component.audit.pruneOlderThan, {
       cutoffMs: Date.now() - retentionMs,
     });
+  }
+
+  /**
+   * Drop MRTR one-time-redemption rows whose continuation has expired
+   * (the sealed state they guard can no longer verify). Bounded per
+   * call; drains by looping until a call deletes nothing. Wire it into
+   * the same cron as `pruneAuditEntries` when the `mrtr` option is
+   * enabled.
+   */
+  async pruneMrtrRedemptions(ctx: RunMutationCtx): Promise<number> {
+    let total = 0;
+    for (;;) {
+      const deleted = await ctx.runMutation(
+        this.component.mrtr.pruneMrtrRedemptions,
+        {},
+      );
+      total += deleted;
+      if (deleted === 0) break;
+    }
+    return total;
   }
 
   /**
@@ -1396,6 +1521,7 @@ export class McpGateway {
       resources,
       resourceTemplates,
       ensureCatalogSynced,
+      declarativeTools: tools,
     });
   }
 

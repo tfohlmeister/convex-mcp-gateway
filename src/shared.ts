@@ -68,6 +68,66 @@ export interface McpToolAnnotations {
 }
 
 /**
+ * Names of tool arguments reserved for gateway-injected MRTR data. Only
+ * the idempotency key is ever injected: continuation state and input
+ * responses stay inside the `beforeCall` hook, so the underlying Convex
+ * function remains MCP-unaware.
+ */
+export interface McpMrtrArgs {
+  idempotencyKey: string;
+}
+
+/**
+ * A host-side MRTR decision. The gateway signs `state` but does not encrypt
+ * it, so it must not contain credentials.
+ */
+export type McpInputRequiredResult = {
+  __mcpInputRequired: true;
+  inputRequests?: Record<string, unknown>;
+  state?: unknown;
+};
+
+/**
+ * A host-side `beforeCall` decision that ends the call without invoking
+ * the underlying Convex function. `result` is the literal MCP
+ * `tools/call` result the client receives (`content`, optional
+ * `structuredContent`, optional `isError`), e.g. "Invoice was not
+ * archived." after a declined confirmation.
+ */
+export type McpCompleteCallResult = {
+  __mcpCompleteCall: true;
+  result: Record<string, unknown>;
+};
+
+export type McpBeforeCallResult =
+  | McpInputRequiredResult
+  | McpCompleteCallResult
+  | null
+  | undefined;
+
+/** Create a host-side `beforeCall` result that requests another round trip. */
+export function inputRequired(
+  inputRequests: Record<string, unknown> = {},
+  state?: unknown,
+): McpInputRequiredResult {
+  return {
+    __mcpInputRequired: true,
+    inputRequests,
+    ...(state !== undefined ? { state } : {}),
+  };
+}
+
+/**
+ * Create a host-side `beforeCall` result that terminates the call with
+ * the given MCP tool result, without dispatching the Convex function.
+ */
+export function completeCall(
+  result: Record<string, unknown>,
+): McpCompleteCallResult {
+  return { __mcpCompleteCall: true, result };
+}
+
+/**
  * A single entry of a tool's `securitySchemes`. The field is still a
  * draft addition to the MCP Tool spec and the gateway only passes it
  * through, so the shape stays open: `type` plus whatever the scheme
@@ -109,6 +169,25 @@ export interface McpToolDefinition {
    * `mcpCallerValidator` for the arg's validator.
    */
   identityArg?: string;
+  /**
+   * Name of the tool argument the gateway fills with the continuation's
+   * stable idempotency key on a verified MRTR retry that continues to
+   * dispatch. Removed from the advertised input schema and stripped from
+   * every client request. Optional: a tool without durable side effects
+   * (or one only used for gateway-side confirmation) does not need it.
+   */
+  mrtrArgs?: McpMrtrArgs;
+  /**
+   * The host-side MRTR state machine, run in the host HTTP action before
+   * the underlying Convex tool on the first call AND on every verified
+   * continuation (where it additionally receives the decoded state, the
+   * client's untrusted `inputResponses`, and the stable idempotency key).
+   * Returns `inputRequired()` for another round, `completeCall()` to end
+   * the call without dispatching, or `null`/`undefined` to continue to
+   * the Convex function. Supported only by the declarative `tools`
+   * option of `handleMcpRequest`.
+   */
+  beforeCall?: McpBeforeCallHandler;
   metadata?: Record<string, unknown>;
 }
 
@@ -179,6 +258,31 @@ export const mcpCallerValidator = v.object({
 });
 
 export type McpCaller = Infer<typeof mcpCallerValidator>;
+
+/**
+ * What a `beforeCall` hook receives. On the first call only `args` and
+ * `identity` are present. On a verified continuation the gateway adds
+ * the decoded `state` the hook sealed in the previous round, the
+ * client's untrusted `inputResponses` (validate every field before
+ * acting on it), the chain's stable `idempotencyKey`, and the 1-based
+ * `round` number of the continuation being answered.
+ */
+export type McpBeforeCallArgs = {
+  args: Record<string, unknown>;
+  identity: McpCaller;
+  state?: unknown;
+  inputResponses?: Record<string, unknown>;
+  idempotencyKey?: string;
+  round?: number;
+};
+
+export type McpBeforeCallHandler = (
+  ctx: { auth: { getUserIdentity: () => Promise<unknown> } } & Record<
+    string,
+    unknown
+  >,
+  args: McpBeforeCallArgs,
+) => McpBeforeCallResult | Promise<McpBeforeCallResult>;
 
 /**
  * Args that the gateway passes to the host's `authorize` callback for

@@ -91,6 +91,10 @@ export const runTool = action({
       tool.identityArg !== undefined
         ? omitKey(request.args, tool.identityArg)
         : request.args;
+    // MRTR needs no special-casing here: only the chain's idempotency
+    // key is ever injected into dispatched args (continuation state and
+    // input responses never leave the host-side hook), and the key is
+    // deliberately auditable like any other argument.
     const auditArgs = redactArgsForAudit(tool, callerArgs);
     const callArgs =
       tool.identityArg !== undefined

@@ -10,6 +10,7 @@
 
 import type * as audit from "../audit.js";
 import type * as dispatch from "../dispatch.js";
+import type * as mrtr from "../mrtr.js";
 import type * as registry from "../registry.js";
 import type * as sessions from "../sessions.js";
 
@@ -23,6 +24,7 @@ import { anyApi, componentsGeneric } from "convex/server";
 const fullApi: ApiFromModules<{
   audit: typeof audit;
   dispatch: typeof dispatch;
+  mrtr: typeof mrtr;
   registry: typeof registry;
   sessions: typeof sessions;
 }> = anyApi as any;

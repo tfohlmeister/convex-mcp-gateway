@@ -105,6 +105,22 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Name
       >;
     };
+    mrtr: {
+      pruneMrtrRedemptions: FunctionReference<
+        "mutation",
+        "internal",
+        {},
+        number,
+        Name
+      >;
+      redeemContinuation: FunctionReference<
+        "mutation",
+        "internal",
+        { expiresAt: number; jti: string; responsesDigest: string },
+        "fresh" | "replay" | "conflict",
+        Name
+      >;
+    };
     registry: {
       clearAllResources: FunctionReference<
         "mutation",
@@ -170,6 +186,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
+          mrtrArgs?: { idempotencyKey: string };
+          mrtrGated?: boolean;
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
@@ -227,6 +245,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
+          mrtrArgs?: { idempotencyKey: string };
+          mrtrGated?: boolean;
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
@@ -270,6 +290,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           inputSchema: any;
           kind: "query" | "mutation" | "action";
           metadata?: any;
+          mrtrArgs?: { idempotencyKey: string };
+          mrtrGated?: boolean;
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
@@ -322,6 +344,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             inputSchema: any;
             kind: "query" | "mutation" | "action";
             metadata?: any;
+            mrtrArgs?: { idempotencyKey: string };
+            mrtrGated?: boolean;
             name: string;
             outputSchema?: any;
             protocolMetadata?: any;

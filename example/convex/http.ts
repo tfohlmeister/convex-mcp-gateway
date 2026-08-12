@@ -116,6 +116,12 @@ const mcpHandler = httpAction(async (ctx, request) =>
     // driven from CLIs and tests, which send no Origin header:
     // allowedOrigins: ["https://app.example.com"],
     resolveIdentity,
+    // Multi-round-trip requests (see invoices_archiveAfterConfirmation in
+    // mcp.ts). Real deployments must supply ≥32 bytes of private, stable
+    // key material from a Convex environment variable
+    // (process.env.MCP_MRTR_SECRET); the literal only keeps the example
+    // and its test suite self-contained.
+    mrtr: { secret: "example-only-mrtr-secret-not-for-production-use" },
     // Declarative catalog: the registry is reconciled from this list on
     // each initialize, so no separate registerDefaults mutation is
     // needed for the HTTP path.

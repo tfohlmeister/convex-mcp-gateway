@@ -6,6 +6,7 @@ import {
   type McpAuthorizerArgs,
   type McpAuthorizerDecision,
   type McpAuthorizerHandler,
+  type McpInputRequiredResult,
   type McpToolRegistration,
 } from "../shared.js";
 
@@ -214,6 +215,13 @@ export type McpResourceAuditOption =
       templatesList?: boolean;
     };
 
+export type McpMrtrOptions = {
+  /** At least 32 bytes of private, stable key material for HMAC-SHA-256. */
+  secret: string;
+  /** Maximum continuation lifetime. Defaults to five minutes. */
+  ttlMs?: number;
+};
+
 /**
  * Origin allowlist for `handleMcpRequest`. MCP Streamable HTTP requires
  * servers to validate the `Origin` header to prevent DNS-rebinding
@@ -381,6 +389,21 @@ export interface HandleMcpRequestOptions {
     subscribe?: boolean;
     listChanged?: boolean;
   };
+  /**
+   * Opt-in support for modern multi-round-trip requests (MRTR). A
+   * declarative tool's host-side `beforeCall` hook is the state machine:
+   * on the first call it can return `inputRequired(inputRequests, state)`
+   * before the underlying Convex function can run; on every verified
+   * continuation it runs again with the decoded state, the client's
+   * untrusted `inputResponses`, and the chain's stable idempotency key,
+   * and decides whether to ask for another round, finish without
+   * dispatching (`completeCall()`), or continue to the Convex function
+   * (which stays MCP-unaware; only the idempotency key is injectable via
+   * `mrtrArgs`). Continuations are HMAC-sealed, TTL-bound, bound to the
+   * caller/tool/arguments, and redeemed once server-side so a captured
+   * state cannot be replayed with different responses.
+   */
+  mrtr?: McpMrtrOptions;
 }
 
 /**
@@ -390,6 +413,7 @@ export interface HandleMcpRequestOptions {
  */
 type InternalHandleMcpRequestOptions = HandleMcpRequestOptions & {
   ensureCatalogSynced?: () => Promise<void>;
+  declarativeTools?: McpToolRegistration[];
 };
 
 export type McpHandlerCtx = {
@@ -416,6 +440,10 @@ type RegisteredTool = {
   inputSchema: unknown;
   outputSchema?: unknown;
   identityArg?: string;
+  mrtrArgs?: {
+    idempotencyKey: string;
+  };
+  mrtrGated?: boolean;
   protocolMetadata?: {
     title?: string;
     annotations?: unknown;
@@ -987,6 +1015,356 @@ function finalizeModernResult(
   return JSON.stringify(envelope);
 }
 
+type VerifiedMrtrState = {
+  state: unknown;
+  idempotencyKey: string;
+  jti: string;
+  round: number;
+  exp: number;
+};
+
+const MRTR_DEFAULT_TTL_MS = 5 * 60 * 1000;
+const MRTR_MAX_TTL_MS = 60 * 60 * 1000;
+const MRTR_MAX_STATE_BYTES = 8 * 1024;
+const MRTR_MIN_SECRET_BYTES = 32;
+/**
+ * Hard ceiling on continuation rounds per chain. MRTR server
+ * requirement 8 permits repeated `InputRequiredResult`s, but an
+ * unbounded chain lets a buggy hook ping-pong with a client forever.
+ */
+const MRTR_MAX_ROUNDS = 16;
+
+function isMcpInputRequiredResult(
+  value: unknown,
+): value is McpInputRequiredResult {
+  return (
+    isPlainObject(value) &&
+    value.__mcpInputRequired === true &&
+    (value.inputRequests === undefined || isPlainObject(value.inputRequests))
+  );
+}
+
+function isMcpCompleteCallResult(
+  value: unknown,
+): value is { __mcpCompleteCall: true; result: Record<string, unknown> } {
+  return (
+    isPlainObject(value) &&
+    value.__mcpCompleteCall === true &&
+    isPlainObject(value.result)
+  );
+}
+
+/**
+ * A well-formed MCP `tools/call` result carries a `content` array (the
+ * spec-required field); `structuredContent` and `isError` are optional.
+ * A `completeCall()` result is forwarded verbatim to the client, so the
+ * gateway validates it here rather than shipping a shape a spec-
+ * compliant client would reject. Returns a problem string, or `null`
+ * when valid.
+ */
+function describeCompleteCallResultProblem(
+  result: Record<string, unknown>,
+): string | null {
+  if (!Array.isArray(result.content)) {
+    return "result.content must be an array";
+  }
+  if (
+    result.structuredContent !== undefined &&
+    !isPlainObject(result.structuredContent) &&
+    !Array.isArray(result.structuredContent)
+  ) {
+    return "result.structuredContent must be an object or array";
+  }
+  if (result.isError !== undefined && typeof result.isError !== "boolean") {
+    return "result.isError must be a boolean";
+  }
+  return null;
+}
+
+/**
+ * Accumulate the client capabilities a set of `inputRequests` demands.
+ * Elicitation is tracked per mode (`form` / `url`); a request without a
+ * `mode` is a form request per the spec default. Returns `null` for a
+ * request shape or method the gateway cannot vouch for.
+ */
+function mrtrRequiredCapabilities(
+  inputRequests: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const elicitationModes: { form?: object; url?: object } = {};
+  const required: Record<string, unknown> = {};
+  for (const request of Object.values(inputRequests)) {
+    if (!isPlainObject(request) || typeof request.method !== "string") {
+      return null;
+    }
+    switch (request.method) {
+      case "elicitation/create": {
+        const mode = isPlainObject(request.params)
+          ? request.params.mode
+          : undefined;
+        if (mode !== undefined && mode !== "form" && mode !== "url")
+          return null;
+        // Merge instead of overwrite: two requests with different modes
+        // require BOTH modes, and a later form request must not erase an
+        // earlier url requirement.
+        elicitationModes[(mode ?? "form") as "form" | "url"] = {};
+        required.elicitation = elicitationModes;
+        break;
+      }
+      case "sampling/createMessage":
+        required.sampling = {};
+        break;
+      case "roots/list":
+        required.roots = {};
+        break;
+      default:
+        return null;
+    }
+  }
+  return required;
+}
+
+/**
+ * The subset of `required` the client did NOT declare, in the exact
+ * shape `-32021`'s `data.requiredCapabilities` must carry (only the
+ * missing entries, per `basic/index`). Empty object means fully
+ * supported. Mode-aware in both directions: `elicitation: {}` is
+ * equivalent to declaring form-only (spec backwards-compat rule), and a
+ * url-only client does not support form requests.
+ */
+function missingMrtrCapabilities(
+  clientCapabilities: Record<string, unknown>,
+  required: Record<string, unknown>,
+): Record<string, unknown> {
+  const missing: Record<string, unknown> = {};
+  for (const [name, requirement] of Object.entries(required)) {
+    const declared = clientCapabilities[name];
+    if (!isPlainObject(declared)) {
+      missing[name] = requirement;
+      continue;
+    }
+    if (name === "elicitation" && isPlainObject(requirement)) {
+      const declaresNoModes =
+        !isPlainObject(declared.form) && !isPlainObject(declared.url);
+      const supportsForm = isPlainObject(declared.form) || declaresNoModes;
+      const supportsUrl = isPlainObject(declared.url);
+      const missingModes: Record<string, unknown> = {};
+      if ("form" in requirement && !supportsForm) missingModes.form = {};
+      if ("url" in requirement && !supportsUrl) missingModes.url = {};
+      if (Object.keys(missingModes).length > 0) {
+        missing.elicitation = missingModes;
+      }
+    }
+  }
+  return missing;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+function base64UrlDecode(value: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const padded = `${value.replaceAll("-", "+").replaceAll("_", "/")}${"=".repeat((4 - (value.length % 4)) % 4)}`;
+    return Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function cryptoBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+function stableJson(value: unknown): string {
+  // Mirror JSON.stringify's undefined semantics so every output is
+  // valid JSON: top-level and array-item undefined become null, and
+  // undefined-valued properties are omitted. Without this, a call site
+  // that forgot a `?? null` guard would embed a literal `undefined`
+  // token (or return the value undefined) into digest input.
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(",")}}`;
+}
+
+async function sha256Base64Url(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+/**
+ * True when `mrtr.secret` cannot key HMAC-SHA-256 safely. Checked up
+ * front by the handler so a short secret surfaces as a `-32603` server
+ * misconfiguration on BOTH the seal and verify paths, never as a
+ * `-32602` that blames the client for a state that may be perfectly
+ * valid.
+ */
+function mrtrSecretTooShort(options: McpMrtrOptions): boolean {
+  return (
+    new TextEncoder().encode(options.secret).byteLength <
+    MRTR_MIN_SECRET_BYTES
+  );
+}
+
+async function mrtrKey(secret: string): Promise<CryptoKey> {
+  if (new TextEncoder().encode(secret).byteLength < MRTR_MIN_SECRET_BYTES) {
+    throw new Error("MRTR secret must contain at least 32 bytes");
+  }
+  return await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+}
+
+/**
+ * Seal one continuation round. `argsDigest` is computed by the caller
+ * BEFORE the hook runs, so a hook that mutates its (copied) argument
+ * object can never poison the digest the retry is checked against.
+ * `idempotencyKey` is minted once on round 1 and carried verbatim
+ * through every later round of the chain; `jti` is fresh per round and
+ * anchors the one-time redemption record.
+ */
+async function sealMrtrState(
+  options: McpMrtrOptions,
+  payloadFields: {
+    toolName: string;
+    identitySubject: string | null;
+    argsDigest: string;
+    state: unknown;
+    idempotencyKey: string;
+    round: number;
+  },
+): Promise<string> {
+  const encodedState = stableJson(payloadFields.state);
+  if (
+    new TextEncoder().encode(encodedState).byteLength > MRTR_MAX_STATE_BYTES
+  ) {
+    throw new Error("MRTR state exceeds 8 KiB");
+  }
+  // `ttlMs` is a host option, not client input, so a nonsensical value
+  // (0, negative, NaN, Infinity) is a server misconfiguration. Throw so
+  // the seal path reports it as -32603, never as a -32602 that would
+  // mint a dead-on-arrival continuation and then blame the client's
+  // retry for the "expired" state it was handed.
+  if (
+    options.ttlMs !== undefined &&
+    (!Number.isFinite(options.ttlMs) || options.ttlMs <= 0)
+  ) {
+    throw new Error("MRTR ttlMs must be a positive finite number");
+  }
+  const ttlMs = Math.min(
+    options.ttlMs ?? MRTR_DEFAULT_TTL_MS,
+    MRTR_MAX_TTL_MS,
+  );
+  const now = Date.now();
+  const payload = {
+    v: 2,
+    toolName: payloadFields.toolName,
+    identitySubject: payloadFields.identitySubject,
+    argsDigest: payloadFields.argsDigest,
+    exp: now + ttlMs,
+    jti: crypto.randomUUID(),
+    round: payloadFields.round,
+    idempotencyKey: payloadFields.idempotencyKey,
+    state: payloadFields.state,
+  };
+  const encoded = base64UrlEncode(
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await mrtrKey(options.secret),
+    new TextEncoder().encode(encoded),
+  );
+  return `${encoded}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+/**
+ * Verify one continuation. Returns `null` when verification RAN and
+ * said no (tampered, expired, wrong principal/tool/arguments): `-32602`
+ * territory. Throws when verification could not run at all (e.g. a
+ * misconfigured secret): the caller maps that to `-32603` instead of
+ * blaming the client.
+ */
+async function verifyMrtrState(
+  options: McpMrtrOptions,
+  requestState: unknown,
+  expected: {
+    toolName: string;
+    identitySubject: string | null;
+    argsDigest: string;
+  },
+): Promise<VerifiedMrtrState | null> {
+  if (typeof requestState !== "string") return null;
+  const [encoded, signature, extra] = requestState.split(".");
+  if (!encoded || !signature || extra !== undefined) return null;
+  const signatureBytes = base64UrlDecode(signature);
+  if (
+    !signatureBytes ||
+    !(await crypto.subtle.verify(
+      "HMAC",
+      await mrtrKey(options.secret),
+      cryptoBuffer(signatureBytes),
+      new TextEncoder().encode(encoded),
+    ))
+  ) {
+    return null;
+  }
+  const payloadBytes = base64UrlDecode(encoded);
+  if (!payloadBytes) return null;
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(payloadBytes)) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return null;
+  }
+  if (
+    payload.v !== 2 ||
+    payload.toolName !== expected.toolName ||
+    payload.identitySubject !== expected.identitySubject ||
+    typeof payload.exp !== "number" ||
+    payload.exp < Date.now() ||
+    typeof payload.jti !== "string" ||
+    typeof payload.round !== "number" ||
+    !Number.isSafeInteger(payload.round) ||
+    payload.round < 1 ||
+    typeof payload.idempotencyKey !== "string" ||
+    payload.argsDigest !== expected.argsDigest
+  ) {
+    return null;
+  }
+  return {
+    state: payload.state,
+    idempotencyKey: payload.idempotencyKey,
+    jti: payload.jti,
+    round: payload.round,
+    exp: payload.exp,
+  };
+}
+
 async function ensureCatalogSynced(
   options: InternalHandleMcpRequestOptions,
 ): Promise<void> {
@@ -1495,6 +1873,7 @@ async function handlePost(
     !isInitialize &&
     (headerProtocolVersion === MODERN_PROTOCOL_VERSION ||
       metadataProtocolVersion !== null);
+  let modernClientCapabilities: Record<string, unknown> | null = null;
 
   // The 2026 protocol moves protocol negotiation to each request. Check the
   // mirrored routing metadata before identity resolution, catalog writes,
@@ -1535,6 +1914,7 @@ async function handlePost(
         "Invalid required modern request metadata",
       );
     }
+    modernClientCapabilities = clientCapabilities;
     if (request.headers.get("mcp-method") !== message.method) {
       return modernErrorResponse(
         message.id,
@@ -2451,7 +2831,9 @@ async function handlePost(
         body = jsonErrorEnvelope(message.id, -32602, "Missing tool name");
         break;
       }
-      const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
+      const args = isPlainObject(message.params?.arguments)
+        ? { ...message.params?.arguments }
+        : ((message.params?.arguments ?? {}) as Record<string, unknown>);
 
       const tool = (await ctx.runQuery(component.registry.getTool, {
         name,
@@ -2461,6 +2843,18 @@ async function handlePost(
         // callers can spam arbitrary names with arbitrary args.
         body = jsonErrorEnvelope(message.id, -32602, `Unknown tool: ${name}`);
         break;
+      }
+
+      // Reserved fields are never client-controlled. Strip them on both
+      // first calls and retries before any digest, authorization, or audit.
+      if (tool.mrtrArgs) {
+        delete args[tool.mrtrArgs.idempotencyKey];
+      }
+
+      // Identity is also gateway-owned. Strip it before calculating an MRTR
+      // argument digest so a spoofed value cannot invalidate a continuation.
+      if (tool.identityArg !== undefined) {
+        delete args[tool.identityArg];
       }
 
       if (isModern) {
@@ -2497,11 +2891,38 @@ async function handlePost(
         }
       }
 
-      // Identity-injected arg: the gateway fills this server-side from the
-      // resolved caller, so a client-supplied value is meaningless and a
-      // spoofing vector. Strip it before authorize / audit / dispatch.
-      if (tool.identityArg !== undefined) {
-        delete args[tool.identityArg];
+      const requestState = message.params?.requestState;
+      const inputResponses = message.params?.inputResponses;
+      const declarativeTool = options.declarativeTools?.find(
+        (candidate) => candidate.name === tool.name,
+      );
+      const beforeCall = declarativeTool?.beforeCall;
+      // A registered row is "gated" when it promises a confirmation
+      // hook: registered from a declarative catalog with `beforeCall`,
+      // or reserving `mrtrArgs` (which is meaningless without one).
+      const mrtrGated =
+        tool.mrtrGated === true ||
+        tool.mrtrArgs !== undefined ||
+        beforeCall !== undefined;
+
+      // Fail closed: a gated registry row served by a handler with no
+      // matching hook (imperative registration, stale declarative
+      // catalog, or a mount without the `tools` option) must never
+      // dispatch ungated — that would silently skip the confirmation
+      // the row promises, on any transport.
+      if (mrtrGated && !beforeCall) {
+        console.error(
+          "[mcp-gateway] tool is registered as MRTR-gated but this " +
+            "handler has no beforeCall for it; failing closed",
+          tool.name,
+        );
+        body = jsonErrorEnvelope(
+          message.id,
+          INTERNAL_ERROR,
+          `Tool "${tool.name}" requires a confirmation hook this ` +
+            "deployment did not configure",
+        );
+        break;
       }
 
       const start = Date.now();
@@ -2515,11 +2936,18 @@ async function handlePost(
       });
       const threw = authz.threw;
       let decision = authz.decision;
-      // A tool that declares identityArg structurally needs a caller. If
-      // none was resolved, deny as Unauthorized (so the client starts the
-      // OAuth flow) regardless of what the host's authorize returned.
-      // The tool must never run unscoped.
-      if (decision.allowed && tool.identityArg !== undefined && !identity) {
+      // A tool that declares identityArg structurally needs a caller,
+      // and so does an MRTR hook (its contract passes a non-null
+      // identity, and a continuation must bind to a principal). Deny as
+      // Unauthorized regardless of what the host's authorize returned,
+      // through this shared path so the client gets the real 401 +
+      // WWW-Authenticate challenge and the denial lands in the audit
+      // log like every other one.
+      if (
+        decision.allowed &&
+        (tool.identityArg !== undefined || beforeCall !== undefined) &&
+        !identity
+      ) {
         decision = {
           allowed: false,
           reason: "Unauthorized: tool requires an authenticated caller",
@@ -2596,11 +3024,364 @@ async function handlePost(
         break;
       }
 
-      // Allowed: dispatch via the component, which runs the registered
-      // handle and writes the audit entry.
+      // MRTR continuation verification, after authorization so denials
+      // and anonymous callers went through the audited 401 path above.
+      let continuation: VerifiedMrtrState | null = null;
+      let mrtrArgsDigest: string | null = null;
+      if (
+        isModern &&
+        (requestState !== undefined || inputResponses !== undefined)
+      ) {
+        if (!options.mrtr || requestState === undefined) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "MRTR retries require configured state verification and requestState",
+          );
+          break;
+        }
+        if (!beforeCall) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Tool does not support declarative MRTR continuations",
+          );
+          break;
+        }
+        if (mrtrSecretTooShort(options.mrtr)) {
+          // Server misconfiguration, never the client's fault: the
+          // state being verified may be perfectly valid.
+          console.error(
+            "[mcp-gateway] mrtr.secret is shorter than 32 bytes; " +
+              "refusing to verify continuations",
+          );
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR is misconfigured on this gateway",
+          );
+          break;
+        }
+        if (inputResponses !== undefined && !isPlainObject(inputResponses)) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "MRTR inputResponses must be an object",
+          );
+          break;
+        }
+        mrtrArgsDigest = await sha256Base64Url(stableJson(args));
+        try {
+          continuation = await verifyMrtrState(options.mrtr, requestState, {
+            toolName: tool.name,
+            identitySubject: auditIdentitySubject,
+            argsDigest: mrtrArgsDigest,
+          });
+        } catch (err) {
+          // Verification could not run (as opposed to running and
+          // saying no): -32603, mirroring the sealing path.
+          console.error(
+            "[mcp-gateway] MRTR state verification failed to run",
+            err,
+          );
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR verification failed",
+          );
+          break;
+        }
+        if (!continuation) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Invalid, expired, or mismatched MRTR requestState",
+          );
+          break;
+        }
+        // One-time redemption: a continuation stays cryptographically
+        // valid until its TTL, so first use pins the responses it was
+        // answered with. A byte-identical re-send is an idempotent
+        // replay (safe to re-process); different responses for the same
+        // continuation would let a captured state flip an
+        // already-resolved decision (decline -> accept) and are
+        // rejected. Guarded like every sibling step: a redemption that
+        // cannot RUN (e.g. the component deployment predates the
+        // mrtrRedemptions table) is a logged -32603, not a raw 500 that
+        // skips the CORS wrapper.
+        let redemption: "fresh" | "replay" | "conflict";
+        try {
+          redemption = await ctx.runMutation(
+            component.mrtr.redeemContinuation,
+            {
+              jti: continuation.jti,
+              responsesDigest: await sha256Base64Url(
+                stableJson(inputResponses ?? null),
+              ),
+              expiresAt: continuation.exp,
+            },
+          );
+        } catch (err) {
+          console.error(
+            "[mcp-gateway] MRTR continuation redemption failed to run " +
+              "(is the component deployment up to date?)",
+            tool.name,
+            err,
+          );
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR verification failed",
+          );
+          break;
+        }
+        if (redemption === "conflict") {
+          // Either the replay-flip attack this mechanism exists for, or
+          // a client re-collecting semantically identical answers into
+          // byte-different responses. Make the event observable so an
+          // operator can tell the two apart.
+          console.warn(
+            "[mcp-gateway] MRTR continuation redeemed with different " +
+              "responses; rejecting",
+            tool.name,
+            continuation.jti,
+          );
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "This MRTR continuation was already used with different input " +
+              "responses. Re-send the exact previous responses, or restart " +
+              "the call without requestState",
+          );
+          break;
+        }
+      }
+
+      // The host-side MRTR state machine. It runs before `runTool` on
+      // the first call AND on every verified continuation, so the
+      // decision to dispatch (accept), ask again (missing input), or
+      // finish without dispatching (decline/cancel) lives in the
+      // gateway hook — the underlying Convex function never parses MCP
+      // envelopes. It runs on EVERY transport so required input is
+      // never silently bypassed: when it demands input and the request
+      // cannot carry a continuation (legacy protocol, or `mrtr` not
+      // configured), the call fails closed instead of dispatching.
+      if (beforeCall) {
+        // Digest BEFORE the hook, over the client-sent (stripped)
+        // arguments: a hook that mutates even a nested value of its
+        // (shallow-copied) argument object must not poison the digest
+        // the next retry is checked against.
+        const argsDigest =
+          mrtrArgsDigest ?? (await sha256Base64Url(stableJson(args)));
+        let requested: unknown;
+        try {
+          requested = await beforeCall(ctx, {
+            // JSON round-trip: args are JSON by construction, and a
+            // deep copy keeps hook-side normalization away from both
+            // the digest above and the dispatch below.
+            args: JSON.parse(JSON.stringify(args)) as Record<string, unknown>,
+            identity: identity!,
+            ...(continuation
+              ? {
+                  state: continuation.state,
+                  ...(isPlainObject(inputResponses)
+                    ? { inputResponses }
+                    : {}),
+                  idempotencyKey: continuation.idempotencyKey,
+                  round: continuation.round,
+                }
+              : {}),
+          });
+        } catch (err) {
+          console.error("[mcp-gateway] MRTR beforeCall failed", tool.name, err);
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR beforeCall failed",
+          );
+          break;
+        }
+        if (isMcpCompleteCallResult(requested)) {
+          // Terminal without dispatch, e.g. a declined confirmation.
+          // Valid on both eras: it is an ordinary tools/call result.
+          // Validate the shape rather than forward a malformed result a
+          // spec-compliant client would reject, matching how every other
+          // hook output is checked.
+          const problem = describeCompleteCallResultProblem(requested.result);
+          if (problem) {
+            console.error(
+              "[mcp-gateway] MRTR beforeCall completeCall() returned a " +
+                "malformed tools/call result",
+              tool.name,
+              problem,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR beforeCall returned an invalid result",
+            );
+            break;
+          }
+          body = jsonResultEnvelope(message.id, requested.result);
+          break;
+        }
+        if (requested !== null && requested !== undefined) {
+          if (!isMcpInputRequiredResult(requested)) {
+            // A host-side hook bug (e.g. completeCall with a non-object
+            // result). Leave the operator a breadcrumb: tool name plus
+            // the returned shape, never the value itself (it may carry
+            // host-private state).
+            console.error(
+              "[mcp-gateway] MRTR beforeCall returned an invalid result",
+              tool.name,
+              isPlainObject(requested)
+                ? `object keys: ${Object.keys(requested).join(", ")}`
+                : typeof requested,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR beforeCall returned an invalid result",
+            );
+            break;
+          }
+          if (!isModern) {
+            body = jsonErrorEnvelope(
+              message.id,
+              -32601,
+              `Tool "${tool.name}" requires multi-round-trip input; ` +
+                `connect with MCP protocol ${MODERN_PROTOCOL_VERSION} or later`,
+            );
+            break;
+          }
+          if (!options.mrtr) {
+            console.error(
+              "[mcp-gateway] beforeCall requested input but the `mrtr` " +
+                "option is not configured; failing closed for tool",
+              tool.name,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR is not configured on this gateway",
+            );
+            break;
+          }
+          if (mrtrSecretTooShort(options.mrtr)) {
+            console.error(
+              "[mcp-gateway] mrtr.secret is shorter than 32 bytes; " +
+                "refusing to seal a continuation",
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR is misconfigured on this gateway",
+            );
+            break;
+          }
+          const round = (continuation?.round ?? 0) + 1;
+          if (round > MRTR_MAX_ROUNDS) {
+            console.error(
+              "[mcp-gateway] MRTR chain exceeded the round ceiling",
+              tool.name,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR continuation exceeded the round limit",
+            );
+            break;
+          }
+          const inputRequests = requested.inputRequests ?? {};
+          const requiredCapabilities = mrtrRequiredCapabilities(inputRequests);
+          if (!requiredCapabilities) {
+            // Another host-side hook bug: a request method or shape the
+            // gateway cannot vouch for (typo'd method, unknown
+            // elicitation mode). Name the offending methods so the hook
+            // author can find it.
+            console.error(
+              "[mcp-gateway] MRTR beforeCall returned unsupported input " +
+                "requests",
+              tool.name,
+              Object.values(inputRequests)
+                .map((request) =>
+                  isPlainObject(request)
+                    ? String(request.method)
+                    : typeof request,
+                )
+                .join(", "),
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR beforeCall returned unsupported input requests",
+            );
+            break;
+          }
+          const missingCapabilities = missingMrtrCapabilities(
+            // Guaranteed non-null here (validated for every modern
+            // request, and legacy requests broke at the -32601 above);
+            // the fallback only satisfies the type system.
+            modernClientCapabilities ?? {},
+            requiredCapabilities,
+          );
+          if (Object.keys(missingCapabilities).length > 0) {
+            return modernErrorResponse(
+              message.id,
+              -32021,
+              "Client lacks a capability required for MRTR input requests",
+              // Per spec, data.requiredCapabilities lists only what is
+              // MISSING, not the full required set.
+              { requiredCapabilities: missingCapabilities },
+            );
+          }
+          try {
+            body = jsonResultEnvelope(message.id, {
+              resultType: "input_required",
+              ...(Object.keys(inputRequests).length > 0
+                ? { inputRequests }
+                : {}),
+              requestState: await sealMrtrState(options.mrtr, {
+                toolName: tool.name,
+                identitySubject: auditIdentitySubject,
+                argsDigest,
+                state: requested.state ?? null,
+                // Round 1 mints the chain's key; later rounds carry it.
+                idempotencyKey:
+                  continuation?.idempotencyKey ?? crypto.randomUUID(),
+                round,
+              }),
+            });
+          } catch (err) {
+            console.error(
+              "[mcp-gateway] failed to seal MRTR requestState",
+              tool.name,
+              err,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "Failed to create MRTR request state",
+            );
+          }
+          break;
+        }
+      }
+
+      // Allowed (and hook-approved, when one exists): dispatch via the
+      // component. Only the chain's idempotency key is ever injected;
+      // continuation state and input responses stayed in the hook, so
+      // the Convex function remains MCP-unaware.
+      const dispatchArgs =
+        continuation && tool.mrtrArgs
+          ? {
+              ...args,
+              [tool.mrtrArgs.idempotencyKey]: continuation.idempotencyKey,
+            }
+          : args;
       const dispatched = await ctx.runAction(component.dispatch.runTool, {
         name,
-        args,
+        args: dispatchArgs,
         auditIdentitySubject,
         identity,
       });

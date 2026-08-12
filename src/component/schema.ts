@@ -46,6 +46,26 @@ export default defineSchema({
      * without the column stay valid courtesy of `v.optional`.
      */
     identityArg: v.optional(v.string()),
+    /**
+     * Name of the tool argument the gateway fills with the MRTR
+     * continuation's stable idempotency key when a verified retry
+     * continues to dispatch. Excluded from the advertised inputSchema
+     * and stripped from caller args. Continuation state and input
+     * responses are never injected; they stay in the host-side hook.
+     */
+    mrtrArgs: v.optional(
+      v.object({
+        idempotencyKey: v.string(),
+      }),
+    ),
+    /**
+     * True when the tool was registered with a host-side `beforeCall`
+     * hook (or reserves `mrtrArgs`). A gated row must never dispatch
+     * without its hook: a handler serving this registry without a
+     * matching `beforeCall` fails the call closed instead of silently
+     * skipping the confirmation the row promises.
+     */
+    mrtrGated: v.optional(v.boolean()),
     /** MCP-facing title, annotations, `_meta`, and security schemes. */
     protocolMetadata: v.optional(v.any()),
     metadata: v.optional(v.any()),
@@ -178,6 +198,25 @@ export default defineSchema({
   })
     .index("by_session_uri", ["sessionId", "uri"])
     .index("by_uri", ["uri"]),
+
+  /**
+   * One-time redemption of MRTR continuations, one row per redeemed
+   * continuation id (`jti`, minted into the sealed `requestState`).
+   * A continuation stays cryptographically valid until its TTL, so
+   * without this table a captured `requestState` could be replayed
+   * with different `inputResponses` and flip an already-resolved
+   * decision (decline → accept). First redemption wins: a retry with
+   * byte-identical responses is an idempotent replay and re-processes;
+   * different responses for the same `jti` are rejected. Expired rows
+   * are dropped by `pruneMrtrRedemptions` from a host cron.
+   */
+  mrtrRedemptions: defineTable({
+    jti: v.string(),
+    responsesDigest: v.string(),
+    expiresAt: v.number(),
+  })
+    .index("by_jti", ["jti"])
+    .index("by_expiresAt", ["expiresAt"]),
 
   /**
    * Shared audit log for tool calls and opt-in resource operations.
