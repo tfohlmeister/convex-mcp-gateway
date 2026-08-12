@@ -57,7 +57,7 @@ await gateway.setOAuthConfig(ctx, { authServerUrl: process.env.CONVEX_SITE_URL }
 ```
 
 Tip: deploy-time hooks (e.g. `convex deploy --preview-run`) don't have
-`CONVEX_SITE_URL`; set the OAuth config lazily on the first request instead — it
+`CONVEX_SITE_URL`; set the OAuth config lazily on the first request instead, because it
 *is* available inside `httpAction`s.
 
 ## 3. Browser login continuation (cross-domain session)

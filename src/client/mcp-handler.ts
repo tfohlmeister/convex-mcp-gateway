@@ -314,7 +314,7 @@ export interface HandleMcpRequestOptions {
    * Server-level guidance returned in the MCP `initialize` result's
    * `instructions` field (see the spec's `InitializeResult.instructions`).
    * Clients may hand this to the LLM to explain how to use the server as a
-   * whole — e.g. "call `kira_load_skill` before answering" — without bloating
+   * whole, e.g. "call `kira_load_skill` before answering", without bloating
    * individual tool descriptions. Omitted from the response entirely when
    * unset, so the default `initialize` shape is unchanged.
    *
@@ -366,7 +366,7 @@ export interface HandleMcpRequestOptions {
    * Set these flags ONLY when the host fronts the gateway with a transport
    * that CAN deliver notifications (its own SSE/WebSocket layer). The
    * gateway then advertises the capability and tracks subscribe/unsubscribe
-   * state per session; the host owns delivery — it reads
+   * state per session; the host owns delivery, it reads
    * `gateway.listResourceSubscribers(uri)` and ships payloads built with
    * `gateway.buildResourceUpdatedNotification` /
    * `gateway.buildResourceListChangedNotification`.
@@ -1735,7 +1735,7 @@ async function handlePost(
       // Advertise the resources capability when any resource feature is
       // configured. The subscribe/listChanged flags are added only when the
       // host opts in (and thus has a transport that can deliver); otherwise
-      // the capability stays `{}` — the historical, accurate default.
+      // the capability stays `{}`, the historical, accurate default.
       const advertiseResources =
         registeredResources.length > 0 ||
         registeredTemplates.length > 0 ||
@@ -1837,7 +1837,7 @@ async function handlePost(
         // requests with no Bearer; auditing the denials would let them grow
         // the audit table without bound (and `resources/read` carries a
         // caller-controlled `uri`). Mirrors the unknown-tool path in
-        // dispatch.ts — only authenticated outcomes are audited.
+        // dispatch.ts: only authenticated outcomes are audited.
         body = jsonErrorEnvelope(
           message.id,
           UNAUTHORIZED,
@@ -1848,7 +1848,7 @@ async function handlePost(
       try {
         // Isolate each provider: a single provider that throws must not
         // collapse the whole catalog. Mirrors the per-item isolation
-        // tools/list uses for authorizer throws — a buggy provider hides
+        // tools/list uses for authorizer throws: a buggy provider hides
         // only its own resources, the healthy providers still list.
         const providerResources = (
           await Promise.all(
@@ -1966,7 +1966,7 @@ async function handlePost(
         break;
       }
       if (!identity) {
-        // Not audited on the anonymous deny path — see the resources/list
+        // Not audited on the anonymous deny path, see the resources/list
         // rationale: anonymous spam must never grow the audit table.
         body = jsonErrorEnvelope(
           message.id,
@@ -2074,7 +2074,7 @@ async function handlePost(
         break;
       }
       if (!identity) {
-        // Not audited on the anonymous deny path — see the resources/list
+        // Not audited on the anonymous deny path, see the resources/list
         // rationale. This matters most here: the denied `read` carries a
         // caller-controlled `uri`, so auditing would let an unauthenticated
         // client grow the table with arbitrary large URIs after one

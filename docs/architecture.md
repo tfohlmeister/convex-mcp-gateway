@@ -96,9 +96,12 @@ declarative catalog is synchronized before discovery or dispatch. The legacy
 wire contract remains unchanged: `initialize` always uses the session path,
 including when a client incorrectly includes modern metadata.
 
+The table below describes the **legacy** session lifecycle. Modern
+requests use `POST` only; `GET` and `DELETE` play no part in them.
+
 | Method | Purpose | Notes |
 |---|---|---|
-| `POST /mcp/` | Send a JSON-RPC message | First call must be `initialize`; subsequent calls require `Mcp-Session-Id` |
+| `POST /mcp/` | Send a JSON-RPC message | Legacy: first call must be `initialize`, subsequent calls require `Mcp-Session-Id`. Modern: no session, each request stands alone |
 | `GET /mcp/` | Open server-initiated SSE channel | Returns `405 Method Not Allowed`; we don't push notifications yet |
 | `DELETE /mcp/` | Terminate session | Drops the session row; subsequent requests with that id get `404` |
 
@@ -109,7 +112,10 @@ based on the client's `Accept` header:
 - `Accept: text/event-stream` → single-frame SSE response with the same
   payload wrapped in an event. Used by clients that prefer streaming
   transport even for short responses; ready for future progress
-  notifications without protocol change.
+  notifications without protocol change. Legacy frames carry an event
+  id; modern ones do not, because `2026-07-28` removed `Last-Event-ID`
+  resumability. Both set `X-Accel-Buffering: no` so reverse proxies
+  don't hold the frame back.
 
 ![Streamable HTTP session lifecycle](./diagrams/session-lifecycle.svg)
 
@@ -120,19 +126,28 @@ that get `404` on a previously valid session id MUST start a fresh
 the host can schedule `gateway.pruneSessions(ctx, idleMs)` from a
 cron if needed.
 
-### Registry sync on `initialize`
+### Registry sync
 
 When the host passes the declarative `tools` option to
-`handleMcpRequest`, the registry is reconciled on each `initialize`. The
-sync is change-detected: the gateway fingerprints the list (function
-names + schemas + protocol metadata + metadata, no handle creation) and
-compares it against the `config.toolsFingerprint` stored at the last
-sync. On a match it does nothing, so the steady-state cost per
-connection is a single cheap lookup; only an actual change triggers the
-atomic `replaceTools`. A sync failure (e.g. a duplicate tool name) fails
-the `initialize` loudly and logs the cause. Hosts that prefer to
-register imperatively omit `tools` and call `gateway.register` from a
-mutation instead.
+`handleMcpRequest`, the registry is reconciled on each legacy
+`initialize` and before every modern request, since a stateless request
+has no handshake to hang the sync on. The sync is change-detected: the
+gateway fingerprints the list (function names + schemas + protocol
+metadata + metadata, no handle creation) and compares it against the
+`config.toolsFingerprint` stored at the last sync. On a match it does
+nothing, so the steady-state cost is a single cheap lookup; only an
+actual change triggers the atomic `replaceTools`.
+
+A malformed catalog (a duplicate tool name, or an `x-mcp-header`
+annotation that isn't statically reachable through `properties`) fails
+the sync loudly and logs which list is at fault. That is deliberate:
+a declarative catalog is all-or-nothing, and silently dropping the
+offending tool is exactly the drift this API exists to prevent. It does
+mean one bad entry takes the endpoint down until the list is fixed.
+
+Hosts that prefer to register imperatively omit `tools` and call
+`gateway.register` from a mutation instead; the same validation runs
+there, failing the mutation with the tool named.
 
 ## Request flow: `tools/call`
 

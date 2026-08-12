@@ -429,7 +429,7 @@ export const replaceTools = mutation({
       }
     }
     // Persist (or clear) the declarative fingerprint without disturbing the
-    // OAuth fields. `args.fingerprint` being undefined clears it — the
+    // OAuth fields. `args.fingerprint` being undefined clears it, and the
     // imperative-register path invalidating any prior declarative sync.
     await putConfigFingerprint(ctx, "toolsFingerprint", args.fingerprint);
     return null;

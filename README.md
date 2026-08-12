@@ -191,8 +191,8 @@ client like **claude.ai**, add `requireAuth: true` to the
 only reacts to a 401. See
 [OAuth: all-private servers](./docs/oauth.md#all-private-servers-and-browser-clients-requireauth).
 
-To give the model server-level guidance — how to use the server as a whole,
-not any single tool — pass `initializeInstructions` to `handleMcpRequest`. It
+To give the model server-level guidance (how to use the server as a whole,
+not any single tool), pass `initializeInstructions` to `handleMcpRequest`. It
 populates the `initialize` result's `instructions` field and is omitted when
 unset, so the default response shape is unchanged. It's a best-effort hint
 (per the spec clients MAY use it; some ignore it), so keep it short and don't
@@ -283,7 +283,7 @@ export const resources = [
 ```
 
 ```ts
-// convex/http.ts — add `resources` to the same mount as `tools`
+// convex/http.ts: add `resources` to the same mount as `tools`
 const mcp = httpAction(async (ctx, req) =>
   gateway.handleMcpRequest(ctx, req, { authorize, tools, resources }),
 );

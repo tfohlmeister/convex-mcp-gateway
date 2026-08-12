@@ -252,7 +252,7 @@ export const listResourceSubscribers = query({
 /**
  * Drop subscription rows whose session no longer exists (e.g. sessions
  * dropped by `pruneSessions`, which does not cascade). Orphans are a
- * *sparse* predicate — they can sit anywhere in the table behind live rows —
+ * *sparse* predicate (they can sit anywhere in the table behind live rows)
  * so this scans a fixed window per call ordered by creation time and reports
  * a `cursor` to resume from. Returning "0 deleted" does NOT mean "done"
  * (the window may have held only live rows); drain by following `cursor`
@@ -266,7 +266,7 @@ export const pruneOrphanResourceSubscriptions = mutation({
   }),
   handler: async (ctx, args) => {
     // Scan a window by the system `by_creation_time` index so the cursor
-    // advances regardless of how many rows we actually delete — otherwise
+    // advances regardless of how many rows we actually delete, otherwise
     // a window full of live rows would stall the scan at the front forever.
     const rows = await ctx.db
       .query("subscriptions")

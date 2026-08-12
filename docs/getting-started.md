@@ -310,11 +310,17 @@ the `/mcp/` path the handler owns. Full guide: [oauth.md](./oauth.md).
 
 ## 6. Talk to it
 
-The gateway speaks **MCP 2025-06-18 Streamable HTTP**: every client
-must first `initialize` to receive a session ID, then include it on
-all subsequent requests via the `Mcp-Session-Id` header. JSON and SSE
-responses are both supported; the server picks based on the client's
-`Accept` header.
+The gateway speaks Streamable HTTP in two eras on the same endpoint.
+The walkthrough below uses the session-based one (**2025-03-26** and
+**2025-06-18**): every client first `initialize`s to receive a session
+ID, then includes it on all subsequent requests via the
+`Mcp-Session-Id` header. JSON and SSE responses are both supported; the
+server picks based on the client's `Accept` header.
+
+Stateless **2026-07-28** clients skip all of that: no `initialize`, no
+session ID, each request carries its own protocol metadata. See
+[the 2026-07-28 section in the README](../README.md#mcp-2026-07-28-clients)
+for the request contract.
 
 ```sh
 # 1. Initialize and capture the session id from the response header.

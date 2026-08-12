@@ -4,9 +4,9 @@ MCP **resources** are read-only content the gateway exposes alongside
 tools: a client lists them (`resources/list`) and reads them
 (`resources/read`). The gateway supports two flavours:
 
-- **Concrete resources** — a fixed URI (`docs://handbook`). Declare with
+- **Concrete resources**: a fixed URI (`docs://handbook`). Declare with
   `defineMcpResource`.
-- **Resource templates** — a parameterized URI pattern
+- **Resource templates**: a parameterized URI pattern
   (`weather://{city}/current`), advertised via `resources/templates/list`.
   Declare with `defineMcpResourceTemplate`.
 
@@ -15,7 +15,7 @@ Both run only for authenticated callers, flow through the same optional
 [Authorization](./authorization.md) and [Audit log](./audit-log.md).
 
 **Supported MCP methods:** `resources/list`, `resources/read`,
-`resources/templates/list`, and — opt-in — `resources/subscribe` /
+`resources/templates/list`, and, opt-in, `resources/subscribe` /
 `resources/unsubscribe`. The `notifications/resources/*` pushes are the
 host's responsibility (this gateway's HTTP transport can't push; see
 [Subscriptions](#subscriptions--change-notifications)). A complete runnable
@@ -62,14 +62,14 @@ doesn't pass a provider. See the registry-sync behaviour in
 ### Migrating from a raw provider
 
 Before `defineMcpResource` existed, the escape hatch was to pass a raw
-provider object — `{ name, list, read }` — straight to
+provider object (`{ name, list, read }`) straight to
 `handleMcpRequest({ resources })`. That still works (a `defineMcpResource`
 registration _is_ such a provider), but prefer the primitive: it declares
 the descriptor once (so `list` and the registry stay in sync), validates the
 shape at declaration time, and only invokes `read` for its own `uri`.
 
 ```ts
-// Before — raw provider escape hatch
+// Before: raw provider escape hatch
 const handbook = {
   name: "handbook",
   list: async () => [{ uri: "docs://handbook", name: "Operator handbook" }],
@@ -77,7 +77,7 @@ const handbook = {
     uri === "docs://handbook" ? [{ uri, text: await loadHandbook() }] : null,
 };
 
-// After — defineMcpResource (uri/name declared once; URI match handled for you)
+// After: defineMcpResource (uri/name declared once; URI match handled for you)
 const handbook = defineMcpResource({
   uri: "docs://handbook",
   name: "Operator handbook",
@@ -116,9 +116,9 @@ passed as a provider on the request) carries only `uri`/`name`/
 These shapes are validated at two points so structurally malformed
 descriptors never reach the client:
 
-- **Declaration time** — `defineMcpResource` / `defineMcpResourceTemplate`
+- **Declaration time**: `defineMcpResource` / `defineMcpResourceTemplate`
   throw on an invalid descriptor (bad `annotations`, negative `size`, etc.).
-- **Request time** — output from a resource _provider_ (`list`/`read`) and a
+- **Request time**: output from a resource _provider_ (`list`/`read`) and a
   template provider is validated before it is returned; an invalid descriptor
   or content array fails the whole operation with a deterministic
   `-32603` JSON-RPC error naming the bad field, rather than shipping
@@ -204,9 +204,9 @@ Only **RFC 6570 level-1** simple placeholders are supported:
 one URI path segment (it does not span `/`). The following throw at
 declaration time so an unusable template fails loudly:
 
-- operators — `{+var}`, `{#var}`, `{/var}`, `{.var}`, `{;var}`, `{?var}`,
+- operators: `{+var}`, `{#var}`, `{/var}`, `{.var}`, `{;var}`, `{?var}`,
   `{&var}`
-- comma lists — `{a,b}`
+- comma lists: `{a,b}`
 - a template with no placeholder (use `defineMcpResource` instead)
 - repeated variable names, unclosed `{`
 
@@ -217,8 +217,8 @@ Templates are persisted in the component registry and reconciled on
 `resourceTemplates` option is change-detected via a fingerprint and synced,
 and `resources/templates/list` merges the registered templates with the
 runtime providers (a runtime provider wins on a shared `uriTemplate`). Unlike
-concrete resources, templates persist their **full** descriptor — `title`
-and `annotations` included — so a registry-only template still lists its
+concrete resources, templates persist their **full** descriptor (`title`
+and `annotations` included) so a registry-only template still lists its
 complete shape. You can also manage the catalog imperatively with
 `gateway.registerResourceTemplate(s)` / `unregisterResourceTemplate` /
 `clearResourceTemplates`. Only catalog metadata is stored; the `read`
@@ -241,7 +241,7 @@ but resolves no reads until a matching runtime provider is supplied.
 > **List-deny is not read-deny.** `resources/read` of a template-expanded
 > URI is authorized under `mode: "resource_read"` with the _concrete_
 > expanded URI (e.g. `weather://london/current`) and `resourceMetadata:
-null` — not under `resource_templates_list` with the `uriTemplate`. So
+null`, not under `resource_templates_list` with the `uriTemplate`. So
 > hiding a template from `resources/templates/list` does **not** by itself
 > block reads of its expansions. `resource_templates_list` controls catalog
 > _visibility_; `resource_read` is the gate for every read. To deny reads of
@@ -260,7 +260,7 @@ each request gets exactly one response, `GET /mcp/` is `405` (no standalone
 server→client SSE stream), and there is no background process holding streams
 open. So subscriptions are **off by default**:
 
-- `initialize` advertises `capabilities.resources` as `{}` — neither
+- `initialize` advertises `capabilities.resources` as `{}`, neither
   `subscribe` nor `listChanged`.
 - `resources/subscribe` and `resources/unsubscribe` return `-32601` with a
   message explaining the capability isn't advertised.
@@ -287,7 +287,7 @@ true }` and the gateway then **tracks subscription state per session**:
 capped per session), `resources/unsubscribe` removes it, and an explicit
 session `DELETE` cascades its subscriptions.
 
-The gateway does **not** deliver notifications — you do, using the state it
+The gateway does **not** deliver notifications, you do, using the state it
 tracks plus the payload builders:
 
 ```ts
@@ -317,7 +317,7 @@ Notes:
   subscriptions (an explicit `DELETE` does). Run
   `gateway.pruneResourceSubscriptions(ctx)` alongside session pruning; it
   pages through the table in bounded windows and returns the total deleted.
-  `listResourceSubscribers` may briefly return session IDs that have ended —
+  `listResourceSubscribers` may briefly return session IDs that have ended,
   treat unknown sessions as no-ops.
 - **`listChanged` without `subscribe`.** You can set `listChanged: true`
   alone to advertise catalog-change notifications without per-resource

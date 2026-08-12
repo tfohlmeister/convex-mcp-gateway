@@ -74,7 +74,7 @@ See SECURITY.md for the reasoning behind the default.
   - One central `authorizeResource` hook gates list / read / templates-list;
     resource reads require an authenticated caller.
   - Opt-in `auditResources` records `list` / `read` / `templates_list`
-    operations (URI, operation, identity, outcome, duration) — never the
+    operations (URI, operation, identity, outcome, duration), never the
     resource contents.
   - Templates resolve `resources/read` server-side (concrete resources take
     precedence), with level-1 `{var}` matching validated at declaration time.

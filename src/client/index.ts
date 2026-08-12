@@ -495,7 +495,7 @@ function escapeRegExp(text: string): string {
 /**
  * Compile an RFC 6570 *level-1* URI template (simple `{var}` placeholders)
  * into a matcher. Each `{var}` matches exactly one URI path segment (no
- * `/`) — the correct behavior for simple string expansion, where reserved
+ * `/`), the correct behavior for simple string expansion, where reserved
  * characters are percent-encoded and so never appear literally. Operators
  * (`{+var}`, `{#var}`, `{/var}`, `{?var}`, `{&var}`, `{;var}`, `{.var}`)
  * and comma-separated variable lists (`{a,b}`) are intentionally
@@ -562,8 +562,8 @@ function compileUriTemplate(
 /**
  * Declare an MCP resource template (RFC 6570). The returned provider can be
  * passed to `gateway.handleMcpRequest({ resourceTemplates: [...] })`: it is
- * advertised via `resources/templates/list`, and — when a `read` handler is
- * supplied — used to resolve `resources/read` requests whose URI matches
+ * advertised via `resources/templates/list`, and, when a `read` handler is
+ * supplied, used to resolve `resources/read` requests whose URI matches
  * `uriTemplate` (concrete resources declared via `defineMcpResource` always
  * take precedence).
  *
@@ -656,7 +656,7 @@ async function syncDeclaredResources(
 
 /**
  * Project each template provider's `.template` into the registry descriptor
- * shape (known fields only — defends against a hand-built provider whose
+ * shape (known fields only, defends against a hand-built provider whose
  * `.template` carries extra keys the registry's validator would reject).
  * Every template provider carries `.template`, so unlike resources there is
  * no "static vs runtime-only" split to filter on.

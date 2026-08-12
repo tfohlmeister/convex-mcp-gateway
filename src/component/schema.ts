@@ -61,7 +61,7 @@ export default defineSchema({
 
   /**
    * Persisted MCP resource templates (RFC 6570), the template counterpart
-   * of `resources`. Stores catalog metadata only — never the `read`
+   * of `resources`. Stores catalog metadata only, never the `read`
    * handler or matcher. `annotations` is stored as `v.any()` (its shape is
    * validated host-side before write); `title`/`annotations` are persisted
    * here (unlike concrete resources, where they are runtime-only) so a

@@ -54,7 +54,7 @@ export const recordEntry = internalMutation({
  * Append one resource-operation audit row. Unlike `recordEntry` (written by
  * the in-component `dispatch.runTool`), resource audit is recorded by the
  * host's HTTP handler, so this must be a public `mutation` exposed on the
- * component API — exactly like `dispatch.recordAuthDenial`. Resource contents
+ * component API, exactly like `dispatch.recordAuthDenial`. Resource contents
  * are intentionally never accepted here; callers store only operation
  * metadata such as URI, duration, outcome, and error summary.
  */
