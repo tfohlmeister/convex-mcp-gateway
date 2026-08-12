@@ -13,6 +13,7 @@ import type * as dispatch from "../dispatch.js";
 import type * as mrtr from "../mrtr.js";
 import type * as registry from "../registry.js";
 import type * as sessions from "../sessions.js";
+import type * as tasks from "../tasks.js";
 
 import type {
   ApiFromModules,
@@ -27,6 +28,7 @@ const fullApi: ApiFromModules<{
   mrtr: typeof mrtr;
   registry: typeof registry;
   sessions: typeof sessions;
+  tasks: typeof tasks;
 }> = anyApi as any;
 
 /**

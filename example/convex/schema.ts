@@ -13,4 +13,12 @@ export default defineSchema({
     invoiceId: v.id("invoices"),
     result: v.object({ archived: v.boolean(), invoiceId: v.id("invoices") }),
   }).index("by_key", ["key"]),
+  // Durable idempotency records for host-executed MCP tasks: one row per
+  // task idempotency key, written by invoices.bulkMarkPaidTask so hook
+  // retries and workflow re-runs never double-apply the side effect.
+  // A real application should retain these for its own retry window.
+  taskExecutions: defineTable({
+    key: v.string(),
+    result: v.any(),
+  }).index("by_key", ["key"]),
 });

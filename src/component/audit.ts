@@ -4,6 +4,7 @@ import {
   auditEntryTypeValidator,
   auditOutcomeValidator,
   resourceAuditOperationValidator,
+  taskAuditOperationValidator,
   toolKindValidator,
 } from "./schema.js";
 
@@ -15,6 +16,8 @@ const auditEntryValidator = v.object({
   toolKind: v.optional(toolKindValidator),
   resourceUri: v.optional(v.string()),
   resourceOperation: v.optional(resourceAuditOperationValidator),
+  taskId: v.optional(v.string()),
+  taskOperation: v.optional(taskAuditOperationValidator),
   args: v.any(),
   outcome: auditOutcomeValidator,
   identitySubject: v.union(v.string(), v.null()),
@@ -94,6 +97,7 @@ export const listEntries = query({
     entryType: v.optional(auditEntryTypeValidator),
     toolName: v.optional(v.string()),
     resourceUri: v.optional(v.string()),
+    taskId: v.optional(v.string()),
     outcome: v.optional(auditOutcomeValidator),
     limit: v.optional(v.number()),
   },
@@ -131,6 +135,23 @@ export const listEntries = query({
         .withIndex("by_resourceUri", (q) =>
           q.eq("resourceUri", args.resourceUri!),
         )
+        .order("desc")
+        .take(limit);
+    }
+
+    if (args.taskId !== undefined && args.outcome !== undefined) {
+      return (await filterByOutcome(
+        ctx.db
+          .query("audit")
+          .withIndex("by_taskId", (q) => q.eq("taskId", args.taskId!))
+          .order("desc"),
+      )) as never;
+    }
+
+    if (args.taskId !== undefined) {
+      return await ctx.db
+        .query("audit")
+        .withIndex("by_taskId", (q) => q.eq("taskId", args.taskId!))
         .order("desc")
         .take(limit);
     }

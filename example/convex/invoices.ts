@@ -1,6 +1,6 @@
 import { ConvexError, v } from "convex/values";
 import { mcpCallerValidator } from "convex-mcp-gateway";
-import { mutation, query } from "./_generated/server";
+import { internalMutation, mutation, query } from "./_generated/server";
 
 export const seed = mutation({
   args: {},
@@ -129,6 +129,74 @@ export const summary = query({
   handler: async (ctx) => {
     const invoices = await ctx.db.query("invoices").collect();
     return { total: invoices.length };
+  },
+});
+
+/**
+ * A deferred "recount" used by the MCP Tasks example: registered with
+ * `taskSupport: true` in convex/mcp.ts, so a modern client can invoke it
+ * as a task-augmented `tools/call` and poll `tasks/get` for this result.
+ * With the built-in executor the mutation runs exactly once after the
+ * HTTP request, so it needs no idempotency bookkeeping of its own; a
+ * host that switches to a retrying workflow executor should persist the
+ * gateway-issued idempotency key around the write (see docs/tasks.md).
+ */
+export const recount = mutation({
+  args: { failWith: v.optional(v.string()), failPlain: v.optional(v.string()) },
+  returns: v.object({ total: v.number() }),
+  handler: async (ctx, args) => {
+    // Test hooks: `failWith` exercises the deliberate (ConvexError)
+    // channel, `failPlain` the accidental one, whose text must NOT reach
+    // the polling client.
+    if (args.failPlain) throw new Error(args.failPlain);
+    if (args.failWith) throw new ConvexError(args.failWith);
+    const invoices = await ctx.db.query("invoices").collect();
+    return { total: invoices.length };
+  },
+});
+
+/**
+ * The registered function of the host-executed MCP task demo
+ * (`invoices_bulkMarkPaid` on the /mcp-host-tasks/ mount). It never does
+ * the work itself: with a host executor configured, execution flows
+ * through the executor and `bulkMarkPaidTask` below, so a synchronous
+ * (non-task) call gets a deliberate, user-facing error instead of an
+ * unconfirmed bulk write.
+ */
+export const bulkMarkPaid = mutation({
+  args: {},
+  returns: v.null(),
+  handler: async () => {
+    throw new ConvexError(
+      "invoices_bulkMarkPaid must be invoked as an MCP task",
+    );
+  },
+});
+
+/**
+ * The actual bulk write, run by the host task executor after the owner
+ * confirmed. Idempotent under hook retries and workflow re-runs: the
+ * side effect is keyed on the gateway-issued task idempotency key, so a
+ * repeated call returns the recorded result instead of re-applying.
+ */
+export const bulkMarkPaidTask = internalMutation({
+  args: { key: v.string() },
+  returns: v.object({ updated: v.number() }),
+  handler: async (ctx, args) => {
+    const prior = await ctx.db
+      .query("taskExecutions")
+      .withIndex("by_key", (q) => q.eq("key", args.key))
+      .unique();
+    if (prior) return prior.result as { updated: number };
+
+    const invoices = await ctx.db.query("invoices").collect();
+    const open = invoices.filter((invoice) => invoice.status === "open");
+    for (const invoice of open) {
+      await ctx.db.patch("invoices", invoice._id, { status: "paid" });
+    }
+    const result = { updated: open.length };
+    await ctx.db.insert("taskExecutions", { key: args.key, result });
+    return result;
   },
 });
 

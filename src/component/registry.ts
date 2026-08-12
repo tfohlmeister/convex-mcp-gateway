@@ -19,6 +19,7 @@ const toolReturnValidator = v.object({
     }),
   ),
   mrtrGated: v.optional(v.boolean()),
+  taskSupport: v.optional(v.boolean()),
   protocolMetadata: v.optional(v.any()),
   metadata: v.optional(v.any()),
 });
@@ -80,6 +81,7 @@ export const registerTool = mutation({
       }),
     ),
     mrtrGated: v.optional(v.boolean()),
+    taskSupport: v.optional(v.boolean()),
     protocolMetadata: v.optional(v.any()),
     metadata: v.optional(v.any()),
   },
@@ -398,6 +400,7 @@ export const replaceTools = mutation({
           }),
         ),
         mrtrGated: v.optional(v.boolean()),
+        taskSupport: v.optional(v.boolean()),
         protocolMetadata: v.optional(v.any()),
         metadata: v.optional(v.any()),
       }),

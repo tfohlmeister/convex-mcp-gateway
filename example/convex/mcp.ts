@@ -60,6 +60,14 @@ export const tools: McpToolRegistration[] = [
       continuationKey: v.optional(v.string()),
     },
     mrtrArgs: { idempotencyKey: "continuationKey" },
+    // Also task-capable, which is the interesting combination: the hook
+    // negotiates FIRST (an `input_required` round creates no task), and
+    // only the approved continuation becomes a task. The task then
+    // inherits the MRTR chain's idempotency key, and the built-in
+    // executor injects it into `continuationKey` — so the mutation
+    // dedupes a replayed continuation exactly as on the synchronous path,
+    // without knowing which path it ran on.
+    taskSupport: true,
     // The gateway-side confirmation state machine. The mutation above is
     // MCP-unaware: accept dispatches it, decline finishes the call right
     // here, and a malformed answer simply asks again.
@@ -119,6 +127,23 @@ export const tools: McpToolRegistration[] = [
     // with no caller as Unauthorized.
     identityArg: "caller",
   }),
+  defineMcpMutation({
+    name: "invoices_recount",
+    description:
+      "Recount all invoices as a deferred MCP task; poll tasks/get for " +
+      "the result.",
+    fn: api.invoices.recount,
+    args: {
+      failWith: v.optional(v.string()),
+      failPlain: v.optional(v.string()),
+    },
+    returns: v.object({ total: v.float64() }),
+    // Opt-in MCP Tasks: with the `tasks` option configured in http.ts, a
+    // modern client may send `tools/call` with a `task` request and poll
+    // the returned handle. The mutation then runs after the HTTP request
+    // via the built-in scheduled executor.
+    taskSupport: true,
+  }),
   defineMcpQuery({
     name: "invoices_summary",
     description: "Return the total number of invoices. Public.",
@@ -139,6 +164,26 @@ export const tools: McpToolRegistration[] = [
     // The host's authorize callback in http.ts treats `public:
     // true` as the opt-in for unauthenticated calls.
     metadata: { public: true },
+  }),
+  defineMcpMutation({
+    name: "invoices_bulkMarkPaid",
+    description:
+      "Mark every open invoice paid, after task-based confirmation.",
+    fn: api.invoices.bulkMarkPaid,
+    args: {},
+    // Host-executed task: the registered function is only the
+    // synchronous fallback (it refuses to run); the real work happens in
+    // the executor wired on the /mcp-host-tasks/ mount in http.ts.
+    //
+    // It lives in the ONE shared catalog on purpose. The component keeps a
+    // single tool registry and a single catalog fingerprint, so two mounts
+    // passing different `tools` arrays would each re-sync (and delete the
+    // other's tools) on every modern request — a tool that is registered
+    // could then answer -32602 to a concurrent call. Mounts differ by
+    // their `tasks` / `authorize` options, never by their catalog. On the
+    // main mount, which has no `tasks.execute`, a task call to this tool
+    // simply fails with the fallback's error.
+    taskSupport: true,
   }),
 ];
 

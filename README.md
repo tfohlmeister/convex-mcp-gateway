@@ -34,6 +34,12 @@ Built as a [Convex Component](https://www.convex.dev/components).
   `beforeCall` hook to request input before any Convex function runs, then
   receive HMAC-verified continuation state plus an idempotency key on retry;
   see [Multi-round-trip requests](#multi-round-trip-requests)
+- **MCP Tasks (poll-first)**: opt-in `io.modelcontextprotocol/tasks`
+  support; task-augmented `tools/call` returns a handle, clients poll
+  `tasks/get`, owner-bound with TTL retention and lifecycle audit.
+  Built-in durable executor via the Convex scheduler, or bring
+  `@convex-dev/workflow` for retries and `input_required` rounds.
+  See [Tasks](./docs/tasks.md)
 - **MCP resources**: `defineMcpResource` / `defineMcpResourceTemplate`
   serve `resources/list`, `resources/read`, and `resources/templates/list`
   (RFC 6570). Central `authorizeResource` hook, opt-in resource audit,
@@ -392,6 +398,43 @@ MCP Apps, and Enterprise Managed Authorization are not advertised until a
 host provides their required durable state or long-lived delivery
 infrastructure.
 
+### Tasks (deferred tool calls)
+
+Modern clients can run a tool as an MCP task
+(`io.modelcontextprotocol/tasks`): `tools/call` with a `task` request
+returns a handle immediately, and the client polls `tasks/get` for the
+outcome; `tasks/update` cancels or answers `input_required` rounds.
+Doubly opt-in: register the tool with `taskSupport: true` AND configure
+the `tasks` option; the capability is not advertised otherwise.
+
+```ts
+defineMcpMutation({
+  name: "invoices_recount",
+  fn: api.invoices.recount,
+  args: {},
+  taskSupport: true, // advertised as execution: { taskSupport: "optional" }
+});
+
+gateway.handleMcpRequest(ctx, req, {
+  authorize,
+  tools,
+  tasks: {}, // built-in durable executor (Convex scheduler, runs once)
+});
+```
+
+Tasks are owner-bound to the authenticated caller (foreign, unknown, and
+expired ids answer identically), retained 24 hours by default (clamped to
+[1 minute, 7 days], prunable via `gateway.pruneTasks`), audited per
+lifecycle transition, and rejected loudly on the legacy protocol instead
+of silently running inline. Mount the gateway more than once with
+different `authorize` policies and you also want `tasks.scope`, so a task
+started on one mount cannot be polled through another. Hosts that need retries, delays, or
+`input_required` rounds plug in `@convex-dev/workflow` through
+`tasks.execute` and finalize with `gateway.completeTask` / `failTask` /
+`requireTaskInput`. See [Tasks](./docs/tasks.md) for the full contract,
+execution models, idempotency rules, and size limits.
+
+
 ## Resources
 
 Alongside tools, the gateway serves MCP **resources** (read-only content).
@@ -458,8 +501,8 @@ template + per-resource auth + audit + subscription) is wired into
   metadata wrap + userinfo token validation, for browser MCP clients
   (claude.ai) against IdPs that don't support Dynamic Client
   Registration (Pocket-ID, etc.)
-- **[Audit log](./docs/audit-log.md)**: reading, filtering, redacting,
-  pruning
+- **[Audit log](./docs/audit-log.md)**: tool / resource / task row
+  shapes, reading, filtering, redacting, pruning
 - **[Recipe: Better Auth on Convex](./docs/recipes/better-auth.md)**:
   opaque-token `resolveIdentity`, split-domain discovery, and browser
   login continuation for `@convex-dev/better-auth` as the IdP

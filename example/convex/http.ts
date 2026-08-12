@@ -4,7 +4,7 @@ import {
   type McpAuthorizerHandler,
   type McpResourceAuthorizerHandler,
 } from "convex-mcp-gateway";
-import { components } from "./_generated/api.js";
+import { components, internal } from "./_generated/api.js";
 import { httpAction } from "./_generated/server.js";
 import { resources, resourceTemplates, tools } from "./mcp.js";
 
@@ -137,6 +137,13 @@ const mcpHandler = httpAction(async (ctx, request) =>
     // so a real deployment would deliver notifications/resources/updated
     // over its own channel (see docs/resources.md).
     resourceSubscriptions: { subscribe: true, listChanged: true },
+    // Opt-in MCP Tasks (io.modelcontextprotocol/tasks): tools registered
+    // with `taskSupport: true` (invoices_recount) accept task-augmented
+    // modern calls. No `execute` is supplied, so the built-in scheduled
+    // executor runs the tool once; hosts needing retries, delays, or
+    // input_required rounds wire @convex-dev/workflow here instead
+    // (see docs/tasks.md).
+    tasks: {},
   }),
 );
 // Mount BOTH /mcp/ and /mcp (no trailing slash). claude.ai (and
@@ -284,6 +291,122 @@ for (const method of ["POST", "GET", "DELETE", "OPTIONS"] as const) {
     path: "/mcp-throws/",
     method,
     handler: mcpHandlerThrowingAuthorize,
+  });
+}
+
+// Host-executed MCP tasks demo (the @convex-dev/workflow integration
+// shape, without the dependency): `execute` owns durable execution and
+// pauses immediately for confirmation; the accepted responses run the
+// idempotent internal mutation and complete the task. A real host would
+// call `workflowManager.start(...)` in `execute`, resume the run in
+// `onInputResponses`, and cancel it in `onCancel` (see docs/tasks.md).
+// Both hooks are at-least-once, so everything they do is idempotent:
+// the side effect is keyed on the task's idempotency key, and a repeat
+// completion lands on a terminal row as a harmless "conflict".
+const mcpHandlerHostTasks = httpAction(async (ctx, request) =>
+  gateway.handleMcpRequest(ctx, request, {
+    authorize,
+    cors: true,
+    resolveIdentity,
+    tools,
+    tasks: {
+      execute: async (ctx, task) => {
+        // Only start work the executor actually owns; other task tools
+        // in the catalog keep their normal meaning for this host.
+        if (task.toolName !== "invoices_bulkMarkPaid") {
+          throw new Error(`No host execution wired for ${task.toolName}`);
+        }
+        // Check the outcome: every non-"updated" answer means the task
+        // never entered `input_required`, so nothing would ever ask the
+        // owner and nothing would ever run. Throwing here is the contract
+        // — the gateway fails the task and returns a clean error — while
+        // dropping the value would leave the client polling `working`
+        // until the TTL with no trace anywhere.
+        const asked = await gateway.requireTaskInput(ctx, task.taskId, {
+          confirm: {
+            method: "elicitation/create",
+            params: {
+              mode: "form",
+              message: "Mark every open invoice as paid?",
+              requestedSchema: {
+                type: "object",
+                properties: { confirm: { type: "boolean" } },
+                required: ["confirm"],
+              },
+            },
+          },
+        });
+        if (asked !== "updated") {
+          throw new Error(
+            `requireTaskInput returned "${asked}" for ${task.taskId}`,
+          );
+        }
+      },
+      onInputResponses: async (ctx, event) => {
+        const task = (await gateway.getTask(ctx, event.taskId)) as {
+          idempotencyKey: string;
+        } | null;
+        if (!task) {
+          // The row expired or was pruned between the client's update and
+          // this hook. The client already saw its responses accepted, so
+          // say plainly that the confirmed work is not going to happen.
+          console.error(
+            "[example] task row gone before execution; the confirmed bulk " +
+              "write was NOT performed",
+            event.taskId,
+          );
+          return;
+        }
+        const confirm = event.inputResponses.confirm as
+          | { action?: string }
+          | undefined;
+        if (confirm?.action !== "accept") {
+          const failed = await gateway.failTask(ctx, event.taskId, {
+            code: -32000,
+            message: "Confirmation declined",
+          });
+          if (failed !== "finalized") {
+            console.warn(
+              "[example] declined confirmation could not be recorded",
+              failed,
+              event.taskId,
+            );
+          }
+          return;
+        }
+        const result = await ctx.runMutation(
+          internal.invoices.bulkMarkPaidTask,
+          { key: task.idempotencyKey },
+        );
+        // The write has committed by now, so an outcome other than
+        // "finalized" means the client will be told something other than
+        // what actually happened: "conflict" (the owner cancelled first,
+        // or a hook retry already completed it) is benign because the
+        // keyed mutation did not double-apply, but "not_found" (row
+        // expired in between) and "result_too_large" both mean every
+        // invoice is paid while the client sees no result. Log it.
+        const completed = await gateway.completeTask(ctx, event.taskId, result);
+        if (completed !== "finalized" && completed !== "conflict") {
+          console.error(
+            "[example] bulk mark-paid committed but the task could not be " +
+              "completed; the client will not see this result",
+            completed,
+            event.taskId,
+          );
+        }
+      },
+      onCancel: async () => {
+        // Nothing to stop in this example: work only happens inside
+        // onInputResponses. A workflow host cancels its run here.
+      },
+    },
+  }),
+);
+for (const method of ["POST", "GET", "DELETE", "OPTIONS"] as const) {
+  http.route({
+    path: "/mcp-host-tasks/",
+    method,
+    handler: mcpHandlerHostTasks,
   });
 }
 

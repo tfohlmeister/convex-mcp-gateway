@@ -28,10 +28,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "query",
         "internal",
         {
-          entryType?: "tool" | "resource";
+          entryType?: "tool" | "resource" | "task";
           limit?: number;
           outcome?: "allowed" | "denied" | "error";
           resourceUri?: string;
+          taskId?: string;
           toolName?: string;
         },
         Array<{
@@ -39,13 +40,15 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           _id: string;
           args: any;
           durationMs: number;
-          entryType?: "tool" | "resource";
+          entryType?: "tool" | "resource" | "task";
           errorCode?: number;
           errorMessage?: string;
           identitySubject: string | null;
           outcome: "allowed" | "denied" | "error";
           resourceOperation?: "list" | "read" | "templates_list";
           resourceUri?: string;
+          taskId?: string;
+          taskOperation?: "create" | "input" | "cancel" | "complete" | "fail";
           toolKind?: "query" | "mutation" | "action";
           toolName?: string;
         }>,
@@ -220,6 +223,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
+          taskSupport?: boolean;
         } | null,
         Name
       >;
@@ -279,6 +283,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
+          taskSupport?: boolean;
         }>,
         Name
       >;
@@ -324,6 +329,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
+          taskSupport?: boolean;
         },
         string,
         Name
@@ -378,6 +384,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             name: string;
             outputSchema?: any;
             protocolMetadata?: any;
+            taskSupport?: boolean;
           }>;
         },
         null,
@@ -486,6 +493,285 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { sessionId: string; uri: string },
         boolean,
+        Name
+      >;
+    };
+    tasks: {
+      cancelPendingTasksForOwner: FunctionReference<
+        "mutation",
+        "internal",
+        { cursorCreationTime?: number; ownerSubject: string; scope?: string },
+        {
+          cancelled: number;
+          cursor: number | null;
+          outOfScope: number;
+          scanned: number;
+          taskIds: Array<string>;
+        },
+        Name
+      >;
+      cancelTaskForOwner: FunctionReference<
+        "mutation",
+        "internal",
+        { ownerSubject: string; scope?: string; taskId: string },
+        | {
+            outcome: "cancelled";
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | {
+            outcome: "already_cancelled";
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | { outcome: "not_found" }
+        | {
+            outcome: "conflict";
+            status:
+              | "working"
+              | "input_required"
+              | "completed"
+              | "failed"
+              | "cancelled";
+          },
+        Name
+      >;
+      completeTask: FunctionReference<
+        "mutation",
+        "internal",
+        { result: any; taskId: string },
+        "finalized" | "not_found" | "conflict" | "result_too_large",
+        Name
+      >;
+      createTask: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          args: any;
+          caller?: { claims?: any; subject: string };
+          executor: "component" | "host";
+          idempotencyKey: string;
+          mrtrApproved?: boolean;
+          ownerSubject: string;
+          scope?: string;
+          taskId: string;
+          toolKind: "query" | "mutation" | "action";
+          toolName: string;
+          ttlMs?: number;
+        },
+        | {
+            created: true;
+            reused?: true;
+            startPending?: true;
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | {
+            created: false;
+            reason:
+              | "duplicate_id"
+              | "args_too_large"
+              | "caller_too_large"
+              | "limit_exceeded";
+          },
+        Name
+      >;
+      executeScheduledTask: FunctionReference<
+        "action",
+        "internal",
+        { taskId: string },
+        null,
+        Name
+      >;
+      failTask: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          auditErrorMessage?: string;
+          error: { code: number; message: string };
+          taskId: string;
+        },
+        "finalized" | "not_found" | "conflict",
+        Name
+      >;
+      getTaskForOwner: FunctionReference<
+        "query",
+        "internal",
+        { ownerSubject: string; scope?: string; taskId: string },
+        {
+          createdAt: number;
+          error?: { code: number; message: string };
+          expiresAt: number;
+          inputRequests?: any;
+          inputRound?: number;
+          result?: any;
+          status:
+            | "working"
+            | "input_required"
+            | "completed"
+            | "failed"
+            | "cancelled";
+          taskId: string;
+          toolName: string;
+          updatedAt: number;
+        } | null,
+        Name
+      >;
+      getTaskInternal: FunctionReference<
+        "query",
+        "internal",
+        { taskId: string },
+        any | null,
+        Name
+      >;
+      markTaskStarted: FunctionReference<
+        "mutation",
+        "internal",
+        { taskId: string },
+        null,
+        Name
+      >;
+      pruneTasks: FunctionReference<"mutation", "internal", {}, number, Name>;
+      requireTaskInput: FunctionReference<
+        "mutation",
+        "internal",
+        { inputRequests: any; taskId: string },
+        | "updated"
+        | "not_found"
+        | "conflict"
+        | "invalid_requests"
+        | "too_large"
+        | "unsupported_executor",
+        Name
+      >;
+      submitInputResponsesForOwner: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          inputResponses: any;
+          inputRound?: number;
+          ownerSubject: string;
+          scope?: string;
+          taskId: string;
+        },
+        | {
+            outcome: "accepted";
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | {
+            outcome: "duplicate";
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | {
+            outcome: "cancelled";
+            task: {
+              createdAt: number;
+              error?: { code: number; message: string };
+              expiresAt: number;
+              inputRequests?: any;
+              inputRound?: number;
+              result?: any;
+              status:
+                | "working"
+                | "input_required"
+                | "completed"
+                | "failed"
+                | "cancelled";
+              taskId: string;
+              toolName: string;
+              updatedAt: number;
+            };
+          }
+        | { outcome: "not_found" }
+        | {
+            outcome: "conflict";
+            status:
+              | "working"
+              | "input_required"
+              | "completed"
+              | "failed"
+              | "cancelled";
+          }
+        | { outcome: "mismatch" }
+        | { outcome: "too_large" }
+        | { expectedRound: number; outcome: "stale_round" },
         Name
       >;
     };

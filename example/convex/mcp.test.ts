@@ -592,7 +592,9 @@ describe("authorize callback (host's http.ts)", () => {
     // summary, and identity-gated whoami are visible to authenticated users.
     expect(body.result.tools.map((tool) => tool.name).sort()).toEqual([
       "invoices_archiveAfterConfirmation",
+      "invoices_bulkMarkPaid",
       "invoices_list",
+      "invoices_recount",
       "invoices_summary",
       "invoices_whoami",
     ]);
@@ -634,8 +636,10 @@ describe("authorize callback (host's http.ts)", () => {
     };
     expect(body.result.tools.map((tool) => tool.name).sort()).toEqual([
       "invoices_archiveAfterConfirmation",
+      "invoices_bulkMarkPaid",
       "invoices_list",
       "invoices_markPaid",
+      "invoices_recount",
       "invoices_summary",
       "invoices_whoami",
     ]);
@@ -3190,5 +3194,701 @@ describe("bounded $ref resolution (registration + advertisement)", () => {
         } as unknown as Parameters<typeof gateway.registerTool>[1]),
       ).rejects.toThrow(/"regional_summary" has an unresolvable inputSchema/);
     });
+  });
+});
+
+// =================================================================
+// MCP Tasks (io.modelcontextprotocol/tasks): task-augmented modern
+// tools/call, owner-bound polling, cancellation, failure, and the
+// legacy/non-negotiated rejections. Uses the built-in scheduled
+// executor, driven by convex-test's scheduler controls.
+// =================================================================
+
+describe("MCP tasks (modern, e2e)", () => {
+  // Several tests below drive the scheduler with fake timers. Restore them
+  // here rather than at the end of each test: an assertion that fails
+  // mid-test would otherwise leave fake timers installed for every later
+  // test in this file, turning one real failure into a cascade.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TASK_CAPS = { "io.modelcontextprotocol/tasks": {} };
+
+  function modernBody(
+    id: number,
+    method: string,
+    params: Record<string, unknown>,
+    clientCapabilities: Record<string, unknown> = TASK_CAPS,
+  ) {
+    return JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: {
+        ...params,
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": clientCapabilities,
+        },
+      },
+    });
+  }
+
+  // The main /mcp/ mount resolves identity via `resolveIdentity`
+  // (userinfo-bridge mode), so modern callers authenticate with the
+  // fixture Bearer tokens from http.ts, not `t.withIdentity`.
+  const TOKENS: Record<string, string> = {
+    alice: "valid-userinfo-token", // subject: validator-resolved-sub
+    bob: "valid-admin-token", // subject: admin-resolved-sub
+  };
+
+  async function modernRpc(
+    t: ReturnType<typeof newTest>,
+    id: number,
+    method: string,
+    params: Record<string, unknown>,
+    options: {
+      name?: string;
+      clientCapabilities?: Record<string, unknown>;
+      as?: keyof typeof TOKENS;
+      path?: string;
+    } = {},
+  ): Promise<Response> {
+    return await t.fetch(options.path ?? "/mcp/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": method,
+        ...(options.name !== undefined ? { "mcp-name": options.name } : {}),
+        ...(options.as !== undefined
+          ? { authorization: `Bearer ${TOKENS[options.as]}` }
+          : {}),
+      },
+      body: modernBody(id, method, params, options.clientCapabilities),
+    });
+  }
+
+  async function startRecountTask(
+    t: ReturnType<typeof newTest>,
+    args: Record<string, unknown> = {},
+  ): Promise<string> {
+    const res = await modernRpc(
+      t,
+      1,
+      "tools/call",
+      { name: "invoices_recount", arguments: args, task: {} },
+      { name: "invoices_recount", as: "alice" },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result: { resultType: string; task: { taskId: string; status: string } };
+      error?: unknown;
+    };
+    expect(body.error, JSON.stringify(body.error)).toBeUndefined();
+    expect(body.result.resultType).toBe("task");
+    expect(body.result.task.status).toBe("working");
+    return body.result.task.taskId;
+  }
+
+  async function getTask(
+    t: ReturnType<typeof newTest>,
+    taskId: string,
+    as: keyof typeof TOKENS = "alice",
+    path?: string,
+  ) {
+    const res = await modernRpc(t, 9, "tasks/get", { taskId }, {
+      name: taskId,
+      as,
+      path,
+    });
+    return (await res.json()) as {
+      result?: {
+        resultType: string;
+        task: {
+          status: string;
+          result?: unknown;
+          error?: { code: number; message: string };
+          pollIntervalMs?: number;
+        };
+      };
+      error?: { code: number; message: string };
+    };
+  }
+
+  test("task-augmented call defers execution and completes on poll", async () => {
+    // Fake timers keep the runAfter(0) executor pending until the test
+    // releases it, making the "still working" assertion deterministic.
+    vi.useFakeTimers();
+    const t = newTest();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("invoices", { status: "open", amount: 1 });
+      await ctx.db.insert("invoices", { status: "paid", amount: 2 });
+    });
+
+    const taskId = await startRecountTask(t);
+
+    // Deferred: the mutation has not run yet, the task is polling-ready.
+    const pending = await getTask(t, taskId);
+    expect(pending.result?.task.status).toBe("working");
+    expect(pending.result?.task.pollIntervalMs).toBe(2000);
+
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+
+    const done = await getTask(t, taskId);
+    expect(done.result?.task.status).toBe("completed");
+    expect(done.result?.task.result).toEqual({ total: 2 });
+
+    // Lifecycle audit: create + complete, no payloads.
+    const entries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, { taskId }),
+    );
+    expect(entries.map((e) => e.taskOperation).sort()).toEqual([
+      "complete",
+      "create",
+    ]);
+    expect(entries.every((e) => e.args === null)).toBe(true);
+
+    // The execution itself goes through dispatch.runTool, so a task-run
+    // tool leaves the SAME entryType: "tool" row a synchronous call does.
+    // The task rows above are bookkeeping around it, not a replacement.
+    const toolEntries = await t.run(async (ctx) =>
+      ctx.runQuery(components.mcpGateway.audit.listEntries, {
+        toolName: "invoices_recount",
+      }),
+    );
+    expect(
+      toolEntries.filter((e) => e.entryType === "tool"),
+    ).toMatchObject([
+      {
+        entryType: "tool",
+        toolName: "invoices_recount",
+        toolKind: "mutation",
+        outcome: "allowed",
+        identitySubject: "validator-resolved-sub",
+      },
+    ]);
+  });
+
+  test("an MRTR-gated task tool negotiates first, then inherits the chain key", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = newTest();
+      const invoiceId = await t.run(async (ctx) =>
+        ctx.db.insert("invoices", { status: "open", amount: 7 }),
+      );
+
+      // Round 1: the hook asks for confirmation. No task row is created —
+      // MRTR owns the negotiation until it approves.
+      const first = (await (
+        await modernRpc(
+          t,
+          40,
+          "tools/call",
+          {
+            name: "invoices_archiveAfterConfirmation",
+            arguments: { id: invoiceId },
+            task: {},
+          },
+          {
+            name: "invoices_archiveAfterConfirmation",
+            as: "alice",
+            clientCapabilities: {
+              "io.modelcontextprotocol/tasks": {},
+              elicitation: { form: {} },
+            },
+          },
+        )
+      ).json()) as {
+        result: { resultType: string; requestState: string };
+      };
+      expect(first.result.resultType).toBe("input_required");
+      // No durable task yet: a `create` lifecycle row is written in the
+      // same mutation as the task row, so its absence proves none exists.
+      expect(
+        await t.run(async (ctx) =>
+          ctx.runQuery(components.mcpGateway.audit.listEntries, {
+            entryType: "task",
+          }),
+        ),
+      ).toHaveLength(0);
+
+      // Round 2: the approved continuation becomes a task.
+      const second = (await (
+        await modernRpc(
+          t,
+          41,
+          "tools/call",
+          {
+            name: "invoices_archiveAfterConfirmation",
+            arguments: { id: invoiceId },
+            task: {},
+            requestState: first.result.requestState,
+            inputResponses: {
+              confirm: { action: "accept", content: { confirm: true } },
+            },
+          },
+          {
+            name: "invoices_archiveAfterConfirmation",
+            as: "alice",
+            clientCapabilities: {
+              "io.modelcontextprotocol/tasks": {},
+              elicitation: { form: {} },
+            },
+          },
+        )
+      ).json()) as { result: { resultType: string; task: { taskId: string } } };
+      expect(second.result.resultType).toBe("task");
+      const taskId = second.result.task.taskId;
+
+      const row = (await t.run(async (ctx) =>
+        ctx.runQuery(components.mcpGateway.tasks.getTaskInternal, { taskId }),
+      )) as { idempotencyKey: string; mrtrApproved?: boolean };
+      // The hook approved this row, which is what lets the executor run a
+      // tool the registry marks mrtrGated.
+      expect(row.mrtrApproved).toBe(true);
+
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      const done = await getTask(t, taskId);
+      expect(done.result?.task.status).toBe("completed");
+
+      // The mutation is MCP-unaware: it only ever sees `continuationKey`.
+      // That value must be the TASK ROW's key, or a replayed continuation
+      // (which legitimately creates a second task) would double-archive.
+      const executions = await t.run(async (ctx) =>
+        ctx.db.query("mrtrExecutions").collect(),
+      );
+      expect(executions).toHaveLength(1);
+      expect(executions[0]!.key).toBe(row.idempotencyKey);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a failing tool surfaces on the polled task, sanitized", async () => {
+    vi.useFakeTimers();
+    const t = newTest();
+    const taskId = await startRecountTask(t, { failWith: "Recount exploded" });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+    const failed = await getTask(t, taskId);
+    expect(failed.result?.task.status).toBe("failed");
+    // ConvexError is the deliberate channel, so the text passes verbatim.
+    expect(failed.result?.task.error?.message).toBe("Recount exploded");
+  });
+
+  test("a non-ConvexError failure is generic on the wire, verbose in the audit row", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = newTest();
+      const taskId = await startRecountTask(t, {
+        failPlain: "postgres://user:pw@host exploded",
+      });
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      const failed = await getTask(t, taskId);
+      expect(failed.result?.task.status).toBe("failed");
+      // The polling client must not receive arbitrary exception text: it
+      // is durable, owner-readable, and can quote credentials.
+      expect(failed.result?.task.error?.message).toBe("Tool execution failed");
+      expect(failed.result?.task.error?.message).not.toMatch(/postgres/);
+      // The operator still gets the full text, on the tool row.
+      const toolRows = await t.run(async (ctx) =>
+        ctx.runQuery(components.mcpGateway.audit.listEntries, {
+          toolName: "invoices_recount",
+        }),
+      );
+      expect(
+        toolRows.some(
+          (row) =>
+            row.entryType === "tool" &&
+            (row.errorMessage ?? "").includes("postgres"),
+        ),
+      ).toBe(true);
+      // ...and the task lifecycle row keeps its no-payload contract.
+      const taskRows = await t.run(async (ctx) =>
+        ctx.runQuery(components.mcpGateway.audit.listEntries, { taskId }),
+      );
+      expect(
+        taskRows.every((row) => !(row.errorMessage ?? "").includes("postgres")),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("cancellation before execution wins; repeat cancel is idempotent", async () => {
+    vi.useFakeTimers();
+    const t = newTest();
+    const taskId = await startRecountTask(t);
+
+    const cancel = await modernRpc(
+      t,
+      2,
+      "tasks/update",
+      { taskId, action: "cancel" },
+      { name: taskId, as: "alice" },
+    );
+    const cancelBody = (await cancel.json()) as {
+      result: { task: { status: string } };
+    };
+    expect(cancelBody.result.task.status).toBe("cancelled");
+
+    // The scheduled executor observes the cancel and leaves the row alone.
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+    const after = await getTask(t, taskId);
+    expect(after.result?.task.status).toBe("cancelled");
+    expect(after.result?.task.result).toBeUndefined();
+
+    const repeat = await modernRpc(
+      t,
+      3,
+      "tasks/update",
+      { taskId, action: "cancel" },
+      { name: taskId, as: "alice" },
+    );
+    const repeatBody = (await repeat.json()) as {
+      result: { task: { status: string } };
+    };
+    expect(repeatBody.result.task.status).toBe("cancelled");
+  });
+
+  test("tasks never leak across callers", async () => {
+    vi.useFakeTimers();
+    const t = newTest();
+    const taskId = await startRecountTask(t);
+    const foreign = await getTask(t, taskId, "bob");
+    expect(foreign.result).toBeUndefined();
+    expect(foreign.error?.code).toBe(-32602);
+    expect(foreign.error?.message).toContain("Unknown task");
+    // Drain the pending executor so it cannot leak across tests.
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    vi.useRealTimers();
+  });
+
+  test("legacy requests cannot use tasks", async () => {
+    const t = newTest();
+    await t.mutation(internal.mcp.registerDefaults, {});
+    const tAuth = t.withIdentity({ subject: "alice" }) as ReturnType<
+      typeof newTest
+    >;
+    const session = await initialize(tAuth);
+
+    // Task-augmented legacy call: rejected loudly, never run silently.
+    const call = await rpc(tAuth, session, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "invoices_recount", arguments: {}, task: {} },
+    });
+    const callBody = (await call.json()) as {
+      error?: { code: number; message: string };
+    };
+    expect(callBody.error?.code).toBe(-32602);
+    expect(callBody.error?.message).toMatch(/2026-07-28/);
+
+    // Legacy task methods are unknown methods.
+    const poll = await rpc(tAuth, session, {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tasks/get",
+      params: { taskId: "whatever" },
+    });
+    const pollBody = (await poll.json()) as { error?: { code: number } };
+    expect(pollBody.error?.code).toBe(-32601);
+  });
+
+  test("negotiation gates: capability, tool support, identity", async () => {
+    const t = newTest();
+
+    // Client did not declare the tasks capability.
+    const noCap = await modernRpc(
+      t,
+      6,
+      "tools/call",
+      { name: "invoices_recount", arguments: {}, task: {} },
+      { name: "invoices_recount", clientCapabilities: {}, as: "alice" },
+    );
+    const noCapBody = (await noCap.json()) as {
+      error?: { code: number; message: string };
+    };
+    expect(noCapBody.error?.code).toBe(-32602);
+    expect(noCapBody.error?.message).toMatch(/client capability/);
+
+    // Tool without taskSupport.
+    const wrongTool = await modernRpc(
+      t,
+      7,
+      "tools/call",
+      { name: "invoices_markPaid", arguments: {}, task: {} },
+      { name: "invoices_markPaid", as: "bob" },
+    );
+    const wrongToolBody = (await wrongTool.json()) as {
+      error?: { code: number; message: string };
+    };
+    expect(wrongToolBody.error?.code).toBe(-32602);
+    expect(wrongToolBody.error?.message).toMatch(/does not support task/);
+
+    // Anonymous caller cannot own a task.
+    const anonymous = await modernRpc(
+      t,
+      8,
+      "tools/call",
+      { name: "invoices_recount", arguments: {}, task: {} },
+      { name: "invoices_recount" },
+    );
+    const anonymousBody = (await anonymous.json()) as {
+      error?: { code: number };
+    };
+    expect(anonymousBody.error?.code).toBe(-32001);
+
+    // Anonymous polling is rejected before any lookup.
+    const anonymousPoll = await modernRpc(
+      t,
+      9,
+      "tasks/get",
+      { taskId: "whatever" },
+      { name: "whatever" },
+    );
+    expect(
+      ((await anonymousPoll.json()) as { error?: { code: number } }).error
+        ?.code,
+    ).toBe(-32001);
+  });
+
+  test("a deeply nested task args value is a clean error, not a 500", async () => {
+    const t = newTest();
+    // Past the handler's depth bound (64) but shallow enough that the
+    // request body itself serializes/parses everywhere: the guard walks
+    // with an explicit stack and rejects before createTask's
+    // serialization could overflow into an unhandled error. (A truly
+    // stack-overflowing depth can't be sent over the wire at all, since
+    // building the JSON body would overflow first.)
+    let deep: unknown = 0;
+    for (let i = 0; i < 200; i++) deep = [deep];
+    const res = await modernRpc(
+      t,
+      1,
+      "tools/call",
+      { name: "invoices_recount", arguments: { deep }, task: {} },
+      { name: "invoices_recount", as: "alice" },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { error?: { code: number; message: string } };
+    expect(body.error?.code).toBe(-32602);
+    expect(body.error?.message).toMatch(/nest too deeply/);
+  });
+
+  test("discovery and catalog advertise tasks only when configured", async () => {
+    const t = newTest();
+    const discover = await modernRpc(t, 10, "server/discover", {}, { as: "alice" });
+    const discoverBody = (await discover.json()) as {
+      result: { capabilities: Record<string, unknown> };
+    };
+    expect(
+      discoverBody.result.capabilities["io.modelcontextprotocol/tasks"],
+    ).toEqual({ pollIntervalMs: 2000 });
+
+    const list = await modernRpc(t, 11, "tools/list", {}, { as: "alice" });
+    const listBody = (await list.json()) as {
+      result: {
+        tools: Array<{ name: string; execution?: { taskSupport?: string } }>;
+      };
+    };
+    const recount = listBody.result.tools.find(
+      (tool) => tool.name === "invoices_recount",
+    );
+    expect(recount?.execution).toEqual({ taskSupport: "optional" });
+    const plainTool = listBody.result.tools.find(
+      (tool) => tool.name === "invoices_list",
+    );
+    expect(plainTool?.execution).toBeUndefined();
+  });
+});
+
+// =================================================================
+// Host-executed MCP tasks (the @convex-dev/workflow integration shape):
+// the /mcp-host-tasks/ mount pauses for confirmation via
+// requireTaskInput, resumes through onInputResponses, and keys the side
+// effect on the task's idempotency key. Exercises the input_required
+// round-trip end to end without a protocol session.
+// =================================================================
+
+describe("MCP tasks (host executor, e2e)", () => {
+  // Several tests below drive the scheduler with fake timers. Restore them
+  // here rather than at the end of each test: an assertion that fails
+  // mid-test would otherwise leave fake timers installed for every later
+  // test in this file, turning one real failure into a cascade.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const PATH = "/mcp-host-tasks/";
+  const TASK_CAPS = { "io.modelcontextprotocol/tasks": {} };
+
+  async function hostRpc(
+    t: ReturnType<typeof newTest>,
+    id: number,
+    method: string,
+    params: Record<string, unknown>,
+    options: { name?: string } = {},
+  ): Promise<Response> {
+    return await t.fetch(PATH, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": method,
+        authorization: "Bearer valid-userinfo-token",
+        ...(options.name !== undefined ? { "mcp-name": options.name } : {}),
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method,
+        params: {
+          ...params,
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": TASK_CAPS,
+          },
+        },
+      }),
+    });
+  }
+
+  async function startBulkTask(t: ReturnType<typeof newTest>) {
+    const res = await hostRpc(
+      t,
+      1,
+      "tools/call",
+      { name: "invoices_bulkMarkPaid", arguments: {}, task: {} },
+      { name: "invoices_bulkMarkPaid" },
+    );
+    const body = (await res.json()) as {
+      result: { resultType: string; task: { taskId: string } };
+      error?: unknown;
+    };
+    expect(body.error, JSON.stringify(body.error)).toBeUndefined();
+    expect(body.result.resultType).toBe("task");
+    return body.result.task.taskId;
+  }
+
+  async function pollTask(t: ReturnType<typeof newTest>, taskId: string) {
+    const res = await hostRpc(t, 2, "tasks/get", { taskId }, { name: taskId });
+    return (
+      (await res.json()) as {
+        result?: {
+          task: {
+            status: string;
+            inputRequests?: Record<string, unknown>;
+            inputRound?: number;
+            result?: unknown;
+            error?: { message: string };
+          };
+        };
+      }
+    ).result?.task;
+  }
+
+  async function answer(
+    t: ReturnType<typeof newTest>,
+    taskId: string,
+    action: string,
+    inputRound = 1,
+  ) {
+    return await hostRpc(
+      t,
+      3,
+      "tasks/update",
+      {
+        taskId,
+        inputResponses: { confirm: { action, content: { confirm: true } } },
+        inputRound,
+      },
+      { name: taskId },
+    );
+  }
+
+  test("input_required round-trip: confirm, execute once, complete", async () => {
+    const t = newTest();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("invoices", { status: "open", amount: 1 });
+      await ctx.db.insert("invoices", { status: "open", amount: 2 });
+      await ctx.db.insert("invoices", { status: "paid", amount: 3 });
+    });
+
+    const taskId = await startBulkTask(t);
+
+    // The executor paused the task before doing any work.
+    const pending = await pollTask(t, taskId);
+    expect(pending?.status).toBe("input_required");
+    expect(Object.keys(pending?.inputRequests ?? {})).toEqual(["confirm"]);
+    // The descriptor carries the round the client must echo back.
+    expect(pending?.inputRound).toBe(1);
+    const untouched = await t.run(async (ctx) =>
+      (await ctx.db.query("invoices").collect()).filter(
+        (invoice) => invoice.status === "open",
+      ),
+    );
+    expect(untouched).toHaveLength(2);
+
+    // Accepting runs the keyed mutation and completes the task.
+    const accepted = await answer(t, taskId, "accept");
+    expect(accepted.status).toBe(200);
+    const done = await pollTask(t, taskId);
+    expect(done?.status).toBe("completed");
+    expect(done?.result).toEqual({ updated: 2 });
+
+    // Idempotency: re-sending the same responses re-fires the hook
+    // (at-least-once), but the keyed side effect does not double-apply
+    // and the completed outcome stands.
+    const repeat = await answer(t, taskId, "accept");
+    expect(repeat.status).toBe(200);
+    const still = await pollTask(t, taskId);
+    expect(still?.status).toBe("completed");
+    expect(still?.result).toEqual({ updated: 2 });
+    const executions = await t.run(async (ctx) =>
+      ctx.db.query("taskExecutions").collect(),
+    );
+    expect(executions).toHaveLength(1);
+  });
+
+  test("declined confirmation fails the task without side effects", async () => {
+    const t = newTest();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("invoices", { status: "open", amount: 1 });
+    });
+    const taskId = await startBulkTask(t);
+    await answer(t, taskId, "decline");
+    const failed = await pollTask(t, taskId);
+    expect(failed?.status).toBe("failed");
+    expect(failed?.error?.message).toBe("Confirmation declined");
+    const open = await t.run(async (ctx) =>
+      (await ctx.db.query("invoices").collect()).filter(
+        (invoice) => invoice.status === "open",
+      ),
+    );
+    expect(open).toHaveLength(1);
+  });
+
+  test("a synchronous call of the task-only tool refuses to run", async () => {
+    const t = newTest();
+    const res = await hostRpc(
+      t,
+      4,
+      "tools/call",
+      { name: "invoices_bulkMarkPaid", arguments: {} },
+      { name: "invoices_bulkMarkPaid" },
+    );
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toMatch(/must be invoked as an MCP task/);
   });
 });

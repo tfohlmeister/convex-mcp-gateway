@@ -78,6 +78,9 @@ export type {
   McpResourceTemplate,
   McpResourceTemplateProvider,
   McpResourceTemplateReadHandler,
+  McpTaskContext,
+  McpTaskExecutor,
+  McpTasksOptions,
 } from "./mcp-handler.js";
 export { completeCall, inputRequired } from "../shared.js";
 export {
@@ -272,12 +275,18 @@ interface McpToolConfigBase<
   identityArg?: McpCallerArgKeys<ArgsV>;
   /**
    * Name of the argument the gateway fills with the MRTR continuation's
-   * stable idempotency key when a verified retry continues to dispatch.
+   * stable idempotency key when a verified retry continues to dispatch,
+   * and with the task row's own key when the tool is run by the BUILT-IN
+   * task executor. A host executor (`tasks.execute`) gets no injection:
+   * it must thread `task.idempotencyKey` through itself.
    * Removed from the public schema and stripped from client requests.
    * Requires `beforeCall`; distinct from `identityArg`. Required for
    * `defineMcpMutation` / `defineMcpAction` tools that use `beforeCall`,
    * since a replayed continuation dispatches again; optional only for
-   * queries, which have no durable side effect to deduplicate.
+   * queries, which have no durable side effect to deduplicate. (The same
+   * rule is what makes a `taskSupport` mutation/action with a hook carry
+   * the key its deferred run is deduped on; `taskSupport` itself is not
+   * separately validated.)
    */
   mrtrArgs?: {
     idempotencyKey: McpArgKey<ArgsV>;
@@ -291,8 +300,20 @@ interface McpToolConfigBase<
    * `completeCall()` to end the call without dispatching (e.g. a
    * declined confirmation), or `null`/`undefined` to continue to the
    * Convex function, which stays MCP-unaware.
+   *
+   * Composes with `taskSupport`: for a task-augmented call the hook runs
+   * at task-creation time, so no durable task exists until it approves.
    */
   beforeCall?: McpBeforeCallHandler;
+  /**
+   * Opt-in MCP Tasks support. When `true` and the host configures the
+   * `tasks` option of `handleMcpRequest`, a modern client may invoke
+   * this tool as a task-augmented `tools/call` and poll `tasks/get`.
+   * The function then runs *after* the HTTP request, so it must be safe
+   * to defer and must persist the gateway-issued idempotency key around
+   * its side effect (see docs/tasks.md).
+   */
+  taskSupport?: boolean;
   /** Optional display title advertised in `tools/list`. */
   title?: string;
   /** MCP behavior hints advertised in `tools/list`. */
@@ -400,10 +421,11 @@ function build<
         `and leave it unused.`,
     );
   }
-  // The key is injected only on a continuation that dispatches; a
-  // first-call approval (hook returns null) and every legacy dispatch
-  // run WITHOUT it, so its validator must be optional or the Convex
-  // function rejects those calls. Enforce it here rather than let the
+  // The key is not injected on every path: a first-call approval (hook
+  // returns null) and every legacy dispatch run WITHOUT it, while a
+  // continuation that dispatches and a component-executed task run always
+  // carry it. So its validator must be optional or the Convex function
+  // rejects the calls that omit it. Enforce it here rather than let the
   // tool fail at runtime with an ArgumentValidationError.
   if (config.mrtrArgs !== undefined) {
     const keyValidator = (config.args as Record<string, GenericValidator>)[
@@ -437,6 +459,9 @@ function build<
     ...(config.mrtrArgs !== undefined ? { mrtrArgs: config.mrtrArgs } : {}),
     ...(config.beforeCall !== undefined
       ? { beforeCall: config.beforeCall }
+      : {}),
+    ...(config.taskSupport !== undefined
+      ? { taskSupport: config.taskSupport }
       : {}),
     ...(config.title !== undefined ? { title: config.title } : {}),
     ...(config.annotations !== undefined
@@ -935,8 +960,34 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
   return resolved;
 }
 
+/**
+ * Reject `taskSupport: true` on a tool that asked for its arguments to be
+ * kept out of the audit log. A task stores the caller's `args` verbatim in
+ * the component's `tasks` table for the whole retention window (execution
+ * needs them), so honouring `metadata.auditArgs: false` / `{ redact }` in
+ * the audit row while persisting the same values next to it would be a
+ * false promise. Fail at registration, where the contradiction is
+ * fixable, instead of leaking silently at runtime.
+ */
+function assertTaskAuditCompatibility(tools: McpToolRegistration[]): void {
+  for (const tool of tools) {
+    if (tool.taskSupport !== true) continue;
+    const auditArgs = (
+      tool.metadata as { auditArgs?: false | true | { redact?: string[] } } | undefined
+    )?.auditArgs;
+    if (auditArgs === undefined || auditArgs === true) continue;
+    throw new Error(
+      `MCP tool "${tool.name}" cannot combine taskSupport with ` +
+        "metadata.auditArgs: a task persists its arguments verbatim in the " +
+        "component's tasks table, so argument redaction cannot be honoured. " +
+        "Drop taskSupport, or stop redacting this tool's arguments.",
+    );
+  }
+}
+
 async function resolveToolHandles(tools: McpToolRegistration[]) {
   assertToolHeaderSchemas(tools);
+  assertTaskAuditCompatibility(tools);
   return await Promise.all(
     tools.map(async (tool) => {
       const schemas = resolveToolSchemas(tool);
@@ -960,6 +1011,9 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       // kept `mrtrArgs`.
       ...(tool.beforeCall !== undefined || tool.mrtrArgs !== undefined
         ? { mrtrGated: true }
+        : {}),
+      ...(tool.taskSupport !== undefined
+        ? { taskSupport: tool.taskSupport }
         : {}),
       ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
@@ -998,6 +1052,7 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
       // Adding or removing a hook changes the stored gate flag, so it
       // must churn the fingerprint or the row would never resync.
       mrtrGated: tool.beforeCall !== undefined || tool.mrtrArgs !== undefined,
+      taskSupport: tool.taskSupport ?? null,
       protocolMetadata: toolProtocolMetadata(tool) ?? null,
       metadata: tool.metadata ?? null,
     }))
@@ -1028,6 +1083,7 @@ async function syncDeclaredTools(
   // would let a catalog that was synced under an older version keep its
   // matching fingerprint and never get checked at all.
   assertToolHeaderSchemas(tools);
+  assertTaskAuditCompatibility(tools);
   const fingerprint = toolsFingerprint(tools);
   const current = await ctx.runQuery(
     component.registry.getToolsFingerprint,
@@ -1110,6 +1166,7 @@ export class McpGateway {
     tool: McpToolRegistration,
   ): Promise<void> {
     assertToolHeaderSchemas([tool]);
+    assertTaskAuditCompatibility([tool]);
     assertNoImperativeBeforeCall([tool]);
     const schemas = resolveToolSchemas(tool);
     const handle = await createFunctionHandle(tool.fn as any);
@@ -1127,6 +1184,9 @@ export class McpGateway {
         : {}),
       ...(tool.mrtrArgs !== undefined
         ? { mrtrArgs: tool.mrtrArgs, mrtrGated: true }
+        : {}),
+      ...(tool.taskSupport !== undefined
+        ? { taskSupport: tool.taskSupport }
         : {}),
       ...protocolMetadataField(tool),
       ...(tool.metadata !== undefined ? { metadata: tool.metadata } : {}),
@@ -1306,19 +1366,21 @@ export class McpGateway {
   }
 
   /**
-   * Inspect the audit log written by the component on every `tools/call`
-   * and (when enabled) resource operation. Returns newest entries first.
-   * Filter by `entryType` (`"tool"` | `"resource"`), `toolName`,
-   * `resourceUri`, and/or `outcome`; `limit` defaults to 100 and is capped
+   * Inspect the audit log written by the component on every `tools/call`,
+   * task lifecycle transition, and (when enabled) resource operation.
+   * Returns newest entries first. Filter by `entryType`
+   * (`"tool"` | `"resource"` | `"task"`), `toolName`, `resourceUri`,
+   * `taskId`, and/or `outcome`; `limit` defaults to 100 and is capped
    * server-side at 1000. (The server applies one index per call; combining
    * `resourceUri` and `toolName` is not meaningful since a row has only one.)
    */
   async listAuditEntries(
     ctx: RunQueryCtx,
     args: {
-      entryType?: "tool" | "resource";
+      entryType?: "tool" | "resource" | "task";
       toolName?: string;
       resourceUri?: string;
+      taskId?: string;
       outcome?: "allowed" | "denied" | "error";
       limit?: number;
     } = {},
@@ -1469,6 +1531,165 @@ export class McpGateway {
       cursorCreationTime = cursor;
     }
     return total;
+  }
+
+  /**
+   * Trusted full read of one task row, for host executor / workflow code.
+   * Unlike the wire-facing `tasks/get` it returns execution data (`args`,
+   * `caller`, `idempotencyKey`) and is NOT owner-bound; never expose its
+   * result to an MCP client without checking ownership.
+   *
+   * It also returns EXPIRED rows as-is, where every owner-facing function
+   * and every trusted finalizer already treats the task as gone. Check
+   * `expiresAt` before acting on a row, or a workflow that sees
+   * `status: "working"` will have its `completeTask` answered
+   * `"not_found"`.
+   */
+  async getTask(ctx: RunQueryCtx, taskId: string) {
+    return await ctx.runQuery(this.component.tasks.getTaskInternal, {
+      taskId,
+    });
+  }
+
+  /**
+   * Mark a task completed with `result`. Called by the host's durable
+   * execution (typically the last step of a `@convex-dev/workflow` run)
+   * when the `tasks` option was configured with a custom `execute`.
+   *
+   * Returns `"finalized"`; `"not_found"` (no such task, or it expired
+   * while you were working); `"conflict"` (already terminal, e.g. the
+   * owner cancelled first — the cancel wins); or `"result_too_large"`,
+   * which means the task WAS finalized but as `failed`, because the
+   * result could not be stored. The last two both mean the client sees
+   * something other than the work you just committed, so check the
+   * outcome rather than discarding it.
+   */
+  async completeTask(ctx: RunMutationCtx, taskId: string, result: unknown) {
+    return await ctx.runMutation(this.component.tasks.completeTask, {
+      taskId,
+      result,
+    });
+  }
+
+  /**
+   * Mark a task failed. `error.message` reaches the polling client
+   * verbatim, so sanitize it like a tool result; pass the full exception
+   * text as `auditErrorMessage` when it should land in the audit log
+   * instead of on the wire.
+   */
+  async failTask(
+    ctx: RunMutationCtx,
+    taskId: string,
+    error: { code: number; message: string },
+    auditErrorMessage?: string,
+  ) {
+    return await ctx.runMutation(this.component.tasks.failTask, {
+      taskId,
+      error,
+      ...(auditErrorMessage !== undefined ? { auditErrorMessage } : {}),
+    });
+  }
+
+  /**
+   * Transition a `working` task to `input_required` with MRTR-shaped
+   * `inputRequests`. The owner answers via `tasks/update`; the gateway
+   * then surfaces the accepted responses through the `onInputResponses`
+   * handler option so the host can resume its workflow.
+   *
+   * Anything other than `"updated"` means the task did NOT enter
+   * `input_required`, so nothing will ask the owner and nothing will
+   * resume: `"conflict"` (not `working` any more), `"invalid_requests"`
+   * (the value is not a plain object — a host-side bug, deliberately
+   * distinct from `"conflict"`), `"too_large"`, `"unsupported_executor"`,
+   * or `"not_found"`. Throwing from `execute` on a non-`"updated"` answer
+   * is the intended handling. Only valid for
+   * host-executed tasks (`tasks.execute` configured): the built-in
+   * executor runs once and could never resume, so component-executed
+   * tasks answer `"unsupported_executor"`.
+   */
+  async requireTaskInput(
+    ctx: RunMutationCtx,
+    taskId: string,
+    inputRequests: Record<string, unknown>,
+  ) {
+    return await ctx.runMutation(this.component.tasks.requireTaskInput, {
+      taskId,
+      inputRequests,
+    });
+  }
+
+  /**
+   * Drop expired task rows. Bounded per call; drains by looping until a
+   * call deletes nothing. Wire it into the same cron as
+   * `pruneAuditEntries` when tasks are enabled.
+   */
+  async pruneTasks(ctx: RunMutationCtx): Promise<number> {
+    let total = 0;
+    for (;;) {
+      const deleted = await ctx.runMutation(
+        this.component.tasks.pruneTasks,
+        {},
+      );
+      total += deleted;
+      if (deleted === 0) break;
+    }
+    return total;
+  }
+
+  /**
+   * Cancel every live (non-terminal) task owned by `ownerSubject`, for
+   * the revocation case: a deferred task executes with the identity
+   * snapshot taken at creation, which stays valid until its TTL even if
+   * the caller's access was revoked minutes later. Call this when a
+   * subject is revoked to stop its pending tasks before they run.
+   * Drains in bounded batches and returns the total cancelled plus the
+   * ids. The host must still cancel any durable execution (workflow run)
+   * for those ids itself, e.g. from its `onCancel` bookkeeping.
+   *
+   * Sweeps every mount by default, which is what a revocation means: the
+   * subject's access is gone, not one mount's. Pass `scope` to narrow it
+   * to the tasks a single mount created (see `tasks.scope` on
+   * `handleMcpRequest`).
+   */
+  async cancelPendingTasksForOwner(
+    ctx: RunMutationCtx,
+    ownerSubject: string,
+    scope?: string,
+  ): Promise<{ cancelled: number; taskIds: string[] }> {
+    let cancelled = 0;
+    let outOfScope = 0;
+    const taskIds: string[] = [];
+    let cursorCreationTime: number | undefined;
+    for (;;) {
+      const batch = await ctx.runMutation(
+        this.component.tasks.cancelPendingTasksForOwner,
+        {
+          ownerSubject,
+          ...(scope !== undefined ? { scope } : {}),
+          ...(cursorCreationTime !== undefined ? { cursorCreationTime } : {}),
+        },
+      );
+      cancelled += batch.cancelled;
+      taskIds.push(...batch.taskIds);
+      outOfScope += batch.outOfScope;
+      if (batch.cursor === null) break;
+      cursorCreationTime = batch.cursor;
+    }
+    // Gated on `outOfScope`, not on `scanned`: a correctly-scoped sweep
+    // over a subject whose tasks have all settled legitimately cancels
+    // nothing, and warning about that would train operators to ignore it.
+    if (outOfScope > 0 && cancelled === 0) {
+      // A revocation that cancelled nothing while the subject demonstrably
+      // has rows is almost always a wrong `scope`, and reading it as
+      // "nothing was pending" leaves the revoked subject's tasks armed
+      // until their TTL. The component logs the per-page detail.
+      console.warn(
+        "[mcp-gateway] revocation sweep cancelled nothing for a scoped " +
+          "subject that has task rows; check the scope argument",
+        scope,
+      );
+    }
+    return { cancelled, taskIds };
   }
 
   /**

@@ -16,12 +16,29 @@ export const auditOutcomeValidator = v.union(
 export const auditEntryTypeValidator = v.union(
   v.literal("tool"),
   v.literal("resource"),
+  v.literal("task"),
 );
 
 export const resourceAuditOperationValidator = v.union(
   v.literal("list"),
   v.literal("read"),
   v.literal("templates_list"),
+);
+
+export const taskAuditOperationValidator = v.union(
+  v.literal("create"),
+  v.literal("input"),
+  v.literal("cancel"),
+  v.literal("complete"),
+  v.literal("fail"),
+);
+
+export const taskStatusValidator = v.union(
+  v.literal("working"),
+  v.literal("input_required"),
+  v.literal("completed"),
+  v.literal("failed"),
+  v.literal("cancelled"),
 );
 
 export default defineSchema({
@@ -49,9 +66,10 @@ export default defineSchema({
     /**
      * Name of the tool argument the gateway fills with the MRTR
      * continuation's stable idempotency key when a verified retry
-     * continues to dispatch. Excluded from the advertised inputSchema
-     * and stripped from caller args. Continuation state and input
-     * responses are never injected; they stay in the host-side hook.
+     * continues to dispatch (and with the task's own idempotency key
+     * when the tool runs as an MCP task). Excluded from the advertised
+     * inputSchema and stripped from caller args. Continuation state and
+     * input responses are never injected; they stay in the host-side hook.
      */
     mrtrArgs: v.optional(
       v.object({
@@ -66,6 +84,15 @@ export default defineSchema({
      * skipping the confirmation the row promises.
      */
     mrtrGated: v.optional(v.boolean()),
+    /**
+     * Opt-in MCP Tasks support (`io.modelcontextprotocol/tasks`). Only a
+     * tool that sets this may be invoked as a task-augmented modern
+     * `tools/call`; the catalog advertises it as
+     * `execution: { taskSupport: "optional" }` when the host has
+     * configured task execution. Pre-existing rows without the column
+     * stay valid courtesy of `v.optional`.
+     */
+    taskSupport: v.optional(v.boolean()),
     /** MCP-facing title, annotations, `_meta`, and security schemes. */
     protocolMetadata: v.optional(v.any()),
     metadata: v.optional(v.any()),
@@ -274,6 +301,126 @@ export default defineSchema({
     .index("by_expiresAt", ["expiresAt"]),
 
   /**
+   * MCP Tasks (`io.modelcontextprotocol/tasks`): one row per task-augmented
+   * modern `tools/call`. The row is the durable source of truth for the
+   * task lifecycle (`working` → `input_required` ⇄ `working` →
+   * `completed` | `failed` | `cancelled`); the client polls it via
+   * `tasks/get` and updates it via `tasks/update`, and the host finalizes
+   * it through the trusted `completeTask` / `failTask` /
+   * `requireTaskInput` client APIs.
+   *
+   * `taskId` is a 128-bit cryptographically random hex string generated
+   * host-side (never client-supplied). `ownerSubject` binds the task to
+   * the authenticated caller that created it; every owner-facing read or
+   * update must match it, and a mismatch is answered exactly like an
+   * unknown id so foreign tasks are unobservable.
+   *
+   * `args` snapshots the public tool arguments for deferred execution by
+   * the built-in scheduled executor; `caller` snapshots the resolved
+   * identity for `identityArg` injection at execution time. Neither is
+   * ever returned on the wire, and neither appears in an
+   * `entryType: "task"` audit row. The `entryType: "tool"` row that
+   * `dispatch.runTool` writes for the run itself DOES carry the
+   * arguments, verbatim — a `taskSupport` tool may not set
+   * `metadata.auditArgs`, precisely so that this is unambiguous.
+   *
+   * `idempotencyKey` is issued once per task; the executing tool persists
+   * it around its side effect so workflow retries and duplicate client
+   * updates cannot double-apply. Repeated `tasks/update` submissions of
+   * byte-identical responses are answered idempotently while the same
+   * round is still pending; a re-send against a superseded round is
+   * `stale_round`, and against a completed or failed row `conflict`.
+   */
+  tasks: defineTable({
+    taskId: v.string(),
+    ownerSubject: v.string(),
+    toolName: v.string(),
+    toolKind: toolKindValidator,
+    args: v.any(),
+    caller: v.optional(
+      v.object({ subject: v.string(), claims: v.optional(v.any()) }),
+    ),
+    status: taskStatusValidator,
+    result: v.optional(v.any()),
+    error: v.optional(v.object({ code: v.number(), message: v.string() })),
+    inputRequests: v.optional(v.any()),
+    inputResponses: v.optional(v.any()),
+    /**
+     * Monotonic count of `input_required` rounds requested on this task
+     * (0 before the first). A `tasks/update` submitting responses must
+     * echo the round it is answering, so a stale retry of an earlier
+     * round cannot be mistaken for the answer to a later, re-asked one.
+     * Optional for forward-compat with rows written before this field.
+     */
+    inputRound: v.optional(v.number()),
+    idempotencyKey: v.string(),
+    /**
+     * `"component"`: the built-in scheduler-based executor runs the
+     * registered tool function once and completes/fails the task.
+     * `"host"`: the host started durable execution itself (typically a
+     * `@convex-dev/workflow` run) and finalizes via the trusted APIs.
+     */
+    executor: v.union(v.literal("component"), v.literal("host")),
+    /**
+     * Set once the host's `tasks.execute` returned for this row. Only
+     * meaningful for `executor: "host"`: the component executor is
+     * scheduled inside the creating mutation, so it is started by
+     * construction. Without this marker a replayed request could not tell
+     * "the row exists, so execution started" from "the row exists because
+     * a start that then failed to be compensated left it behind", and the
+     * retry whose job was to start the work would skip it.
+     */
+    startedAt: v.optional(v.number()),
+    /**
+     * Mount scope, from the host's `tasks.scope` option. The task table is
+     * component-wide and `authorize` runs only at creation, so without
+     * this any mount resolving the same subject could poll, cancel, or
+     * answer input rounds for a task created through a mount with a
+     * different policy. Every owner-facing function requires an exact
+     * match (in both directions: a scoped row is invisible to an unscoped
+     * mount and vice versa), and a mismatch is answered exactly like an
+     * unknown id. Unset preserves the pre-scope behaviour, so
+     * single-mount hosts need no migration.
+     */
+    scope: v.optional(v.string()),
+    /**
+     * Set when the host's MRTR `beforeCall` hook approved this call before
+     * the row was created. The built-in executor requires it for any tool
+     * the registry currently marks `mrtrGated`: a task created while the
+     * tool had no hook must not still execute after one was added (that
+     * confirmation is what the row now promises), while a task the hook
+     * already approved must not be blocked by the same rule.
+     */
+    mrtrApproved: v.optional(v.boolean()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_taskId", ["taskId"])
+    // Lets a task-augmented MRTR continuation that is replayed find the
+    // task it already created instead of minting a sibling. Lives here
+    // rather than as a task id on the `mrtrChains` row on purpose: MRTR
+    // must not know that Tasks exists.
+    .index("by_idempotencyKey", ["idempotencyKey"])
+    // Bulk owner operations (e.g. cancelling a revoked subject's pending
+    // tasks).
+    .index("by_ownerSubject", ["ownerSubject"])
+    // Per-owner live-task cap. Counting through `by_ownerSubject` would
+    // read every task the owner ever created (and take a read dependency
+    // on all of them, so any sibling status change could OCC-conflict the
+    // next creation); this index reads only the two non-terminal statuses.
+    .index("by_owner_status", ["ownerSubject", "status"])
+    .index("by_expiresAt", ["expiresAt"]),
+
+  /**
+   * Shared audit log for tool calls, task lifecycle transitions, and
+   * opt-in resource operations. Tool rows capture the tool name/kind,
+   * outcome, duration, and optionally redacted args. Resource rows
+   * capture operation metadata (resource URI, list/read, outcome,
+   * duration) but never resource contents. Task rows capture the task
+   * id, operation, tool name, and owner subject but never task
+   * payloads. `identitySubject` is supplied by the host after resolving
+  /**
    * Shared audit log for tool calls and opt-in resource operations.
    * Tool rows capture the tool name/kind, outcome, duration, and
    * optionally redacted args. Resource rows capture operation metadata
@@ -285,13 +432,15 @@ export default defineSchema({
   audit: defineTable({
     /**
      * Optional for forward compatibility with existing tool audit rows.
-     * New writes set this to either "tool" or "resource".
+     * New writes set this to "tool", "resource", or "task".
      */
     entryType: v.optional(auditEntryTypeValidator),
     toolName: v.optional(v.string()),
     toolKind: v.optional(toolKindValidator),
     resourceUri: v.optional(v.string()),
     resourceOperation: v.optional(resourceAuditOperationValidator),
+    taskId: v.optional(v.string()),
+    taskOperation: v.optional(taskAuditOperationValidator),
     args: v.any(),
     outcome: auditOutcomeValidator,
     identitySubject: v.union(v.string(), v.null()),
@@ -301,6 +450,7 @@ export default defineSchema({
   })
     .index("by_toolName", ["toolName"])
     .index("by_resourceUri", ["resourceUri"])
+    .index("by_taskId", ["taskId"])
     .index("by_entryType", ["entryType"])
     .index("by_outcome", ["outcome"]),
 });

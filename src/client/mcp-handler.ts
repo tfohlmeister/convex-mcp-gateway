@@ -223,6 +223,108 @@ export type McpMrtrOptions = {
 };
 
 /**
+ * The snapshot handed to a host task executor and to the update hooks.
+ * `identity` is the caller resolved when the task was created; `args`
+ * are the public tool arguments (identity/reserved keys already
+ * stripped); `idempotencyKey` is issued once per task and must be
+ * persisted by the tool around its side effect.
+ */
+export type McpTaskContext = {
+  taskId: string;
+  toolName: string;
+  toolKind: "query" | "mutation" | "action";
+  args: Record<string, unknown>;
+  identity: { subject: string; claims?: Record<string, unknown> };
+  idempotencyKey: string;
+  expiresAt: number;
+};
+
+/**
+ * Starts durable execution for a freshly created task, e.g.
+ * `workflow.start(ctx, internal.tasks.runArchive, {...})` with
+ * `@convex-dev/workflow`. It must only *start* the work and return;
+ * the execution itself finalizes the task later via
+ * `gateway.completeTask` / `gateway.failTask` (or pauses it via
+ * `gateway.requireTaskInput`). A throw here fails the task immediately.
+ */
+export type McpTaskExecutor = (
+  ctx: McpHandlerCtx,
+  task: McpTaskContext,
+) => Promise<void> | void;
+
+export type McpTasksOptions = {
+  /**
+   * Host-owned durable execution. Omit it to use the built-in
+   * scheduled executor, which runs the registered tool function once
+   * and completes/fails the task (no retries, no input rounds).
+   */
+  execute?: McpTaskExecutor;
+  /**
+   * Called after a `tasks/update` accepted MRTR-shaped `inputResponses`
+   * for an `input_required` task (now back in `working`). Hosts with a
+   * custom `execute` resume their workflow here. Best-effort AND
+   * at-least-once: a throw is logged and the update still succeeds (the
+   * responses are already durably stored on the task row), and an
+   * idempotent duplicate update re-fires the hook so a client that
+   * re-sends the same responses retries a notification that previously
+   * failed. The hook MUST therefore tolerate repeats.
+   */
+  onInputResponses?: (
+    ctx: McpHandlerCtx,
+    event: {
+      taskId: string;
+      toolName: string;
+      inputResponses: Record<string, unknown>;
+    },
+  ) => Promise<void> | void;
+  /**
+   * Called after an owner cancellation, including idempotent repeats:
+   * re-sending the cancel is the retry path for a notification that
+   * previously threw, so the hook MUST tolerate being called for an
+   * already-cancelled task. Hosts cancel their workflow run here.
+   */
+  onCancel?: (
+    ctx: McpHandlerCtx,
+    event: { taskId: string; toolName: string },
+  ) => Promise<void> | void;
+  /**
+   * Default task retention. A task row (and with it the result) expires
+   * `retentionMs` after creation; expired tasks answer like unknown ids
+   * and are dropped by `gateway.pruneTasks`. Clamped to
+   * [1 minute, 7 days]; defaults to 24 hours. A client may request a
+   * shorter `ttlMs` per call, clamped the same way.
+   */
+  retentionMs?: number;
+  /**
+   * Identifies THIS mount for task ownership. Stored on every task the
+   * mount creates, and required to match on every `tasks/get` /
+   * `tasks/update`; a mismatch answers exactly like an unknown task id.
+   *
+   * Set it whenever the gateway is mounted more than once with different
+   * `authorize` policies over the same identity namespace. The task table
+   * is component-wide and `authorize` runs only at creation, so without a
+   * scope a caller permitted on a broad mount can start a privileged task
+   * there and collect its result through a narrower one — bypassing the
+   * narrower mount's policy without any bug in it.
+   *
+   * A sealed MRTR `requestState` is not bound to the mount, so two mounts
+   * sharing `mrtr.secret` both accept the same continuation and each ends
+   * up owning its own task row for that chain (their rows are
+   * scope-isolated). The tool still dedupes, because both runs receive the
+   * same chain key in `mrtrArgs`. Give differently-scoped mounts different
+   * secrets if you want continuations to be non-transferable.
+   *
+   * Unset (the default) keeps the pre-scope behaviour, so a single-mount
+   * host needs no migration. Adopting it later only affects tasks created
+   * from then on: rows already in flight have no scope and stay visible
+   * only to unscoped mounts until they expire.
+   */
+  scope?: string;
+  /** Advertised polling interval hint, defaults to 2000 ms. */
+  pollIntervalMs?: number;
+};
+
+/**
  * Origin allowlist for `handleMcpRequest`. MCP Streamable HTTP requires
  * servers to validate the `Origin` header to prevent DNS-rebinding
  * attacks: a request whose `Origin` is present but not allowed is
@@ -404,6 +506,21 @@ export interface HandleMcpRequestOptions {
    * state cannot be replayed with different responses.
    */
   mrtr?: McpMrtrOptions;
+  /**
+   * Opt-in MCP Tasks (`io.modelcontextprotocol/tasks`). **Off by
+   * default**; the capability is advertised in `server/discover` only
+   * when this option is set, and only tools registered with
+   * `taskSupport: true` accept a task-augmented modern `tools/call`.
+   *
+   * Without `execute`, the gateway runs the tool once via the component's
+   * built-in scheduled executor (durable across restarts, no retries) and
+   * completes or fails the task. Hosts that need retry policy, delays,
+   * or `input_required` rounds supply `execute` to start their own
+   * durable execution — typically a `@convex-dev/workflow` run — and
+   * finalize via `gateway.completeTask` / `failTask` /
+   * `requireTaskInput`. See docs/tasks.md.
+   */
+  tasks?: McpTasksOptions;
 }
 
 /**
@@ -444,6 +561,7 @@ type RegisteredTool = {
     idempotencyKey: string;
   };
   mrtrGated?: boolean;
+  taskSupport?: boolean;
   protocolMetadata?: {
     title?: string;
     annotations?: unknown;
@@ -518,6 +636,19 @@ const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 const HEADER_MISMATCH = -32020;
+
+/** Advertised default `tasks/get` polling hint (milliseconds). */
+const TASK_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Default task retention ceiling applied when the host did not set
+ * `tasks.retentionMs`. Mirrors the component's `TASK_DEFAULT_TTL_MS`
+ * (not imported to keep component server code out of the host bundle).
+ */
+const TASK_DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/** Capability / extension key for MCP Tasks. */
+const TASKS_CAPABILITY_KEY = "io.modelcontextprotocol/tasks";
 
 /**
  * What the MCP client is told when host code threw instead of returning
@@ -855,6 +986,9 @@ function modernNameMatches(message: JsonRpcMessage, request: Request): boolean {
       return headerName === message.params?.uri;
     case "prompts/get":
       return headerName === message.params?.name;
+    case "tasks/get":
+    case "tasks/update":
+      return headerName === message.params?.taskId;
     default:
       return true;
   }
@@ -1044,7 +1178,8 @@ function finalizeModernResult(
     method === "tools/list" ||
     method === "resources/list" ||
     method === "resources/templates/list" ||
-    method === "resources/read"
+    method === "resources/read" ||
+    method === "tasks/get"
   ) {
     envelope.result.ttlMs ??= 0;
     envelope.result.cacheScope ??= "private";
@@ -1645,6 +1780,34 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Max nesting the task path accepts in client-controlled JSON values. */
+const MAX_TASK_VALUE_DEPTH = 64;
+
+/**
+ * True when `value` nests deeper than `MAX_TASK_VALUE_DEPTH`. Walked
+ * with an EXPLICIT stack, never recursion, so checking a hostile value
+ * cannot itself overflow. Task args and input responses are checked at
+ * the HTTP boundary before they reach `ctx.runMutation`, whose own arg
+ * serialization would otherwise overflow on a deeply nested body and
+ * escape as a raw 500 instead of a clean JSON-RPC error.
+ */
+function nestsTooDeep(value: unknown): boolean {
+  const stack: Array<{ node: unknown; depth: number }> = [
+    { node: value, depth: 0 },
+  ];
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop()!;
+    if (node === null || typeof node !== "object") continue;
+    if (depth > MAX_TASK_VALUE_DEPTH) return true;
+    for (const child of Array.isArray(node)
+      ? node
+      : Object.values(node as Record<string, unknown>)) {
+      stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+  return false;
+}
+
 /**
  * Validate MCP resource/content annotations. Returns a human-readable
  * problem string, or `null` when valid (including when `undefined`).
@@ -1879,6 +2042,16 @@ export async function handleMcpRequest(
   component: ComponentApi,
   options: InternalHandleMcpRequestOptions,
 ): Promise<Response> {
+  // An empty task scope is a configuration error, not "unscoped": it
+  // would be stored as its own third namespace, so a host writing
+  // `scope: process.env.MOUNT_ID ?? ""` would silently get a namespace
+  // nobody intended, unreachable from both scoped and unscoped mounts.
+  // Fail at the mount rather than at the first poll.
+  if (options.tasks?.scope === "") {
+    throw new Error(
+      "tasks.scope must be a non-empty string; omit it for an unscoped mount.",
+    );
+  }
   // Before the preflight branch: telling a browser via CORS that a
   // cross-origin POST is permitted, only to 403 the POST itself, defeats
   // the point of preflight. A disallowed origin gets a bare 403 with no
@@ -2048,6 +2221,9 @@ async function handlePost(
     !isInitialize &&
     (headerProtocolVersion === MODERN_PROTOCOL_VERSION ||
       metadataProtocolVersion !== null);
+  // The validated `clientCapabilities` object of a modern request,
+  // hoisted so MRTR and task-augmented `tools/call` can both negotiate
+  // against it below.
   let modernClientCapabilities: Record<string, unknown> | null = null;
 
   // The 2026 protocol moves protocol negotiation to each request. Check the
@@ -2360,6 +2536,16 @@ async function handlePost(
         capabilities: {
           tools: {},
           ...(advertiseResources ? { resources: {} } : {}),
+          // Opt-in negotiation: tasks are advertised only when the host
+          // configured task execution, per the extension contract.
+          ...(options.tasks
+            ? {
+                "io.modelcontextprotocol/tasks": {
+                  pollIntervalMs:
+                    options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS,
+                },
+              }
+            : {}),
         },
       });
       break;
@@ -2990,6 +3176,12 @@ async function handlePost(
             ...(tool.outputSchema !== undefined
               ? { outputSchema: tool.outputSchema }
               : {}),
+            // Advertise task support only when the host actually
+            // configured task execution AND the caller speaks the
+            // modern protocol; legacy clients cannot poll tasks.
+            ...(tool.taskSupport === true && isModern && options.tasks
+              ? { execution: { taskSupport: "optional" } }
+              : {}),
           });
         }
       }
@@ -3098,6 +3290,101 @@ async function handlePost(
             "deployment did not configure",
         );
         break;
+      }
+
+      // Task augmentation (`io.modelcontextprotocol/tasks`): validate the
+      // whole negotiation before authorize so an unusable task request
+      // never runs the tool synchronously as a silent fallback.
+      const taskRequest = message.params?.task;
+      if (taskRequest !== undefined) {
+        if (!isModern) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Task-augmented calls require MCP protocol " +
+              `${MODERN_PROTOCOL_VERSION} or later`,
+          );
+          break;
+        }
+        if (!options.tasks) {
+          // Same "unsupported because unconfigured" shape as the
+          // resource catalogs: the capability was never advertised.
+          responseStatus = 404;
+          body = jsonErrorEnvelope(
+            message.id,
+            -32601,
+            "Tasks are not supported: the host did not configure task " +
+              "execution",
+          );
+          break;
+        }
+        if (
+          !isPlainObject(modernClientCapabilities?.[TASKS_CAPABILITY_KEY])
+        ) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Task-augmented calls require the ${TASKS_CAPABILITY_KEY} ` +
+              "client capability",
+          );
+          break;
+        }
+        if (
+          !isPlainObject(taskRequest) ||
+          (taskRequest.ttlMs !== undefined &&
+            typeof taskRequest.ttlMs !== "number")
+        ) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Invalid task request: expected an object with optional " +
+              "numeric ttlMs",
+          );
+          break;
+        }
+        if (tool.taskSupport !== true) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Tool "${tool.name}" does not support task execution`,
+          );
+          break;
+        }
+        // Reject a deeply nested args value here, before it reaches the
+        // createTask mutation whose arg serialization would overflow the
+        // stack and escape as a raw 500.
+        if (nestsTooDeep(args)) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Task arguments nest too deeply",
+          );
+          break;
+        }
+        // A non-object `arguments` (string, array, number) reaches a
+        // synchronous dispatch as-is and the tool's own validator rejects
+        // it. On the task path it would instead be PERSISTED first, and
+        // the executor's `{...task.args}` spread would turn a string into
+        // a character-indexed object before the tool ever saw it. Reject
+        // it while the caller is still here to be told.
+        if (!isPlainObject(args)) {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "Task arguments must be an object",
+          );
+          break;
+        }
+        if (!identity) {
+          // Tasks are owner-bound rows; an anonymous caller could never
+          // poll the result, so reject before creating unpollable state.
+          // Use the real 401 + WWW-Authenticate challenge (same as the
+          // authorize denial path) so browser clients begin OAuth
+          // discovery instead of seeing an unactionable 200.
+          raw = await requireAuthChallenge(ctx, request, component, message.id);
+          body = "";
+          break;
+        }
       }
 
       const start = Date.now();
@@ -3786,6 +4073,251 @@ async function handlePost(
         }
       }
 
+      // Task-augmented call: create the durable task row and return the
+      // handle immediately; the tool runs after this request completes
+      // (built-in scheduled executor) or inside the host's own durable
+      // execution.
+      //
+      // Ordering matters, and this is deliberately the LAST gate before
+      // dispatch would have happened:
+      //   - after authorize, so a denied caller cannot create tasks;
+      //   - after the identityArg strip, so the stored args snapshot is
+      //     the public argument set;
+      //   - after the MRTR `beforeCall` hook, so no durable row exists
+      //     until the hook approved the call. A hook that demands input
+      //     answered with the `input_required` envelope above and created
+      //     nothing, which keeps MRTR's one negotiation channel intact:
+      //     a task-augmented MRTR tool negotiates over `requestState`
+      //     first and only then becomes a task.
+      //   - after the chain claim above, which is the load-bearing one.
+      //     Creating a task is a TERMINAL resolution of the chain, not a
+      //     deferral of one: it returns a handle INSTEAD of dispatching,
+      //     and once the row exists the executor runs the tool with no
+      //     further gate. So it must be covered by the same
+      //     `resolution: "dispatched"` claim as a synchronous dispatch —
+      //     otherwise a task-augmented continuation of a chain another
+      //     branch already settled (a decline, say) would create a row
+      //     that quietly runs the tool. A lost claim broke above with
+      //     `alreadyResolvedEnvelope` and created nothing.
+      if (taskRequest !== undefined && options.tasks && identity) {
+        const taskId = generateSessionId();
+        // A verified continuation carries the chain's idempotency key, and
+        // the executor injects the task row's key into `mrtrArgs`. Reusing
+        // it means a replayed continuation (`redemption === "replay"`)
+        // that lands as a second task still dedupes inside the tool,
+        // exactly as a replayed synchronous continuation does.
+        const idempotencyKey =
+          continuation?.idempotencyKey ?? crypto.randomUUID();
+        const executor = options.tasks.execute ? "host" : "component";
+        // A client may only shorten retention, never extend it past the
+        // host's configured ceiling (or the 24h default, mirroring the
+        // component's TASK_DEFAULT_TTL_MS). The component additionally
+        // clamps to the global [1 minute, 7 days] bounds.
+        const hostRetentionMs =
+          options.tasks.retentionMs ?? TASK_DEFAULT_RETENTION_MS;
+        const requestedTtlMs =
+          isPlainObject(taskRequest) && typeof taskRequest.ttlMs === "number"
+            ? Math.min(taskRequest.ttlMs, hostRetentionMs)
+            : hostRetentionMs;
+        // A task created from a continuation must outlive every
+        // continuation that could ask for it again. Otherwise a client
+        // that shortens `ttlMs` below the continuation's own lifetime gets
+        // the reuse lookup to miss (the row is expired, so it is not
+        // reusable) and every replay mints another task and another tool
+        // run from one chain — the exact duplication the shared chain key
+        // exists to prevent.
+        const ttlMs =
+          continuation !== null
+            ? Math.max(requestedTtlMs, continuation.exp - Date.now())
+            : requestedTtlMs;
+        const created = await ctx.runMutation(component.tasks.createTask, {
+          taskId,
+          ownerSubject: identity.subject,
+          ...(options.tasks.scope !== undefined
+            ? { scope: options.tasks.scope }
+            : {}),
+          toolName: tool.name,
+          toolKind: tool.kind,
+          args,
+          caller: identity,
+          idempotencyKey,
+          executor,
+          // The hook ran above and returned null (approve); record it so
+          // the executor can tell "this call was confirmed" from "this
+          // task predates the tool becoming gated".
+          ...(beforeCall !== undefined ? { mrtrApproved: true } : {}),
+          ...(ttlMs !== undefined ? { ttlMs } : {}),
+        });
+        if (!created.created) {
+          // Client-caused rejections map to INVALID_PARAMS with a clear
+          // message; a duplicate 128-bit id is genuinely-broken and logs.
+          const clientReason: Record<string, string | undefined> = {
+            args_too_large:
+              "Task arguments exceed the permitted serialized size",
+            caller_too_large:
+              "The caller identity is too large to snapshot for a task",
+            limit_exceeded:
+              "Too many active tasks for this caller; poll or cancel " +
+              "existing tasks before creating more",
+          };
+          const message_ = clientReason[created.reason];
+          if (message_ === undefined) {
+            console.error(
+              "[mcp-gateway] task creation failed",
+              created.reason,
+              tool.name,
+            );
+          }
+          body = jsonErrorEnvelope(
+            message.id,
+            message_ !== undefined ? INVALID_PARAMS : INTERNAL_ERROR,
+            message_ ?? "Failed to create task",
+          );
+          break;
+        }
+        // The id the CLIENT gets. Normally the one just generated, but a
+        // replayed continuation is answered with the task its chain key
+        // already owns, so every step below must speak about that row, not
+        // the id this request happened to mint and never used.
+        const effectiveTaskId = created.task.taskId;
+        // A reused row is normally the task the original request already
+        // started, and starting again would run the host's workflow twice
+        // for one task. `startPending` is the exception the component
+        // reports: the row is host-executed, non-terminal, and was never
+        // marked started, so its original request died between creating it
+        // and getting execution going. This retry is that row's only
+        // chance — skipping it would hand back a handle nothing advances.
+        const mustStart =
+          created.reused !== true || created.startPending === true;
+        if (created.startPending === true) {
+          console.warn(
+            "[mcp-gateway] starting a reused task whose original request " +
+              "never recorded a start",
+            effectiveTaskId,
+            tool.name,
+          );
+        }
+        if (options.tasks.execute && mustStart) {
+          try {
+            await options.tasks.execute(ctx, {
+              taskId: effectiveTaskId,
+              toolName: tool.name,
+              toolKind: tool.kind,
+              args,
+              identity,
+              idempotencyKey,
+              expiresAt: created.task.expiresAt,
+            });
+            // Durable execution is going; record it so a replay of this
+            // request reuses the row without starting a second run, and so
+            // a replay after a FAILED start still starts one.
+            try {
+              await ctx.runMutation(component.tasks.markTaskStarted, {
+                taskId: effectiveTaskId,
+              });
+            } catch (markErr) {
+              // Losing the marker only costs an extra start on a replay,
+              // which the host's idempotency key already absorbs. Do not
+              // fail a task whose execution is running.
+              console.warn(
+                "[mcp-gateway] could not record that task execution started",
+                effectiveTaskId,
+                markErr,
+              );
+            }
+          } catch (err) {
+            // The executor could not start durable execution; fail the
+            // task so the client is not left polling a dead handle.
+            console.error(
+              "[mcp-gateway] task executor threw during start",
+              tool.name,
+              err,
+            );
+            let failed: string | null = null;
+            try {
+              failed = await ctx.runMutation(component.tasks.failTask, {
+                taskId: effectiveTaskId,
+                error: {
+                  code: INTERNAL_ERROR,
+                  message: "Task failed to start",
+                },
+                auditErrorMessage:
+                  err instanceof Error ? err.message : String(err),
+              });
+            } catch (failErr) {
+              // Double fault: the row could not be failed either. The
+              // client still gets a clean error (not a raw 500); the
+              // orphaned working row is bounded by its TTL.
+              console.error(
+                "[mcp-gateway] failed to mark task as failed after " +
+                  "executor start error",
+                effectiveTaskId,
+                failErr,
+              );
+            }
+            if (failed !== null && failed !== "finalized") {
+              // The throw came AFTER the executor advanced the task: it
+              // already completed, was cancelled, or is awaiting input
+              // (a `requireTaskInput` that succeeded before the hook
+              // threw). Reporting "failed to start" would strand a live
+              // task behind an error envelope with no handle, so hand
+              // back the handle and let the recorded state speak.
+              console.error(
+                "[mcp-gateway] task executor threw after the task had " +
+                  "already advanced (" +
+                  failed +
+                  "); durable execution may still be running, so the " +
+                  "recorded task state is authoritative, not this error",
+                effectiveTaskId,
+              );
+            } else {
+              body = jsonErrorEnvelope(
+                message.id,
+                INTERNAL_ERROR,
+                "Task failed to start",
+              );
+              break;
+            }
+          }
+        }
+        // `created.task` is a snapshot from before `execute` ran, and a
+        // host executor may legitimately advance the row inside this same
+        // request (a `requireTaskInput` that puts it straight into
+        // `input_required`). Re-read so the handle we return does not
+        // advertise a status the database no longer holds; fall back to
+        // the snapshot if the read fails, since the row demonstrably
+        // exists and the client can just poll.
+        let descriptor_ = created.task;
+        if (options.tasks.execute && mustStart) {
+          try {
+            const fresh = await ctx.runQuery(component.tasks.getTaskForOwner, {
+              taskId: effectiveTaskId,
+              ownerSubject: identity.subject,
+              ...(options.tasks.scope !== undefined
+                ? { scope: options.tasks.scope }
+                : {}),
+            });
+            if (fresh) descriptor_ = fresh;
+          } catch (err) {
+            console.warn(
+              "[mcp-gateway] could not re-read the created task; returning " +
+                "the pre-execution snapshot",
+              effectiveTaskId,
+              err,
+            );
+          }
+        }
+        body = jsonResultEnvelope(message.id, {
+          resultType: "task",
+          task: {
+            ...descriptor_,
+            pollIntervalMs:
+              options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS,
+          },
+        });
+        break;
+      }
+
       // Allowed (and hook-approved, when one exists): dispatch via the
       // component. Only the chain's idempotency key is ever injected;
       // continuation state and input responses stayed in the hook, so
@@ -3843,6 +4375,326 @@ async function handlePost(
           : {}),
         isError: false,
       });
+      break;
+    }
+
+    case "tasks/get":
+    case "tasks/update": {
+      // Task methods exist only on the modern protocol: a legacy client
+      // could never have created a task in the first place.
+      if (!isModern) {
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `Unsupported method: ${message.method}`,
+        );
+        break;
+      }
+      if (!options.tasks) {
+        // Never advertised (see server/discover): unknown method.
+        responseStatus = 404;
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `Unsupported method: ${message.method}`,
+        );
+        break;
+      }
+      if (!identity) {
+        // Tasks are owner-bound; without an identity there is nothing a
+        // task lookup could legally return. 401 + WWW-Authenticate so
+        // browser clients begin OAuth discovery.
+        raw = await requireAuthChallenge(ctx, request, component, message.id);
+        body = "";
+        break;
+      }
+      const taskId = message.params?.taskId;
+      if (typeof taskId !== "string" || taskId.length === 0) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "Missing task id",
+        );
+        break;
+      }
+      const pollIntervalMs =
+        options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS;
+
+      if (message.method === "tasks/get") {
+        const task = await ctx.runQuery(component.tasks.getTaskForOwner, {
+          taskId,
+          ownerSubject: identity.subject,
+          // Scope binds the task to the mount that created it: without
+          // it, a mount with a narrower policy can serve a task the
+          // caller started on a broader one.
+          ...(options.tasks.scope !== undefined
+            ? { scope: options.tasks.scope }
+            : {}),
+        });
+        if (!task) {
+          // Unknown, foreign, and expired ids answer identically so a
+          // task's existence never leaks across callers.
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Unknown task: ${taskId}`,
+          );
+          break;
+        }
+        body = jsonResultEnvelope(message.id, {
+          resultType: "task",
+          task: { ...task, pollIntervalMs },
+        });
+        break;
+      }
+
+      // tasks/update: exactly one of `action: "cancel"` or MRTR-shaped
+      // `inputResponses`.
+      const updateAction = message.params?.action;
+      const inputResponses = message.params?.inputResponses;
+      // The round the client is answering, echoed from the descriptor it
+      // polled. Optional, but a malformed value is rejected rather than
+      // coerced to "absent": absence is itself meaningful (it means
+      // "answering a task that never asked a round"), so coercing `"1"`
+      // or `1.5` would answer a client's type bug with the factually
+      // wrong "these responses answer a superseded input round".
+      const inputRoundRaw = message.params?.inputRound;
+      const inputRound =
+        inputRoundRaw === undefined ? undefined : Number(inputRoundRaw);
+      if (
+        inputRoundRaw !== undefined &&
+        !(
+          typeof inputRoundRaw === "number" &&
+          Number.isSafeInteger(inputRoundRaw) &&
+          inputRoundRaw >= 0
+        )
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "inputRound must be a non-negative integer",
+        );
+        break;
+      }
+      if (
+        (updateAction === undefined) === (inputResponses === undefined) ||
+        (updateAction !== undefined && updateAction !== "cancel")
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          'tasks/update requires exactly one of action: "cancel" or ' +
+            "inputResponses",
+        );
+        break;
+      }
+      // Reject a deeply nested inputResponses before it reaches the
+      // submit mutation's serialization (would overflow into a raw 500).
+      if (inputResponses !== undefined && nestsTooDeep(inputResponses)) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "inputResponses nest too deeply",
+        );
+        break;
+      }
+
+      if (updateAction === "cancel") {
+        const cancelled = await ctx.runMutation(
+          component.tasks.cancelTaskForOwner,
+          {
+            taskId,
+            ownerSubject: identity.subject,
+            ...(options.tasks.scope !== undefined
+              ? { scope: options.tasks.scope }
+              : {}),
+          },
+        );
+        if (cancelled.outcome === "not_found") {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Unknown task: ${taskId}`,
+          );
+          break;
+        }
+        if (cancelled.outcome === "conflict") {
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Task is already ${cancelled.status} and cannot be cancelled`,
+          );
+          break;
+        }
+        // Notify the host so it can stop its workflow run. Idempotent
+        // repeats re-fire the hook on purpose: the hook is best-effort,
+        // so re-sending the cancel is the client's (and operator's) way
+        // to retry a notification that previously threw. Hooks must
+        // therefore be idempotent (see docs/tasks.md).
+        if (options.tasks.onCancel) {
+          try {
+            await options.tasks.onCancel(ctx, {
+              taskId,
+              toolName: cancelled.task.toolName,
+            });
+          } catch (err) {
+            console.error(
+              "[mcp-gateway] tasks onCancel hook threw; the task is " +
+                "cancelled but the host workflow may still be running. " +
+                "Re-sending the cancel retries the notification.",
+              taskId,
+              err,
+            );
+          }
+        } else {
+          // The row is cancelled either way, so the wire answer is
+          // correct — but if this task is host-executed, nothing here can
+          // stop the run. Silence would make a misconfigured mount (or a
+          // task created on a different mount, since the task table is
+          // component-wide) indistinguishable from a working one.
+          console.warn(
+            "[mcp-gateway] task cancelled on a mount with no onCancel hook; " +
+              "a host-executed run will not be stopped",
+            taskId,
+            cancelled.task.toolName,
+          );
+        }
+        body = jsonResultEnvelope(message.id, {
+          resultType: "task",
+          task: { ...cancelled.task, pollIntervalMs },
+        });
+        break;
+      }
+
+      const submitted = await ctx.runMutation(
+        component.tasks.submitInputResponsesForOwner,
+        {
+          taskId,
+          ownerSubject: identity.subject,
+          ...(options.tasks.scope !== undefined
+            ? { scope: options.tasks.scope }
+            : {}),
+          inputResponses,
+          ...(inputRound !== undefined ? { inputRound } : {}),
+        },
+      );
+      switch (submitted.outcome) {
+        case "not_found":
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Unknown task: ${taskId}`,
+          );
+          break;
+        case "stale_round":
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `These responses answer a superseded input round; the task is ` +
+              `now awaiting round ${submitted.expectedRound}`,
+          );
+          break;
+        case "conflict":
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Task is ${submitted.status} and does not accept input responses`,
+          );
+          break;
+        case "mismatch":
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "inputResponses must answer exactly the requested input keys " +
+              'with an action of "accept", "decline", or "cancel"',
+          );
+          break;
+        case "too_large":
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            "inputResponses exceed the permitted serialized size",
+          );
+          break;
+        case "cancelled":
+          // Every response carried action "cancel": treated as an owner
+          // cancellation, including the host notification.
+          if (options.tasks.onCancel) {
+            try {
+              await options.tasks.onCancel(ctx, {
+                taskId,
+                toolName: submitted.task.toolName,
+              });
+            } catch (err) {
+              console.error(
+                "[mcp-gateway] tasks onCancel hook threw; the task is " +
+                  "cancelled but the host workflow may still be running. " +
+                  "Re-sending the same responses retries the notification.",
+                taskId,
+                err,
+              );
+            }
+          } else {
+            console.warn(
+              "[mcp-gateway] input responses cancelled the task on a mount " +
+                "with no onCancel hook; a host-executed run will not be " +
+                "stopped",
+              taskId,
+              submitted.task.toolName,
+            );
+          }
+          body = jsonResultEnvelope(message.id, {
+            resultType: "task",
+            task: { ...submitted.task, pollIntervalMs },
+          });
+          break;
+        case "duplicate":
+        case "accepted": {
+          // Duplicates re-fire the hook on purpose: the hook is the only
+          // signal that resumes a paused host workflow, and it is
+          // best-effort. If it threw on the fresh acceptance, re-sending
+          // the same responses is the client's recovery path, so it must
+          // reach the host again. Hooks are required to be idempotent
+          // (see docs/tasks.md). Re-sent all-cancel responses do NOT
+          // arrive here: the component reports them as `cancelled` above,
+          // which is what re-fires `onCancel`.
+          if (options.tasks.onInputResponses) {
+            try {
+              await options.tasks.onInputResponses(ctx, {
+                taskId,
+                toolName: submitted.task.toolName,
+                inputResponses: inputResponses as Record<string, unknown>,
+              });
+            } catch (err) {
+              // The responses are durably stored on the row and the
+              // client can retry the notification by re-sending them.
+              console.error(
+                "[mcp-gateway] tasks update hook threw; the responses are " +
+                  "stored but the host workflow was not notified. " +
+                  "Re-sending the same tasks/update retries the hook.",
+                taskId,
+                err,
+              );
+            }
+          } else {
+            // Storing the responses is not the point: resuming the paused
+            // execution is, and only the hook can do that. The client sees
+            // success either way, so this is the operator's only signal.
+            console.warn(
+              "[mcp-gateway] tasks/update accepted input responses on a " +
+                "mount with no onInputResponses hook; a host-executed task " +
+                "will not resume",
+              taskId,
+              submitted.task.toolName,
+            );
+          }
+          body = jsonResultEnvelope(message.id, {
+            resultType: "task",
+            task: { ...submitted.task, pollIntervalMs },
+          });
+          break;
+        }
+      }
       break;
     }
 

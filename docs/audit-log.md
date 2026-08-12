@@ -1,10 +1,20 @@
 # Audit log
 
-Every `tools/call` produces one row in the component's `audit` table.
-The row records who called what, when, with which arguments, and what
-the gateway decided. The audit pipeline is independent from the
-dispatch outcome: a failed audit insert never alters the response the
-caller sees.
+Every `tools/call` produces one row in the component's `audit` table,
+and so does every resource operation and every task lifecycle
+transition. The row records who called what, when, and what the gateway
+decided — plus the arguments, for tool rows. The audit pipeline is
+independent from the dispatch outcome: a failed audit insert never
+alters the response the caller sees.
+
+`entryType` discriminates the three kinds of row, and the columns that
+apply depend on it:
+
+| `entryType` | Written by | Key columns |
+|---|---|---|
+| `"tool"` | `dispatch.runTool` (and `dispatch.recordAuthDenial` for host-side denials) | `toolName`, `toolKind`, `args` |
+| `"resource"` | the host's HTTP handler, per resource operation | `resourceUri`, `resourceOperation` |
+| `"task"` | the component's task lifecycle mutations | `taskId`, `taskOperation`, `toolName` |
 
 ## What gets written
 
@@ -12,17 +22,44 @@ caller sees.
 |---|---|---|
 | `_id` | `Id<"audit">` | Convex row id |
 | `_creationTime` | `number` | ms since epoch, written by Convex |
-| `toolName` | `string` | Registered tool name (indexed) |
-| `toolKind` | `"query" \| "mutation" \| "action"` | |
-| `args` | `any` | Caller args, or `null` if `metadata.auditArgs === false` on the tool |
+| `entryType` | `"tool" \| "resource" \| "task"` | (indexed) Optional only for rows written before it existed |
+| `toolName` | `string` (optional) | Registered tool name (indexed). Also set on task rows, naming the tool the task runs |
+| `toolKind` | `"query" \| "mutation" \| "action"` (optional) | Tool rows |
+| `resourceUri` | `string` (optional) | Resource rows (indexed) |
+| `resourceOperation` | `"list" \| "read" \| "templates" \| "subscribe" \| "unsubscribe"` (optional) | Resource rows |
+| `taskId` | `string` (optional) | Task rows (indexed) |
+| `taskOperation` | `"create" \| "input" \| "cancel" \| "complete" \| "fail"` (optional) | Task rows |
+| `args` | `any` | Caller args on tool rows, or `null` if `metadata.auditArgs === false`. Always `null` on resource and task rows |
 | `outcome` | `"allowed" \| "denied" \| "error"` | (indexed) |
-| `identitySubject` | `string \| null` | Caller's `identity.subject` resolved by the host's `/mcp/` `httpAction`, or null for anonymous |
-| `durationMs` | `number` | Wall-clock time from dispatch start to finish |
+| `identitySubject` | `string \| null` | Caller's `identity.subject` resolved by the host's `/mcp/` `httpAction`, or null for anonymous. On task rows, the task's owner |
+| `durationMs` | `number` | Tool and resource rows: wall-clock time from dispatch start to finish. Task rows: the task's **age** at that transition (`0` on `create`), not an operation latency |
 | `errorCode` | `number` (optional) | JSON-RPC code on `denied` / `error` outcomes |
 | `errorMessage` | `string` (optional) | Human-readable reason; omitted for error outcomes when the tool sets `metadata.auditErrorMessage: false` |
 
-Two indexes are pre-built: `by_toolName` and `by_outcome`. The query
-helper iterates them; you don't need to add your own.
+Five indexes are pre-built: `by_toolName`, `by_resourceUri`, `by_taskId`,
+`by_entryType`, and `by_outcome`. The query helper iterates them; you
+don't need to add your own.
+
+## Task rows
+
+A task-augmented `tools/call` writes one `entryType: "task"` row per
+state-changing transition — `create`, `input`, `cancel`, `complete`,
+`fail` — carrying the task id, tool name, owner subject and the task's
+age, and **never** task payloads (`args`, `result`,
+`inputRequests` / `inputResponses` are all absent). Idempotent no-ops
+(a repeated cancel, a duplicate input submission) deliberately write
+nothing. Polling with `tasks/get` is not audited. Pruning a task that
+never reached a terminal state writes the `fail` row it never got, so
+the trail always shows how a task ended instead of stopping at `create`.
+
+These rows are bookkeeping *around* the execution, not a record of it.
+A task run by the built-in executor dispatches through the same
+`dispatch.runTool` path as a synchronous call, so it **also** writes the
+ordinary `entryType: "tool"` row — same identity attribution, same
+argument recording, same error-text policy. A host-executed task
+(`tasks.execute`) runs the work in the host's own durable execution, so
+only the lifecycle rows exist for it unless the host audits its steps
+itself. See [tasks.md](./tasks.md).
 
 ## What does NOT get written
 
@@ -69,6 +106,9 @@ Filters:
 ```ts
 gateway.listAuditEntries(ctx, { toolName: "invoices_markPaid", limit: 100 });
 gateway.listAuditEntries(ctx, { outcome: "denied", limit: 100 });
+gateway.listAuditEntries(ctx, { entryType: "task", limit: 100 });
+gateway.listAuditEntries(ctx, { taskId, limit: 20 });
+gateway.listAuditEntries(ctx, { resourceUri: "invoices://summary" });
 gateway.listAuditEntries(ctx, {
   toolName: "invoices_markPaid",
   outcome: "error",
@@ -126,6 +166,15 @@ defineMcpMutation({
 For shape-preserving transformation (e.g. truncate a long string,
 hash a PII field), use `auditArgs: false` and write a richer summary
 into your own table.
+
+**`auditArgs` is incompatible with `taskSupport`.** A task stores the
+caller's arguments verbatim in the component's task row for the whole
+retention window, because deferred execution needs them. Redacting the
+audit row while persisting the same values in the row next to it would be
+a false promise, so registering a tool with both `taskSupport: true` and
+`metadata.auditArgs` (`false` or `{ redact }`) fails with an explanatory
+error. Pick one: a tool whose arguments must not be retained cannot be a
+task.
 
 ## Redacting error messages
 

@@ -685,3 +685,49 @@ describe("x-mcp-header validation at registration time", () => {
     ).rejects.toThrow(/MCP tool "broken" has an invalid inputSchema/);
   });
 });
+
+describe("taskSupport and argument redaction are mutually exclusive", () => {
+  function taskTool(auditArgs: unknown) {
+    return {
+      name: "reports_generate",
+      description: "Generates a report",
+      kind: "action" as const,
+      fn: {} as never,
+      functionReference: {} as never,
+      inputSchema: { type: "object" },
+      taskSupport: true,
+      metadata: { auditArgs },
+    };
+  }
+
+  // A task row stores the caller's arguments verbatim for the whole
+  // retention window (execution needs them), so a tool that asked for
+  // argument redaction cannot also be a task: the audit row would honour
+  // the request while the task row beside it did not.
+  test.each([
+    ["auditArgs: false", false],
+    ["auditArgs: { redact }", { redact: ["token"] }],
+  ])("registerTool rejects taskSupport with %s", async (_label, auditArgs) => {
+    const gateway = new McpGateway({} as never);
+    await expect(
+      gateway.registerTool({} as never, taskTool(auditArgs) as never),
+    ).rejects.toThrow(
+      /cannot combine taskSupport with metadata.auditArgs/,
+    );
+  });
+
+  test("register rejects the combination too", async () => {
+    const gateway = new McpGateway({} as never);
+    await expect(
+      gateway.register({} as never, [taskTool(false) as never]),
+    ).rejects.toThrow(/cannot combine taskSupport with metadata.auditArgs/);
+  });
+
+  test("taskSupport with default (or explicit true) auditing passes the guard", async () => {
+    const gateway = new McpGateway({} as never);
+    // Reaches past the guard and fails later, on the mocked Convex call.
+    await expect(
+      gateway.registerTool({} as never, taskTool(true) as never),
+    ).rejects.not.toThrow(/cannot combine taskSupport/);
+  });
+});

@@ -55,7 +55,7 @@ client class.
 
 ![Component data model](./diagrams/data-model.svg)
 
-Nine tables, all owned by the component:
+Ten tables, all owned by the component:
 
 - `tools` is a per-tool row keyed by `name`. `functionHandle` is the
   opaque reference returned by `createFunctionHandle(fn)` and dispatched
@@ -70,8 +70,14 @@ Nine tables, all owned by the component:
   server issued during `initialize`. The row also stores the
   negotiated protocol version and a `lastSeenAt` timestamp for
   idle-pruning via `gateway.pruneSessions` if the host wants it.
-- `audit` grows linearly with `tools/call` traffic. Two indexes
-  (`by_toolName`, `by_outcome`) keep the most common queries cheap.
+- `audit` grows with `tools/call` traffic plus, for a task, up to three
+  lifecycle rows on top of the tool row. Five indexes (`by_toolName`,
+  `by_resourceUri`, `by_taskId`, `by_entryType`, `by_outcome`) keep the
+  most common queries cheap.
+- `mrtrRedemptions` records each MRTR continuation id (`jti`) once, with
+  the digest of the responses it was redeemed with, so a sealed
+  `requestState` cannot be replayed with different answers. Rows expire
+  with the continuation and are dropped by `gateway.pruneMrtrRedemptions`.
 - `resources` and `resourceTemplates` store the component-level catalog for
   imperative registrations. Declarative providers remain host-side because
   their read functions are executable handles.
@@ -81,6 +87,15 @@ Nine tables, all owned by the component:
   below: one row per redeemed continuation id, and one row per resolved
   chain. Both are TTL-bounded and drained by the same
   `gateway.pruneMrtrRedemptions` cron.
+- `tasks` holds one row per MCP task (`io.modelcontextprotocol/tasks`):
+  owner subject, optional mount scope, originating tool, status,
+  result/error, MRTR-shaped input requests/responses, timestamps,
+  expiration, and the per-task idempotency key. Owner-facing reads and
+  updates are bound to the subject and (when set) the mount that created
+  the task; expired, foreign, and out-of-scope ids answer exactly like
+  unknown ones. Drained by `gateway.pruneTasks`, which deletes expired
+  rows whatever their status — the TTL is the execution deadline, not just
+  a retention window. See [tasks.md](./tasks.md).
 
 ## MCP Streamable HTTP transport
 
@@ -159,10 +174,13 @@ still answerable after a sibling already resolved the call.
 **A chain therefore resolves exactly once**, tracked separately in the
 component's `mrtrChains` table, keyed by the chain's idempotency key
 (stable across every round, unlike `jti`). The gateway claims the chain
-immediately *before* it dispatches or finishes the call via
-`completeCall()`, so the claim is the decision rather than a record of
-one, and the claim is what every later continuation of that chain runs
-into:
+immediately *before* it dispatches, finishes the call via
+`completeCall()`, or — for a task-augmented call — creates the task row,
+so the claim is the decision rather than a record of one, and the claim is
+what every later continuation of that chain runs into. Task creation
+counts as a `"dispatched"` resolution because it returns a handle
+*instead of* dispatching and the executor then runs the tool unguarded;
+see [tasks.md](./tasks.md).
 
 The chain row records both **how** it was resolved and **which
 continuation** resolved it, and the rule follows from that: only the
@@ -323,6 +341,44 @@ Hosts that prefer to register imperatively omit `tools` and call
 `gateway.register` from a mutation instead; the same validation runs
 there, failing the mutation with the tool named.
 
+### MCP Tasks (poll-first)
+
+Tasks (`io.modelcontextprotocol/tasks`) exist only on the modern path
+and are doubly opt-in: the tool declares `taskSupport: true` and the
+host configures the `tasks` handler option; without both, nothing is
+advertised and every task method answers as an unknown method. A
+task-augmented `tools/call` runs the full authorize pipeline, then
+creates a durable task row and returns a handle instead of dispatching;
+the client polls `tasks/get` and mutates via `tasks/update`. A legacy
+request carrying a task request is rejected loudly, never silently run
+inline, and anonymous callers get the real `401` + `WWW-Authenticate`
+challenge because a task they could not poll must never be created.
+
+Every owner-facing task read or update is bound to the subject that
+created the task; unknown, foreign, and expired ids are answered
+identically, so a task's existence never leaks across callers. The
+row's `args`, caller snapshot, and idempotency key exist for execution
+and are never returned on the wire, nor written to any
+`entryType: "task"` row: those carry lifecycle metadata only. A
+component-executed run dispatches through `dispatch.runTool`, so it also
+writes the ordinary `entryType: "tool"` row, which does record the
+arguments (verbatim — a `taskSupport` tool may not set
+`metadata.auditArgs`). Every state-changing lifecycle transition writes a
+task row; idempotent no-ops deliberately write none.
+
+Execution is either component-owned (a Convex scheduled action invokes
+the tool once through `dispatch.runTool`, so identity injection, error
+sanitization, and auditing are the same as a synchronous call; scheduled
+functions are durable, so a deploy between creation and execution loses
+nothing) or host-owned via
+`tasks.execute` (typically a `@convex-dev/workflow` run, finalized with
+`gateway.completeTask` / `failTask` / `requireTaskInput`). Two
+invariants keep the state machine honest: a cancel always wins a race
+against completion, and the `onCancel` / `onInputResponses` host hooks
+are at-least-once — an idempotent wire retry re-fires them, so a resume
+or cancel notification that failed once stays recoverable from the
+client side. See [tasks.md](./tasks.md) for the full contract.
+
 ## Request flow: `tools/call`
 
 ![tools/call dispatch flow](./diagrams/tools-call-flow.svg)
@@ -464,7 +520,7 @@ itself).
   contract, modes, and metadata-driven scope/role recipes
 - [oauth.md](./oauth.md) for the OAuth 2.1 protected-resource discovery
   flow
-- [audit-log.md](./audit-log.md) for audit reading, redaction, and
-  pruning
+- [audit-log.md](./audit-log.md) for the tool / resource / task row
+  shapes, audit reading, redaction, and pruning
 - [testing.md](./testing.md) for `convex-test` patterns specific to this
   component

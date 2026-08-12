@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 728"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 768"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
   <defs>
     <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
@@ -20,12 +20,12 @@
   <rect width="100%" height="100%" fill="url(#dots)" opacity="0.55"/>
 
   <!-- Boundary: gateway component -->
-  <rect x="40" y="60" width="1000" height="556" rx="8"
+  <rect x="40" y="60" width="1000" height="596" rx="8"
         fill="transparent" stroke="rgba(11,13,11,0.22)"
         stroke-width="1" stroke-dasharray="6,4"/>
   <rect x="52" y="48" width="292" height="20" rx="2" fill="#f5f4ed"/>
   <text x="60" y="62" fill="#52534e" font-size="9" font-family="ui-monospace, monospace"
-        letter-spacing="1.5">MCP-GATEWAY · NINE COMPONENT TABLES</text>
+        letter-spacing="1.5">MCP-GATEWAY · TEN COMPONENT TABLES</text>
 
   <!-- ============================================================ -->
   <!-- Group: REGISTRY (left column)                                -->
@@ -184,21 +184,46 @@
         stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
   <text x="472" y="438" fill="#52534e" font-size="8"
         font-family="ui-monospace, monospace" text-anchor="middle"
-        letter-spacing="0.7">IDX ×2</text>
+        letter-spacing="0.7">IDX ×5</text>
   <text x="96" y="462" fill="#65655c" font-size="10"
-        font-family="ui-monospace, monospace">toolName · toolKind · args · outcome · durationMs</text>
+        font-family="ui-monospace, monospace">entryType "tool"|"resource"|"task" · toolName · args · outcome</text>
   <text x="96" y="478" fill="#65655c" font-size="10"
-        font-family="ui-monospace, monospace">identitySubject · errorCode? · errorMessage?</text>
+        font-family="ui-monospace, monospace">identitySubject · durationMs · errorCode? · errorMessage?</text>
   <text x="96" y="494" fill="#65655c" font-size="9"
-        font-family="ui-monospace, monospace">indexed by_toolName and by_outcome</text>
+        font-family="ui-monospace, monospace">indexed by_toolName, by_resourceUri, by_taskId, by_entryType, by_outcome</text>
   <text x="96" y="506" fill="#65655c" font-size="9"
-        font-family="ui-monospace, monospace" font-style="italic">args is null when the tool sets auditArgs: false</text>
+        font-family="ui-monospace, monospace" font-style="italic">task rows carry no payloads; a task run also writes its own tool row</text>
+
+  <!-- ============================================================ -->
+  <!-- Group: TASKS (left column, bottom)                           -->
+  <!-- ============================================================ -->
+  <text x="80" y="532" fill="#65655c" font-size="8"
+        font-family="ui-monospace, monospace" letter-spacing="1.5">TASKS · POLL-FIRST, TTL-BOUNDED</text>
+
+  <rect x="80" y="544" width="440" height="96" rx="6" fill="#f5f4ed"/>
+  <rect x="80" y="544" width="440" height="96" rx="6"
+        fill="rgba(11,13,11,0.05)" stroke="#52534e" stroke-width="1"/>
+  <text x="96" y="568" fill="#0b0d0b" font-size="13" font-weight="600"
+        font-family="ui-monospace, monospace">tasks</text>
+  <rect x="440" y="556" width="64" height="14" rx="2" fill="transparent"
+        stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
+  <text x="472" y="566" fill="#52534e" font-size="8"
+        font-family="ui-monospace, monospace" text-anchor="middle"
+        letter-spacing="0.7">IDX ×4</text>
+  <text x="96" y="590" fill="#65655c" font-size="10"
+        font-family="ui-monospace, monospace">ownerSubject · scope? · toolName · status · args · caller?</text>
+  <text x="96" y="606" fill="#65655c" font-size="10"
+        font-family="ui-monospace, monospace">idempotencyKey · startedAt? · inputRound? · expiresAt</text>
+  <text x="96" y="622" fill="#65655c" font-size="9"
+        font-family="ui-monospace, monospace">indexed by_taskId, by_owner_status, by_idempotencyKey, by_expiresAt</text>
+  <text x="96" y="634" fill="#65655c" font-size="9"
+        font-family="ui-monospace, monospace" font-style="italic">owner+scope bound: expired, foreign and out-of-scope ids answer alike</text>
 
   <!-- ============================================================ -->
   <!-- Retention panel                                              -->
   <!-- ============================================================ -->
-  <rect x="560" y="464" width="440" height="128" rx="6" fill="#f5f4ed"/>
-  <rect x="560" y="464" width="440" height="128" rx="6"
+  <rect x="560" y="464" width="440" height="152" rx="6" fill="#f5f4ed"/>
+  <rect x="560" y="464" width="440" height="152" rx="6"
         fill="transparent" stroke="rgba(82,83,78,0.30)" stroke-width="0.8"
         stroke-dasharray="4,3"/>
   <text x="576" y="484" fill="#52534e" font-size="8"
@@ -219,35 +244,40 @@
   <text x="712" y="576" fill="#65655c" font-size="9"
         font-family="ui-monospace, monospace">audit rows past their window</text>
 
+  <text x="576" y="598" fill="#0b0d0b" font-size="10"
+        font-family="ui-monospace, monospace">pruneTasks</text>
+  <text x="576" y="612" fill="#65655c" font-size="9"
+        font-family="ui-monospace, monospace">expired tasks, any status: TTL is the execution deadline</text>
+
   <!-- ============================================================ -->
   <!-- Legend strip                                                 -->
   <!-- ============================================================ -->
-  <line x1="40" y1="640" x2="1040" y2="640"
+  <line x1="40" y1="680" x2="1040" y2="680"
         stroke="rgba(11,13,11,0.10)" stroke-width="0.8"/>
-  <text x="40" y="656" fill="#52534e" font-size="8"
+  <text x="40" y="696" fill="#52534e" font-size="8"
         font-family="ui-monospace, monospace" letter-spacing="1.5">LEGEND</text>
 
-  <rect x="40" y="672" width="14" height="10" rx="2"
+  <rect x="40" y="712" width="14" height="10" rx="2"
         fill="rgba(11,13,11,0.05)" stroke="#52534e" stroke-width="1"/>
-  <text x="60" y="680" fill="#52534e" font-size="9">Component table</text>
+  <text x="60" y="720" fill="#52534e" font-size="9">Component table</text>
 
-  <rect x="200" y="672" width="14" height="10" rx="2"
+  <rect x="200" y="712" width="14" height="10" rx="2"
         fill="rgba(247,89,31,0.06)" stroke="#f7591f" stroke-width="1"/>
-  <text x="220" y="680" fill="#52534e" font-size="9">Resolves a chain exactly once</text>
+  <text x="220" y="720" fill="#52534e" font-size="9">Resolves a chain exactly once</text>
 
-  <rect x="440" y="672" width="40" height="14" rx="2" fill="transparent"
+  <rect x="440" y="712" width="40" height="14" rx="2" fill="transparent"
         stroke="rgba(82,83,78,0.50)" stroke-width="0.8"/>
-  <text x="460" y="682" fill="#52534e" font-size="8"
+  <text x="460" y="722" fill="#52534e" font-size="8"
         font-family="ui-monospace, monospace" text-anchor="middle"
         letter-spacing="0.7">IDX</text>
-  <text x="488" y="680" fill="#52534e" font-size="9">Index</text>
+  <text x="488" y="720" fill="#52534e" font-size="9">Index</text>
 
-  <text x="576" y="680" fill="#52534e" font-size="9"
+  <text x="576" y="720" fill="#52534e" font-size="9"
         font-family="ui-monospace, monospace">name?</text>
-  <text x="628" y="680" fill="#52534e" font-size="9">Optional field</text>
+  <text x="628" y="720" fill="#52534e" font-size="9">Optional field</text>
 
-  <rect x="756" y="672" width="14" height="10" rx="2"
+  <rect x="756" y="712" width="14" height="10" rx="2"
         fill="transparent" stroke="rgba(82,83,78,0.30)" stroke-width="0.8"
         stroke-dasharray="4,3"/>
-  <text x="776" y="680" fill="#52534e" font-size="9">Host-wired retention, not a table</text>
+  <text x="776" y="720" fill="#52534e" font-size="9">Host-wired retention, not a table</text>
 </svg>

@@ -175,6 +175,11 @@ export interface McpToolDefinition {
    * dispatch. Removed from the advertised input schema and stripped from
    * every client request. Optional: a tool without durable side effects
    * (or one only used for gateway-side confirmation) does not need it.
+   *
+   * Also filled from the task row's own idempotency key when the tool is
+   * run by the BUILT-IN task executor, so a tool that dedupes on it keeps
+   * receiving it on that path too. A host executor (`tasks.execute`) gets
+   * no injection: it must thread `task.idempotencyKey` through itself.
    */
   mrtrArgs?: McpMrtrArgs;
   /**
@@ -186,8 +191,21 @@ export interface McpToolDefinition {
    * the call without dispatching, or `null`/`undefined` to continue to
    * the Convex function. Supported only by the declarative `tools`
    * option of `handleMcpRequest`.
+   *
+   * Composes with `taskSupport`: the hook runs at task-creation time, so
+   * a task is only created once it approves, and a durable task can
+   * never execute with the confirmation skipped.
    */
   beforeCall?: McpBeforeCallHandler;
+  /**
+   * Opt-in MCP Tasks support (`io.modelcontextprotocol/tasks`). Only a
+   * tool that sets this may be invoked as a task-augmented modern
+   * `tools/call`. Task execution defers the function: it must be safe to
+   * run after the HTTP request completed, and it must persist the
+   * gateway-issued idempotency key around its side effect so workflow
+   * retries and duplicate client updates cannot double-apply.
+   */
+  taskSupport?: boolean;
   metadata?: Record<string, unknown>;
 }
 
