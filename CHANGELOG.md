@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.6.1...v0.7.0) (2026-08-12)
+
+
+### Features
+
+* add allowedOrigins and fix 2026-07-28 header handling ([#21](https://github.com/tfohlmeister/convex-mcp-gateway/issues/21)) ([363b555](https://github.com/tfohlmeister/convex-mcp-gateway/commit/363b555e7758f4e011bc9fe09a7092e976a1620e))
+* add stateless MCP 2026-07-28 server support ([d1969ad](https://github.com/tfohlmeister/convex-mcp-gateway/commit/d1969ad988ac8f01f1eb447c6bbbd3582270f834))
+
 ## [0.6.1](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.6.0...v0.6.1) (2026-08-03)
 
 
