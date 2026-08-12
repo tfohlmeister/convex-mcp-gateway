@@ -1226,9 +1226,9 @@ describe("JSON-RPC envelope edge cases", () => {
     const body = (await res.json()) as {
       result: { protocolVersion: string };
     };
-    // Server falls back to the default supported version when the
+    // Server falls back to its newest supported version when the
     // client asks for something it doesn't speak.
-    expect(body.result.protocolVersion).toBe("2025-06-18");
+    expect(body.result.protocolVersion).toBe("2025-11-25");
   });
 });
 

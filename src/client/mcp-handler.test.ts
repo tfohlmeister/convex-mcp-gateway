@@ -316,7 +316,7 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(await readJson(response)).toMatchObject({
       result: {
         resultType: "complete",
-        supportedVersions: ["2026-07-28", "2025-06-18", "2025-03-26"],
+        supportedVersions: ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
         capabilities: { tools: {} },
         ttlMs: 0,
         cacheScope: "private",
@@ -607,6 +607,156 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(await legacy.text()).toContain("id: 1");
   });
 
+  test("every session-based revision gets the identical id:1 SSE frame, no priming", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const sseAccept = { accept: "text/event-stream, application/json" };
+
+    // 2025-11-25 does NOT get a priming event or retry hint: those are
+    // optional SSE resumability additions the reference server emits only
+    // with an event store + GET replay, which this gateway lacks (GET is
+    // 405). Emitting them would advertise resumability it cannot honor.
+    // So its frame is byte-identical to every older legacy revision.
+    const frames: string[] = [];
+    for (const [id, version] of [
+      [1, "2025-11-25"],
+      [2, "2025-06-18"],
+      [3, "2025-03-26"],
+    ] as const) {
+      const init = await handleMcpRequest(
+        ctx,
+        withHeaders(
+          jsonRpcRequest({
+            id,
+            method: "initialize",
+            params: { protocolVersion: version },
+          }),
+          sseAccept,
+        ),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      );
+      const frame = await init.text();
+      expect(frame.startsWith("id: 1\nevent: message\ndata: ")).toBe(true);
+      expect(frame).not.toContain("retry:");
+      // The only `id:` line is the message's own `id: 1`; no `id: 0`
+      // priming event precedes it.
+      expect(frame).not.toContain("id: 0");
+      expect(frame.match(/^id: /gm)).toHaveLength(1);
+      // Strip the per-request JSON-RPC id and the version-specific
+      // payload so the three frames can be compared for structural
+      // identity.
+      frames.push(
+        frame
+          .replace(/"id":\d+/, '"id":X')
+          .replace(/"protocolVersion":"[^"]+"/, ""),
+      );
+    }
+    expect(frames[0]).toBe(frames[1]);
+    expect(frames[1]).toBe(frames[2]);
+  });
+
+  test("a 2025-11-25 session's post-initialize SSE frame is also plain id:1", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const sseAccept = { accept: "text/event-stream, application/json" };
+    const init = await handleMcpRequest(
+      ctx,
+      withHeaders(
+        jsonRpcRequest({
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25" },
+        }),
+        sseAccept,
+      ),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    const sessionId = init.headers.get("mcp-session-id")!;
+    const followUp = await handleMcpRequest(
+      ctx,
+      withHeaders(jsonRpcRequest({ id: 2, method: "tools/list" }), {
+        ...sseAccept,
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": "2025-11-25",
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    const frame = await followUp.text();
+    expect(frame.startsWith("id: 1\nevent: message\ndata: ")).toBe(true);
+    expect(frame).not.toContain("retry:");
+    expect(frame).not.toContain("id: 0");
+  });
+
+  test("negotiates the newest supported revision for unknown or omitted versions", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    // An explicit request for a supported version echoes it regardless of
+    // array order, so the default claim needs its own assertions: an
+    // unsupported version and a missing one must BOTH land on 2025-11-25.
+    for (const params of [{ protocolVersion: "1999-01-01" }, {}]) {
+      const response = await handleMcpRequest(
+        ctx,
+        jsonRpcRequest({ id: 1, method: "initialize", params }),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      );
+      expect(await readJson(response)).toMatchObject({
+        result: { protocolVersion: "2025-11-25" },
+      });
+    }
+  });
+
+  test("negotiates 2025-11-25 when requested and accepts its header afterwards", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(await readJson(init)).toMatchObject({
+      result: { protocolVersion: "2025-11-25" },
+    });
+    const sessionId = init.headers.get("mcp-session-id")!;
+
+    // Per-request header validation must accept every supported legacy
+    // revision, incl. the one the current official SDK pins as latest.
+    const accepted = await handleMcpRequest(
+      ctx,
+      withHeaders(jsonRpcRequest({ id: 2, method: "tools/list" }), {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": "2025-11-25",
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(accepted.status).toBe(200);
+
+    // An unsupported pinned header still 400s per spec, naming all
+    // supported revisions.
+    const rejected = await handleMcpRequest(
+      ctx,
+      withHeaders(jsonRpcRequest({ id: 3, method: "tools/list" }), {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": "2025-12-31",
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain(
+      "2025-11-25, 2025-06-18, 2025-03-26",
+    );
+  });
+
   test("rejects a modern request without client capabilities metadata", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
@@ -767,7 +917,7 @@ describe("handleMcpRequest metadata and resources", () => {
         code: -32022,
         data: {
           requested: "2099-01-01",
-          supported: ["2026-07-28", "2025-06-18", "2025-03-26"],
+          supported: ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
         },
       },
     });
