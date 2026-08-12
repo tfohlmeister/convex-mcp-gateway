@@ -2,6 +2,35 @@
 
 ## [0.7.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.6.1...v0.7.0) (2026-08-12)
 
+Adds the stateless MCP `2026-07-28` server path alongside the existing
+2025-03-26 and 2025-06-18 session transport. Both eras are served from the
+same `/mcp/` endpoint and legacy behaviour is unchanged, so upgrading does
+not require touching an existing mount. Modern requests get `server/discover`,
+per-request protocol metadata, routing-header validation, and private cache
+hints, with no session created, read, or returned.
+
+**What this release is not.** It does not make the gateway fully
+`2026-07-28` compliant and does not close
+[#18](https://github.com/tfohlmeister/convex-mcp-gateway/issues/18):
+
+- **MRTR** (`resultType: "input_required"`) is not implemented. It needs a
+  host-side `beforeCall` hook so an underlying Convex function cannot run
+  before its required input is accepted; designed in
+  [#17](https://github.com/tfohlmeister/convex-mcp-gateway/issues/17).
+- **`subscriptions/listen`** and modern push notifications are not
+  implemented. The gateway takes the other option the spec allows and does
+  not advertise notification capabilities it cannot deliver.
+- **Request-scoped progress and log delivery**, and bounded `$ref` and
+  composition handling for general input and output schemas, are not
+  implemented.
+- **Conformance is unverified.** The protocol contract has focused
+  handler-level tests, but the official MCP conformance suite has not been
+  run and there are no contract tests against a real modern client.
+
+**New option.** `allowedOrigins` enables `Origin` validation for both eras
+and is off by default. It is deliberately separate from `cors`: CORS decides
+what a browser may read, `allowedOrigins` decides what the gateway serves.
+See SECURITY.md for the reasoning behind the default.
 
 ### Features
 
