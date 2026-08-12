@@ -293,6 +293,7 @@ function withHeaders(
 
 async function readJson(response: Response) {
   return (await response.json()) as {
+    id?: number | string | null;
     result?: Record<string, unknown>;
     error?: { code: number; message: string };
   };
@@ -420,7 +421,7 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
-  test("rejects an unconfigured modern browser origin before authorization", async () => {
+  test("rejects a disallowed origin before authorization", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
     let authorized = false;
@@ -430,6 +431,7 @@ describe("handleMcpRequest metadata and resources", () => {
       withHeaders(request, { origin: "https://untrusted.example.com" }),
       component,
       {
+        allowedOrigins: ["https://app.example.com"],
         authorize: async () => {
           authorized = true;
           return { allowed: true };
@@ -439,9 +441,170 @@ describe("handleMcpRequest metadata and resources", () => {
 
     expect(response.status).toBe(403);
     expect(authorized).toBe(false);
+    // The spec allows a JSON-RPC error body with no id on this 403.
     expect(await readJson(response)).toMatchObject({
+      id: null,
       error: { code: -32003 },
     });
+  });
+
+  test("allows an origin on the allowlist", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const response = await handleMcpRequest(
+      ctx,
+      withHeaders(request, { origin: "https://app.example.com" }),
+      component,
+      {
+        allowedOrigins: ["https://app.example.com"],
+        authorize: async () => ({ allowed: true }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  // Regression: the origin gate used to be derived from `cors`, where
+  // `cors: true` resolves every origin to "*" and the 403 never fired,
+  // while an unset `cors` rejected every request carrying an Origin.
+  test("permissive cors does not weaken the origin allowlist", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const response = await handleMcpRequest(
+      ctx,
+      withHeaders(request, { origin: "https://untrusted.example.com" }),
+      component,
+      {
+        cors: true,
+        allowedOrigins: ["https://app.example.com"],
+        authorize: async () => ({ allowed: true }),
+      },
+    );
+
+    expect(response.status).toBe(403);
+  });
+
+  test("an unset allowlist does not reject requests carrying an Origin", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const response = await handleMcpRequest(
+      ctx,
+      withHeaders(request, { origin: "https://anything.example.com" }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  test("a throwing origin matcher fails closed", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    let authorized = false;
+    const response = await handleMcpRequest(
+      ctx,
+      withHeaders(modernJsonRpcRequest({ id: 1, method: "tools/list" }), {
+        // Sandboxed iframes and some redirects send this literal value,
+        // which throws in a `new URL(origin)`-style matcher.
+        origin: "null",
+      }),
+      component,
+      {
+        allowedOrigins: (origin) => new URL(origin).hostname === "app.example",
+        authorize: async () => {
+          authorized = true;
+          return { allowed: true };
+        },
+      },
+    );
+
+    expect(response.status).toBe(403);
+    expect(authorized).toBe(false);
+  });
+
+  test("a disallowed origin is rejected at preflight, without CORS headers", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const preflight = new Request("https://app.example.com/mcp/", {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://untrusted.example.com",
+        "access-control-request-method": "POST",
+      },
+    });
+
+    const response = await handleMcpRequest(ctx, preflight, component, {
+      cors: true,
+      allowedOrigins: ["https://app.example.com"],
+      authorize: async () => ({ allowed: true }),
+    });
+
+    // Answering the preflight with allow-origin and only then 403ing the
+    // POST would tell the browser the call is permitted.
+    expect(response.status).toBe(403);
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test("the origin allowlist also guards legacy requests", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const response = await handleMcpRequest(
+      ctx,
+      withHeaders(
+        jsonRpcRequest({
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-06-18" },
+        }),
+        { origin: "https://untrusted.example.com" },
+      ),
+      component,
+      {
+        allowedOrigins: (origin) => origin.endsWith(".app.example.com"),
+        authorize: async () => ({ allowed: true }),
+      },
+    );
+
+    expect(response.status).toBe(403);
+  });
+
+  test("omits the SSE event id on modern streams and disables proxy buffering", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const sseAccept = { accept: "text/event-stream, application/json" };
+
+    const modern = await handleMcpRequest(
+      ctx,
+      withHeaders(
+        modernJsonRpcRequest({ id: 1, method: "tools/list" }),
+        sseAccept,
+      ),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(modern.headers.get("content-type")).toBe("text/event-stream");
+    expect(modern.headers.get("x-accel-buffering")).toBe("no");
+    // 2026-07-28 removed Last-Event-ID resumability, so an id is noise.
+    expect(await modern.text()).not.toContain("id:");
+
+    const legacy = await handleMcpRequest(
+      ctx,
+      withHeaders(
+        jsonRpcRequest({
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-06-18" },
+        }),
+        sseAccept,
+      ),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(legacy.headers.get("x-accel-buffering")).toBe("no");
+    expect(await legacy.text()).toContain("id: 1");
   });
 
   test("rejects a modern request without client capabilities metadata", async () => {
@@ -776,6 +939,64 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
+  test("compares integer x-mcp-header values numerically", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      {
+        name: "search",
+        description: "Search",
+        kind: "query",
+        functionHandle: "function://search",
+        inputSchema: {
+          type: "object",
+          properties: { limit: { type: "integer", "x-mcp-header": "Limit" } },
+        },
+      },
+    ]);
+    const requestBody = {
+      id: 1,
+      method: "tools/call",
+      params: { name: "search", arguments: { limit: 25 } },
+    };
+
+    // Spec: "servers SHOULD compare the header value and the body value
+    // numerically rather than as strings (e.g., 42.0 and 42 are equal)".
+    const accepted = await handleMcpRequest(
+      state.ctx,
+      withHeaders(modernJsonRpcRequest(requestBody), {
+        "mcp-param-limit": "25.0",
+      }),
+      component,
+      { authorize: async () => ({ allowed: false, reason: "Forbidden" }) },
+    );
+    expect(accepted.status).toBe(200);
+    expect(await readJson(accepted)).toMatchObject({ error: { code: -32003 } });
+
+    const rejected = await handleMcpRequest(
+      state.ctx,
+      withHeaders(modernJsonRpcRequest(requestBody), {
+        "mcp-param-limit": "26",
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(rejected.status).toBe(400);
+    expect(await readJson(rejected)).toMatchObject({ error: { code: -32020 } });
+
+    // Numeric comparison must not inherit Number()'s coercions:
+    // Number("0x19") is 25, but that is not a decimal integer literal.
+    const coerced = await handleMcpRequest(
+      state.ctx,
+      withHeaders(modernJsonRpcRequest(requestBody), {
+        "mcp-param-limit": "0x19",
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(coerced.status).toBe(400);
+    expect(await readJson(coerced)).toMatchObject({ error: { code: -32020 } });
+  });
+
   test("rejects x-mcp-header declarations hidden in schema composition", async () => {
     const component = createComponent();
     const state = createCtx(component, [
@@ -814,9 +1035,11 @@ describe("handleMcpRequest metadata and resources", () => {
       },
     );
 
-    expect(response.status).toBe(400);
+    // A malformed tool schema is a server configuration error, not a
+    // client header mismatch, so it must not be reported as -32020.
+    expect(response.status).toBe(500);
     expect(authorized).toBe(false);
-    expect(await readJson(response)).toMatchObject({ error: { code: -32020 } });
+    expect(await readJson(response)).toMatchObject({ error: { code: -32603 } });
   });
 
   test("decodes base64 modern x-mcp-header values", async () => {

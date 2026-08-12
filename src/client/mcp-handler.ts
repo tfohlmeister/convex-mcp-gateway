@@ -215,6 +215,36 @@ export type McpResourceAuditOption =
     };
 
 /**
+ * Origin allowlist for `handleMcpRequest`. MCP Streamable HTTP requires
+ * servers to validate the `Origin` header to prevent DNS-rebinding
+ * attacks: a request whose `Origin` is present but not allowed is
+ * rejected with HTTP 403 before identity resolution, authorization,
+ * auditing, or dispatch. Requests without an `Origin` header (every
+ * CLI and server-to-server client) are unaffected.
+ *
+ * - `string` / `string[]`, exact-match allowlist of origins.
+ * - `(origin: string) => boolean`, custom matcher for subdomain
+ *   wildcards or per-tenant rules.
+ *
+ * This is deliberately independent of `cors`. CORS is a browser
+ * mechanism that decides what a browser is allowed to *read*;
+ * `allowedOrigins` is an authorization gate that decides what the
+ * gateway is willing to *serve*. Coupling the two makes the permissive
+ * `cors: true` silently disable the origin gate, so they are separate
+ * options.
+ *
+ * **Omitting this option disables origin validation entirely.** That is
+ * the default because a Convex deployment is reachable at a fixed
+ * public URL rather than on localhost, which is the DNS-rebinding
+ * scenario the requirement targets. Set it for any deployment that
+ * serves browser clients.
+ */
+export type McpAllowedOriginsOption =
+  | string
+  | string[]
+  | ((origin: string) => boolean);
+
+/**
  * Options for `gateway.handleMcpRequest`. The host supplies an
  * `authorize` callback that decides allowed vs denied per
  * `tools/call` and per tool in a filtered `tools/list`. The callback
@@ -225,6 +255,10 @@ export interface HandleMcpRequestOptions {
   authorize: McpAuthorizerHandler;
   /** See `McpCorsOption`. Omit for non-browser-only deployments. */
   cors?: McpCorsOption;
+  /**
+   * See `McpAllowedOriginsOption`. Omit to disable origin validation.
+   */
+  allowedOrigins?: McpAllowedOriginsOption;
   /**
    * See `McpIdentityResolver`. Omit to use Convex's built-in JWT
    * validation via `ctx.auth.getUserIdentity()`.
@@ -478,6 +512,58 @@ function resolveCorsOrigin(
   return cors(requestOrigin) ? requestOrigin : null;
 }
 
+/**
+ * MCP Streamable HTTP: "Servers MUST validate the `Origin` header on all
+ * incoming connections to prevent DNS rebinding attacks. If the `Origin`
+ * header is present and invalid, servers MUST respond with HTTP 403."
+ *
+ * Applies to both protocol eras and runs before identity resolution,
+ * authorization, auditing, and dispatch. Returns `null` when the request
+ * may proceed.
+ */
+function originRejection(
+  request: Request,
+  options: HandleMcpRequestOptions,
+): Response | null {
+  const allowed = options.allowedOrigins;
+  if (allowed === undefined) return null;
+  const origin = request.headers.get("origin");
+  if (origin === null) return null;
+  let ok: boolean;
+  if (typeof allowed === "string") {
+    ok = allowed === origin;
+  } else if (Array.isArray(allowed)) {
+    ok = allowed.includes(origin);
+  } else {
+    try {
+      ok = allowed(origin);
+    } catch (err) {
+      // A host matcher written as `new URL(origin).hostname.endsWith(...)`
+      // throws on the literal `Origin: null` that sandboxed iframes and
+      // some redirects send. Fail closed rather than letting the throw
+      // escape as an opaque 500 with no gateway-prefixed log line.
+      console.error(
+        `[mcp-gateway] allowedOrigins matcher threw for origin ${origin}; ` +
+          `treating it as not allowed.`,
+        err,
+      );
+      ok = false;
+    }
+  }
+  if (ok) return null;
+  // The spec allows a JSON-RPC error body with no id here. POST callers
+  // speak JSON-RPC, so give them one; DELETE has no JSON-RPC envelope.
+  const body =
+    request.method === "POST"
+      ? jsonErrorEnvelope(null, FORBIDDEN, "Forbidden: origin is not allowed")
+      : "Forbidden: origin is not allowed";
+  return new Response(body, {
+    status: 403,
+    headers:
+      request.method === "POST" ? { "content-type": "application/json" } : {},
+  });
+}
+
 function corsHeaders(
   cors: McpCorsOption | undefined,
   request: Request,
@@ -612,8 +698,9 @@ function splitErrorText(
   return { full, wire: deliberate ? full : generic };
 }
 
-function sseEvent(id: number, payload: string): string {
-  return `id: ${id}\nevent: message\ndata: ${payload}\n\n`;
+function sseEvent(id: number | null, payload: string): string {
+  const idLine = id === null ? "" : `id: ${id}\n`;
+  return `${idLine}event: message\ndata: ${payload}\n\n`;
 }
 
 function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
@@ -784,6 +871,19 @@ function collectMcpHeaderParameters(schema: unknown): McpHeaderParameterResult {
   return problem ? { problem } : { parameters };
 }
 
+/**
+ * Validate the `x-mcp-header` annotations in a tool's `inputSchema`.
+ * Returns a human-readable problem string, or `null` when the schema is
+ * valid. Called when a catalog is registered or synced, so a
+ * schema-authoring mistake surfaces with the tool name attached instead
+ * of failing every modern `tools/call` for that tool at runtime.
+ */
+export function describeToolHeaderSchemaProblem(
+  inputSchema: unknown,
+): string | null {
+  return collectMcpHeaderParameters(inputSchema).problem ?? null;
+}
+
 function headerValueForArgument(
   argumentsValue: unknown,
   parameter: McpHeaderParameter,
@@ -804,26 +904,56 @@ function headerValueForArgument(
   return null;
 }
 
+/** Strict decimal literal, so `Number(" 42 ")` and `Number("")` don't slip through. */
+const NUMERIC_HEADER_VALUE = /^[+-]?\d+(\.\d+)?$/;
+
+type ModernHeaderProblem =
+  /** The tool's own schema is invalid. A server-side configuration error. */
+  | { kind: "schema"; problem: string }
+  /** The client's headers disagree with the body. `-32020` territory. */
+  | { kind: "mismatch"; problem: string };
+
 function validateModernToolParameterHeaders(
   request: Request,
   inputSchema: unknown,
   argumentsValue: unknown,
-): string | null {
+): ModernHeaderProblem | null {
   const result = collectMcpHeaderParameters(inputSchema);
-  if (result.parameters === undefined) return result.problem;
+  if (result.parameters === undefined) {
+    return { kind: "schema", problem: result.problem };
+  }
 
   for (const parameter of result.parameters) {
     const header = request.headers.get(`mcp-param-${parameter.headerName}`);
     const expected = headerValueForArgument(argumentsValue, parameter);
     if (expected === null) {
       if (header !== null) {
-        return `Mcp-Param-${parameter.headerName} must be omitted`;
+        return {
+          kind: "mismatch",
+          problem: `Mcp-Param-${parameter.headerName} must be omitted`,
+        };
       }
       continue;
     }
-    if (header === null || decodeMcpHeaderValue(header) !== expected) {
-      return `Mcp-Param-${parameter.headerName} must match the request arguments`;
+    const mismatch: ModernHeaderProblem = {
+      kind: "mismatch",
+      problem: `Mcp-Param-${parameter.headerName} must match the request arguments`,
+    };
+    if (header === null) return mismatch;
+    const decoded = decodeMcpHeaderValue(header);
+    if (decoded === null) return mismatch;
+    // Streamable HTTP: integer parameters SHOULD be compared numerically
+    // rather than as strings, so `42.0` and `42` are considered equal.
+    if (parameter.type === "integer") {
+      if (
+        !NUMERIC_HEADER_VALUE.test(decoded) ||
+        Number(decoded) !== Number(expected)
+      ) {
+        return mismatch;
+      }
+      continue;
     }
+    if (decoded !== expected) return mismatch;
   }
   return null;
 }
@@ -1196,6 +1326,12 @@ export async function handleMcpRequest(
   component: ComponentApi,
   options: InternalHandleMcpRequestOptions,
 ): Promise<Response> {
+  // Before the preflight branch: telling a browser via CORS that a
+  // cross-origin POST is permitted, only to 403 the POST itself, defeats
+  // the point of preflight. A disallowed origin gets a bare 403 with no
+  // CORS headers at all.
+  const rejected = originRejection(request, options);
+  if (rejected) return rejected;
   if (request.method === "OPTIONS") {
     return preflightResponse(options.cors, request);
   }
@@ -1411,17 +1547,6 @@ async function handlePost(
         message.id,
         HEADER_MISMATCH,
         "Mcp-Name must exactly match the JSON-RPC request name",
-      );
-    }
-    const origin = request.headers.get("origin");
-    if (origin !== null && resolveCorsOrigin(options.cors, origin) === null) {
-      return new Response(
-        jsonErrorEnvelope(
-          message.id,
-          FORBIDDEN,
-          "Forbidden: origin is not allowed",
-        ),
-        { status: 403, headers: { "content-type": "application/json" } },
       );
     }
   }
@@ -2345,10 +2470,29 @@ async function handlePost(
           message.params?.arguments,
         );
         if (headerProblem) {
+          if (headerProblem.kind === "schema") {
+            // The tool's own inputSchema is malformed. That is a server
+            // configuration error, not a client header mismatch, so it
+            // must not be reported as -32020. Registration validates
+            // this, so reaching here means a row predates that check or
+            // was written past the client API.
+            console.error(
+              "[mcp-gateway] tool inputSchema has an invalid x-mcp-header annotation",
+              tool.name,
+              headerProblem.problem,
+            );
+            return modernErrorResponse(
+              message.id,
+              INTERNAL_ERROR,
+              "Tool input schema is invalid",
+              {},
+              500,
+            );
+          }
           return modernErrorResponse(
             message.id,
             HEADER_MISMATCH,
-            headerProblem,
+            headerProblem.problem,
           );
         }
       }
@@ -2532,7 +2676,10 @@ async function handlePost(
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode(sseEvent(1, body)));
+        // 2026-07-28 dropped `Last-Event-ID` resumability, so an event id
+        // carries no meaning there. Legacy clients may still resume, so
+        // they keep theirs.
+        controller.enqueue(encoder.encode(sseEvent(isModern ? null : 1, body)));
         controller.close();
       },
     });
@@ -2542,6 +2689,9 @@ async function handlePost(
         ...headers,
         "content-type": "text/event-stream",
         "cache-control": "no-cache, no-transform",
+        // Spec SHOULD: tell reverse proxies (nginx) not to buffer the
+        // stream, otherwise events are held back until the response ends.
+        "x-accel-buffering": "no",
       },
     });
   }

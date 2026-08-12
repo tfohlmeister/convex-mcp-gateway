@@ -26,6 +26,7 @@ import {
 import {
   describeResourceProblem,
   describeResourceTemplateProblem,
+  describeToolHeaderSchemaProblem,
   pickTemplateFields,
   handleMcpRequest as handleMcpRequestImpl,
   type HandleMcpRequestOptions,
@@ -53,6 +54,7 @@ export type {
 } from "../shared.js";
 export type {
   HandleMcpRequestOptions,
+  McpAllowedOriginsOption,
   McpCorsOption,
   McpHandlerCtx,
   McpIdentityResolver,
@@ -741,7 +743,36 @@ function protocolMetadataField(tool: McpToolRegistration) {
  * creating a `functionHandle` per tool. Shared by `register` and the
  * declarative `tools` sync.
  */
+/**
+ * Reject a hand-written `inputSchema` whose `x-mcp-header` annotations
+ * violate the Streamable HTTP constraints. Catching it here names the
+ * offending tool; the alternative is every modern `tools/call` for that
+ * tool failing at runtime with nothing pointing at the cause.
+ *
+ * Only the imperative path can produce this. `defineMcp*` derives the
+ * schema from Convex validators, which never emit the annotation.
+ *
+ * On `registerTool` / `register` this fails the registration mutation. On
+ * the declarative `tools` path it fails catalog sync, which runs on every
+ * modern request and on legacy `initialize`, so one malformed schema takes
+ * the whole endpoint down until the list is fixed. That is deliberate and
+ * matches how a duplicate tool name already behaves: a declarative catalog
+ * is all-or-nothing, and silently dropping a tool is the drift this API
+ * exists to prevent.
+ */
+function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
+  for (const tool of tools) {
+    const problem = describeToolHeaderSchemaProblem(tool.inputSchema);
+    if (problem) {
+      throw new Error(
+        `MCP tool "${tool.name}" has an invalid inputSchema: ${problem}.`,
+      );
+    }
+  }
+}
+
 async function resolveToolHandles(tools: McpToolRegistration[]) {
+  assertToolHeaderSchemas(tools);
   return await Promise.all(
     tools.map(async (tool) => ({
       name: tool.name,
@@ -796,6 +827,11 @@ async function syncDeclaredTools(
   component: ComponentApi,
   tools: McpToolRegistration[],
 ): Promise<void> {
+  // Ahead of the fingerprint short-circuit: an in-memory schema walk is
+  // cheaper than the fingerprint itself, and validating only on change
+  // would let a catalog that was synced under an older version keep its
+  // matching fingerprint and never get checked at all.
+  assertToolHeaderSchemas(tools);
   const fingerprint = toolsFingerprint(tools);
   const current = await ctx.runQuery(
     component.registry.getToolsFingerprint,
@@ -845,6 +881,24 @@ async function syncDeclaredTools(
  * };
  * ```
  */
+/**
+ * Run one catalog-sync step, logging an actionable hint before letting
+ * the failure propagate. A no-op when the host didn't declare that part
+ * of the catalog.
+ */
+async function runSyncStep(
+  step: (() => Promise<void>) | undefined,
+  hint: string,
+): Promise<void> {
+  if (!step) return;
+  try {
+    await step();
+  } catch (err) {
+    console.error(`[mcp-gateway] ${hint}`, err);
+    throw err;
+  }
+}
+
 export class McpGateway {
   constructor(public component: ComponentApi) {}
 
@@ -859,6 +913,7 @@ export class McpGateway {
     ctx: RunMutationCtx,
     tool: McpToolRegistration,
   ): Promise<void> {
+    assertToolHeaderSchemas([tool]);
     const handle = await createFunctionHandle(tool.fn as any);
     await ctx.runMutation(this.component.registry.registerTool, {
       name: tool.name,
@@ -1314,10 +1369,27 @@ export class McpGateway {
             );
           }
         : undefined;
+    // Each step logs its own hint before rethrowing. The handler only
+    // sees "catalog sync failed", so without this the deployment log
+    // says nothing about which list is malformed or why.
     const ensureCatalogSynced = async () => {
-      await syncTools?.();
-      await syncResources?.();
-      await syncResourceTemplates?.();
+      await runSyncStep(
+        syncTools,
+        "declarative tool sync failed; the request will fail. Check the " +
+          "`tools` list passed to handleMcpRequest (e.g. duplicate tool names).",
+      );
+      await runSyncStep(
+        syncResources,
+        "declarative resource sync failed; the request will fail. Check the " +
+          "static resources passed to handleMcpRequest (e.g. duplicate " +
+          "resource URIs).",
+      );
+      await runSyncStep(
+        syncResourceTemplates,
+        "declarative resource-template sync failed; the request will fail. " +
+          "Check the resourceTemplates passed to handleMcpRequest (e.g. " +
+          "duplicate uriTemplates).",
+      );
     };
     return await handleMcpRequestImpl(ctx, request, this.component, {
       ...rest,

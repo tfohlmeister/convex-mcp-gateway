@@ -6,8 +6,10 @@ import {
   defineMcpResource,
   defineMcpResourceTemplate,
   mcpCallerValidator,
+  McpGateway,
   type McpCaller,
 } from "./index.js";
+import { describeToolHeaderSchemaProblem } from "./mcp-handler.js";
 
 // defineMcpQuery's TS signature requires a real Convex function
 // reference; runtime validation runs first regardless of TS, so we
@@ -451,5 +453,91 @@ describe("defineMcpResourceTemplate", () => {
         annotations: { priority: -1 },
       }),
     ).toThrow(/priority must be a number between 0 and 1/);
+  });
+});
+
+describe("x-mcp-header validation at registration time", () => {
+  const header = { type: "string", "x-mcp-header": "Region" };
+
+  test("accepts an annotation reachable through a properties chain", () => {
+    expect(
+      describeToolHeaderSchemaProblem({
+        type: "object",
+        properties: { filter: { type: "object", properties: { region: header } } },
+      }),
+    ).toBeNull();
+  });
+
+  test.each([
+    ["items", { type: "object", properties: { rows: { type: "array", items: { type: "object", properties: { region: header } } } } }],
+    ["anyOf", { type: "object", anyOf: [{ type: "object", properties: { region: header } }] }],
+    ["allOf", { type: "object", allOf: [{ type: "object", properties: { region: header } }] }],
+    ["$defs", { type: "object", $defs: { F: { type: "object", properties: { region: header } } } }],
+    ["if/then", { type: "object", then: { type: "object", properties: { region: header } } }],
+  ])("rejects an annotation reachable only through %s", (_label, schema) => {
+    expect(describeToolHeaderSchemaProblem(schema)).toMatch(
+      /must be reachable through schema properties/,
+    );
+  });
+
+  test("rejects a number-typed and a duplicated annotation", () => {
+    expect(
+      describeToolHeaderSchemaProblem({
+        type: "object",
+        properties: { region: { type: "number", "x-mcp-header": "Region" } },
+      }),
+    ).toMatch(/string, integer, or boolean/);
+    expect(
+      describeToolHeaderSchemaProblem({
+        type: "object",
+        properties: {
+          a: header,
+          b: { type: "string", "x-mcp-header": "region" },
+        },
+      }),
+    ).toMatch(/case-insensitively unique/);
+  });
+
+  test("registerTool rejects an invalid schema before touching Convex", async () => {
+    const gateway = new McpGateway({} as never);
+    await expect(
+      gateway.registerTool({} as never, {
+        name: "search",
+        description: "Search",
+        kind: "query",
+        fn: {} as never,
+        functionReference: {} as never,
+        inputSchema: { type: "object", items: { properties: { region: header } } },
+      }),
+    ).rejects.toThrow(
+      /MCP tool "search" has an invalid inputSchema: x-mcp-header must be reachable/,
+    );
+  });
+
+  test("register rejects an invalid schema before touching Convex", async () => {
+    const gateway = new McpGateway({} as never);
+    await expect(
+      gateway.register({} as never, [
+        {
+          name: "ok",
+          description: "Fine",
+          kind: "query",
+          fn: {} as never,
+          functionReference: {} as never,
+          inputSchema: { type: "object", properties: { region: header } },
+        },
+        {
+          name: "broken",
+          description: "Broken",
+          kind: "query",
+          fn: {} as never,
+          functionReference: {} as never,
+          inputSchema: {
+            type: "object",
+            anyOf: [{ properties: { region: header } }],
+          },
+        },
+      ]),
+    ).rejects.toThrow(/MCP tool "broken" has an invalid inputSchema/);
   });
 });

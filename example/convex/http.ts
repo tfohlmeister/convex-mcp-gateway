@@ -110,6 +110,11 @@ const mcpHandler = httpAction(async (ctx, request) =>
   gateway.handleMcpRequest(ctx, request, {
     authorize,
     cors: true,
+    // `cors` decides what a browser may read; `allowedOrigins` decides
+    // which origins the gateway serves at all. Any deployment with browser
+    // clients should pin the latter. Left off here because this example is
+    // driven from CLIs and tests, which send no Origin header:
+    // allowedOrigins: ["https://app.example.com"],
     resolveIdentity,
     // Declarative catalog: the registry is reconciled from this list on
     // each initialize, so no separate registerDefaults mutation is

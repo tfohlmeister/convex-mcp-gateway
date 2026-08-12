@@ -213,14 +213,41 @@ non-shareable with `ttlMs: 0` and `cacheScope: "private"`.
 
 When a tool input schema marks a string, safe integer, or boolean property
 with `x-mcp-header`, the matching `Mcp-Param-<name>` header must carry the
-same value. Schemas that place this extension inside composition are rejected;
-the gateway does not resolve `$ref` or composition for routing headers.
+same value; integers are compared numerically, so `42.0` matches `42`.
+Schemas that place this extension anywhere but a plain chain of `properties`
+keys are rejected at registration time, with the tool name in the error. The
+gateway does not resolve `$ref` or composition for routing headers.
 Base64-encoded routing headers must decode to at most 8 KiB of valid UTF-8
 without control characters.
 
-For browser clients, configure `cors` with the exact allowed origin or an
-allowlist. A modern request carrying an `Origin` header that is not allowed by
-this option is rejected before authorization or dispatch.
+### Origin validation
+
+MCP requires servers to validate the `Origin` header to prevent DNS-rebinding
+attacks. Pass `allowedOrigins` to turn that gate on:
+
+```ts
+gateway.handleMcpRequest(ctx, req, {
+  authorize,
+  cors: ["https://app.example.com"],           // what a browser may read
+  allowedOrigins: ["https://app.example.com"], // what the gateway will serve
+});
+```
+
+A request whose `Origin` is present but not allowed gets HTTP 403 before
+identity resolution, authorization, auditing, or dispatch. This applies to
+both protocol eras. Requests without an `Origin` header (every CLI and
+server-to-server client) are unaffected.
+
+`allowedOrigins` accepts a string, a string array, or an
+`(origin: string) => boolean` matcher. It is deliberately separate from
+`cors`: CORS decides what a browser may *read*, `allowedOrigins` decides what
+the gateway is willing to *serve*. Deriving one from the other means the
+permissive `cors: true` silently disables the gate.
+
+**Omitting `allowedOrigins` disables origin validation.** That is the default
+because a Convex deployment lives at a fixed public URL rather than on
+localhost, which is the scenario DNS rebinding targets. Set it for any
+deployment that serves browser clients.
 
 ## Resources
 

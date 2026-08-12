@@ -59,6 +59,14 @@ worth understanding when evaluating its security posture:
 - **Read access to the audit log is not enforced.**
   `gateway.listAuditEntries` is exposed only through whatever query you
   wrap it in; gate that wrapper with your own authorization checks.
+- **Origin validation is opt-in.** MCP requires servers to validate the
+  `Origin` header against DNS rebinding. The gateway does this only when
+  you pass `allowedOrigins` to `handleMcpRequest`; omitting it accepts
+  any origin. The default is off because a Convex deployment lives at a
+  fixed public URL rather than on localhost, which is the scenario the
+  requirement targets. Set it for any deployment serving browser
+  clients. `cors` does not gate this: it decides what a browser may read,
+  not what the gateway will serve.
 
 ## Known limitations vs. the MCP and OAuth specs
 

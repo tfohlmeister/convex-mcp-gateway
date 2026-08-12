@@ -122,6 +122,37 @@ describe("OAuth bridge CIMD and issuer hardening", () => {
     );
   });
 
+  test("caches the discovery document under the normalized issuer", async () => {
+    // A trailing slash used to produce a second cache entry, so the same
+    // upstream was fetched twice and the two entries could drift apart.
+    const issuer = "https://issuer-cache.example";
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = async () => {
+      fetches += 1;
+      return new Response(JSON.stringify(upstreamMetadata(issuer)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    try {
+      const request = new Request(
+        "https://gateway.example/.well-known/oauth-authorization-server",
+      );
+      for (const configured of [issuer, `${issuer}/`]) {
+        const response = await gateway().serveAuthorizationServerMetadata(
+          null,
+          request,
+          { upstreamIssuer: configured },
+        );
+        expect(response.status).toBe(200);
+      }
+      expect(fetches).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test.each([
     "ftp://issuer.example",
     "https://user:pass@issuer.example",
