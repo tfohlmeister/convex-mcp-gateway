@@ -27,9 +27,9 @@ Built as a [Convex Component](https://www.convex.dev/components).
   discovery, routing-header validation, and private cache hints. A client
   requesting an unknown revision negotiates down to 2025-11-25 (what the
   current official TypeScript SDK pins as latest); all three legacy
-  revisions share one wire contract (2025-11-25's optional SSE
+  revisions share one transport wire contract (2025-11-25's SSE
   resumability framing needs an event store the gateway doesn't have, so
-  it isn't emitted, which is conforming)
+  it isn't emitted, a deliberate SHOULD deviation)
 - **Stateless multi-round trips**: declarative modern tools use a host-side
   `beforeCall` hook to request input before any Convex function runs, then
   receive HMAC-verified continuation state plus an idempotency key on retry;
@@ -312,7 +312,7 @@ defineMcpMutation({
     continuationKey: v.optional(v.string()),
   },
   mrtrArgs: { idempotencyKey: "continuationKey" },
-  beforeCall: async (_ctx, { args, inputResponses }) => {
+  beforeCall: async (_ctx, { args, inputResponses, round }) => {
     const ask = () =>
       inputRequired(
         {
@@ -323,9 +323,10 @@ defineMcpMutation({
         },
         { invoiceId: args.id },
       );
-    // Round one: ask before anything can run.
-    if (inputResponses === undefined) return ask();
-    const confirm = inputResponses.confirm as { action?: string } | undefined;
+    // Round one: ask before anything can run. Discriminate on `round`:
+    // a state-only retry is a continuation, not a first call.
+    if (round === undefined) return ask();
+    const confirm = inputResponses?.confirm as { action?: string } | undefined;
     if (confirm === undefined) return ask(); // missing answer: ask again
     if (confirm.action !== "accept") {
       // Declined: finish WITHOUT running the mutation.
@@ -347,14 +348,19 @@ gateway.handleMcpRequest(ctx, request, {
 The gateway HMAC-signs the opaque `requestState` with a five-minute default
 TTL, binding it to the tool name, original public arguments, authenticated
 caller subject, and a per-round continuation id. Each continuation is
-additionally **redeemed once server-side**: re-sending the same responses is
-an idempotent replay, but a captured `requestState` replayed with a different
-answer (decline → accept) is rejected, so a resolved decision cannot be
-flipped within the TTL. Chains may run multiple rounds (asking again for
+additionally **redeemed once server-side**: re-sending the same responses is an
+idempotent replay, but that same continuation replayed with a different answer
+(decline to accept) is rejected. The guarantee is per continuation, not per
+chain: because each round seals a fresh continuation id, a replay that makes
+the hook ask again forks a branch that is not covered by a sibling's
+redemption. See
+[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27); until that
+is fixed, tools that must not run twice should rely on the injected idempotency
+key rather than on the redemption table. Chains may run multiple rounds (asking again for
 missing input, per the spec's error-handling guidance) up to a hard ceiling.
 
 The hook receives the client's untrusted `inputResponses` and decoded `state`;
-neither is ever injected into the Convex function — only the chain's stable
+neither is ever injected into the Convex function. Only the chain's stable
 idempotency key is, via `mrtrArgs`, and it is audited like any other argument.
 Persist it around the tool's side effect for durable replay protection. The
 state is signed, not encrypted, so never put credentials or other secrets in
@@ -364,13 +370,16 @@ redemption rows.
 Safety properties: the hook runs only for `tools` passed to
 `handleMcpRequest`, and a registry row registered as MRTR-gated (a hook, or
 `mrtrArgs`) **fails closed** when served by a handler without the matching
-hook — imperative registrations and stale catalogs can never dispatch
+hook, so imperative registrations and stale catalogs can never dispatch
 unconfirmed. MRTR tools require an authenticated caller on every transport
 (anonymous calls get the real 401 + `WWW-Authenticate` challenge and an audit
-row). The gateway returns `-32021` — listing only the missing entries, per
-mode for elicitation — rather than sending input requests for a capability
+row). The gateway returns `-32021` (listing only the missing entries, per
+mode for elicitation) rather than sending input requests for a capability
 absent from that request's `clientCapabilities`, and supports state-only
-retries without `inputResponses`. Required input is never silently bypassed:
+retries without `inputResponses` (note that such a retry pins the continuation
+with an empty answer, so send the real responses on a fresh call instead of
+resuming that same state, see
+[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27)). Required input is never silently bypassed:
 the hook also runs for legacy 2025-era requests, and when it demands input
 there (or when `mrtr` is not configured), the call fails closed instead of
 dispatching. Note that rounds that end gateway-side (an `input_required`

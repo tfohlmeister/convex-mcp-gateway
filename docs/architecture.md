@@ -84,18 +84,29 @@ The host-mounted `handleMcpRequest` supports two protocol eras on the same
 `/mcp/` endpoint. Legacy 2025-03-26, 2025-06-18, and 2025-11-25 requests
 retain the session lifecycle below; `initialize` negotiates the newest
 supported revision (2025-11-25) when a client requests one the gateway
-does not speak. All three legacy revisions share one wire contract:
-2025-11-25's additions over 2025-06-18 are optional and not emitted here.
-Its SSE resumability framing (a priming event plus `retry` hint) is
-emitted by the reference server only when it has an event store backing
-GET + `Last-Event-ID` replay; this gateway has neither an event store
-nor a GET channel (GET is a hard 405), so emitting a priming event would
-advertise resumability it cannot honor — a client whose connection died
-mid-frame would reconnect via GET, get 405, and silently abandon the
-request. Not emitting the optional additions is conforming, and it keeps
-every legacy revision's SSE frame identical (one message event, id 1).
-The revision's additive capabilities (tasks, url-mode elicitation) are
-likewise not advertised. A 2026-07-28 POST is stateless when both
+does not speak. All three legacy revisions are served with the same SSE
+framing. The 2025-11-25 delta that would otherwise change that framing is
+resumability (a priming event plus `retry` hint), which the
+reference server emits only when it has an event store backing GET +
+`Last-Event-ID` replay. This gateway has neither an event store nor a GET
+channel (GET is a hard 405), so emitting a priming event would advertise
+resumability it cannot honor: a client whose connection died mid-frame
+would reconnect via GET, get 405, and silently abandon the request
+instead of failing cleanly. The spec states the priming event as a
+SHOULD, not a MAY, so this is a deliberate deviation rather than an
+unused option, and that 405 is what justifies it. Every legacy
+revision's SSE frame stays identical (one message event, id 1).
+
+2025-11-25's other additions (tasks, url-mode elicitation, icons, JSON
+Schema 2020-12 as the default dialect, and the revision's auth-layer
+changes) are not advertised on the legacy path, which is conforming for
+optional capabilities. The revision also tightens `Origin` handling,
+which this gateway enforces only when the host sets `allowedOrigins`;
+that option is off by default. So the paragraph above is a statement
+about SSE framing, not a claim that the three revisions are
+byte-identical in every respect.
+
+A 2026-07-28 POST is stateless when both
 `MCP-Protocol-Version` and
 `params._meta["io.modelcontextprotocol/protocolVersion"]` equal
 `2026-07-28`; it must also mirror its JSON-RPC method in `Mcp-Method` and,
@@ -114,8 +125,8 @@ including when a client incorrectly includes modern metadata.
 The host-side `beforeCall` hook of a declarative tool is the MRTR state
 machine. It runs after authorization but before component dispatch, on
 the first call AND on every verified continuation, and returns one of
-three decisions: `inputRequired()` (ask the client for input — again,
-if a previous answer was incomplete, up to a hard round ceiling),
+three decisions: `inputRequired()` (ask the client for input, again if
+a previous answer was incomplete, up to a hard round ceiling),
 `completeCall()` (finish the call without dispatching, e.g. a declined
 confirmation), or `null`/`undefined` (continue to the Convex function).
 The underlying function therefore stays MCP-unaware: it never parses
@@ -130,15 +141,35 @@ so hook-side mutation cannot poison it), the authenticated caller
 subject, the chain's idempotency key, the round number, and a fresh
 continuation id. On retry it verifies all of these, then **redeems the
 continuation id once** in the component's `mrtrRedemptions` table:
-re-sending byte-identical responses is an idempotent replay, while a
-captured `requestState` replayed with different responses is rejected,
-so a resolved decision (a decline) cannot be flipped into an accept
-within the TTL. Hosts prune expired redemption rows with
-`gateway.pruneMrtrRedemptions` from a cron.
+re-sending byte-identical responses is an idempotent replay, while the
+same continuation replayed with different responses is rejected. Hosts
+prune expired redemption rows with `gateway.pruneMrtrRedemptions` from a
+cron.
+
+State that guarantee precisely, because it is narrower than it looks:
+**a continuation that was itself already answered cannot be answered
+differently.** It is not a guarantee about the chain. The `jti` is fresh
+per round, so every `inputRequired()` seals an independent continuation
+with no redemption row of its own, and any path that makes the hook ask
+again (an idempotent replay, or a state-only retry of an unanswered
+round) forks a new unpinned branch that can still be answered after a
+sibling resolved. Tracked in
+[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27);
+until it is fixed, treat the redemption table as replay protection for a
+single continuation, not as a resolved-decision lock for the chain, and
+rely on the tool's own idempotency key for anything durable.
+
+Because a redeemed replay re-runs the hook and dispatches again,
+`defineMcpMutation` and `defineMcpAction` configs that pass `beforeCall`
+must also declare `mrtrArgs`: the chain's idempotency key is how the
+tool recognizes the repeat. Queries have no durable side effect and may
+omit it. The check runs in `defineMcp*`, so it does not cover a
+hand-built `McpToolRegistration` passed straight to `handleMcpRequest`;
+those hosts own the guarantee themselves.
 
 Fail-closed rules: a registry row registered as MRTR-gated (it had a
 hook, or reserves `mrtrArgs`) is refused with `-32603` when served by a
-handler that has no matching `beforeCall` — imperative registrations
+handler that has no matching `beforeCall`, so imperative registrations
 and stale declarative catalogs can never dispatch without the promised
 confirmation. The hook runs on every transport, so required input is
 never silently bypassed: a legacy 2025-era request that reaches a hook
@@ -147,17 +178,20 @@ the `mrtr` option fails closed with `-32603`). Tools with a hook reject
 anonymous callers through the same audited denial path as
 `identityArg` tools (real 401 + `WWW-Authenticate`). The gateway checks
 the current request's `clientCapabilities` before returning input
-requests — per elicitation mode, accumulated across all requests of the
-round — and reports `-32021` carrying only the missing capabilities. A
+requests (per elicitation mode, accumulated across all requests of the
+round) and reports `-32021` carrying only the missing capabilities. A
 misconfigured signing secret surfaces as `-32603`, never as a client
-error. State-only continuations remain valid without `inputResponses`.
+error. State-only continuations remain valid without `inputResponses`,
+but such a retry redeems the continuation with an empty answer, so the
+real responses must arrive on a fresh call rather than on that same
+state (see #27).
 
 Audit posture, stated explicitly: rounds that end gateway-side (an
 `input_required` response, a declined confirmation completed by the
 hook, a `-32021` capability rejection, a hook failure) write no audit
 rows, because nothing is dispatched and only the component writes tool
 audit entries. The audit log records authorization denials and actual
-dispatches — including the injected idempotency key, which links a
+dispatches, including the injected idempotency key, which links a
 dispatched call back to its confirmation chain. Hosts that need
 per-round visibility log from inside their hook.
 
