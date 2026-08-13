@@ -1,8 +1,10 @@
 # Audit log
 
 Every `tools/call` produces one row in the component's `audit` table,
-and so does every resource operation and every task lifecycle
-transition. The row records who called what, when, and what the gateway
+and so does every task lifecycle transition. Resource operations are
+audited only when the host passes `auditResources` to
+`handleMcpRequest`; without it no resource row is ever written, which
+matters if the audit log is carrying a compliance story. The row records who called what, when, and what the gateway
 decided, plus the arguments, for tool rows. The audit pipeline is
 independent from the dispatch outcome: a failed audit insert never
 alters the response the caller sees.
@@ -26,10 +28,10 @@ apply depend on it:
 | `toolName` | `string` (optional) | Registered tool name (indexed). Also set on task rows, naming the tool the task runs |
 | `toolKind` | `"query" \| "mutation" \| "action"` (optional) | Tool rows |
 | `resourceUri` | `string` (optional) | Resource rows (indexed) |
-| `resourceOperation` | `"list" \| "read" \| "templates" \| "subscribe" \| "unsubscribe"` (optional) | Resource rows |
+| `resourceOperation` | `"list" \| "read" \| "templates_list"` (optional) | Resource rows |
 | `taskId` | `string` (optional) | Task rows (indexed) |
 | `taskOperation` | `"create" \| "input" \| "cancel" \| "complete" \| "fail"` (optional) | Task rows |
-| `args` | `any` | Caller args on tool rows, or `null` if `metadata.auditArgs === false`. Always `null` on resource and task rows |
+| `args` | `any` | Caller args on tool rows, or `null` if `metadata.auditArgs === false`. Always `null` on task rows. On resource rows: `null` for reads, and a count (`{ resourceCount }`, `{ resourceTemplateCount }`) for successful list operations |
 | `outcome` | `"allowed" \| "denied" \| "error"` | (indexed) |
 | `identitySubject` | `string \| null` | Caller's `identity.subject` resolved by the host's `/mcp/` `httpAction`, or null for anonymous. On task rows, the task's owner |
 | `durationMs` | `number` | Tool and resource rows: wall-clock time from dispatch start to finish. Task rows: the task's **age** at that transition (`0` on `create`), not an operation latency |

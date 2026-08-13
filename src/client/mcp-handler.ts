@@ -903,6 +903,15 @@ function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
   return JSON.stringify({ jsonrpc: "2.0", id: id ?? null, result: value });
 }
 
+/**
+ * Whether a value may be shipped as `structuredContent`. MCP models it
+ * as structured output, and a scalar there fails a validating client.
+ * Mirrored in the component for task results.
+ */
+function isStructuredShape(value: unknown): boolean {
+  return Array.isArray(value) || isPlainObject(value);
+}
+
 function jsonErrorEnvelope(
   id: JsonRpcMessage["id"],
   code: number,
@@ -4422,14 +4431,43 @@ async function handlePost(
       // 2025-06-18 §tools/call mandates ALSO sending the typed value
       // as `structuredContent`. Spec-compliant clients (claude.ai,
       // recent Inspector) prefer the structured form when present.
+      // `JSON.stringify` throws on a bigint, and `v.int64()` is a
+      // supported `returns` validator, so a tool declaring one would
+      // otherwise escape the switch as a raw 500: no JSON-RPC envelope,
+      // no CORS headers, nothing the client can act on.
+      let serializedResult: string;
+      try {
+        serializedResult = JSON.stringify(dispatched.data, null, 2);
+      } catch (err) {
+        console.error(
+          "[mcp-gateway] tool result cannot be serialized for the wire",
+          tool.name,
+          err,
+        );
+        body = jsonResultEnvelope(message.id, {
+          content: [
+            {
+              type: "text",
+              text: `Tool "${tool.name}" returned a value that cannot be represented on the wire`,
+            },
+          ],
+          isError: true,
+        });
+        break;
+      }
       body = jsonResultEnvelope(message.id, {
         content: [
           {
             type: "text",
-            text: JSON.stringify(dispatched.data, null, 2),
+            text: serializedResult,
           },
         ],
-        ...(tool.outputSchema !== undefined
+        // MCP defines `structuredContent` as structured output, so a
+        // scalar must not be stamped as one just because the tool
+        // advertises a schema: a validating client rejects the whole
+        // result. Same rule the task path applies, so the two agree.
+        ...(tool.outputSchema !== undefined &&
+        isStructuredShape(dispatched.data)
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,

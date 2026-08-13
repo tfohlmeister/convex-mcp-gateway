@@ -16,32 +16,37 @@ There are two layers worth covering:
 
 ## Setup
 
-The component lives in your host's `node_modules` so its modules need to
-be registered alongside your own:
+The component ships a one-line helper that registers its schema and
+modules with your `convexTest` instance:
 
 ```ts
-// example/convex/mcp.test.ts
+// convex/mcp.test.ts
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
+import { register } from "convex-mcp-gateway/test";
 import schema from "./schema.js";
-import componentSchema from "convex-mcp-gateway/_generated/component";
 import { components, internal } from "./_generated/api.js";
 
 const modules = import.meta.glob(["./**/*.ts", "./**/*.js", "!**/*.test.ts"]);
-const componentModules = import.meta.glob([
-  "../../node_modules/convex-mcp-gateway/dist/component/**/*.js",
-]);
 
 function newTest() {
   const t = convexTest(schema, modules);
-  t.registerComponent("mcpGateway", componentSchema, componentModules);
+  register(t);
   return t;
 }
 ```
 
-> Inside this monorepo the test imports from `../../src/component/...`
-> instead of `node_modules`, but the pattern is the same.
+`register(t, name?)` defaults to mounting the component as `mcpGateway`,
+matching `app.use(mcpGateway)`; pass a name if you mounted it under a
+different one. Do not reach for the component's schema module directly:
+it is not part of the package's public exports, and the generated
+`_generated/component.js` is types-only, so importing it yields
+`undefined`.
+
+> Inside this monorepo the tests import from `../../src/component/...`
+> rather than through the package, because the package is not installed
+> into itself. The pattern above is what a host writes.
 
 ## Layer 1: component-level tests
 

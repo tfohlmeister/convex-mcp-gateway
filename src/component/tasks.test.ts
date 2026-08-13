@@ -1621,15 +1621,23 @@ describe("tasks: result shaping and size accounting", () => {
     expect(outcome).toBe("result_too_large");
   });
 
-  test("a value JSON cannot represent is refused, not thrown past", async () => {
+  test("a value JSON cannot represent is refused, and says so", async () => {
     // v.int64() is a bigint and JSON.stringify throws on it. Rethrowing
-    // would land in the executor's catch and strand the row working.
+    // would land in the executor's catch and strand the row working, and
+    // reporting it as a size would send an operator hunting for a size
+    // problem that does not exist for a seven-byte value.
     const t = newTest();
     const outcome = await seedCompleted(t, {
       taskId: "shape-4",
       result: { count: BigInt(7) },
     });
     expect(outcome).toBe("result_too_large");
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "shape-4",
+      ownerSubject: "alice",
+    });
+    expect(task?.error?.message).toMatch(/cannot be serialized/);
+    expect(task?.error?.message).not.toMatch(/exceeds/);
   });
 });
 

@@ -210,17 +210,21 @@ function byteLength(serialized: string): number {
  * to serialize safely. A too-deep value is treated as over-cap so the
  * caller rejects it cleanly rather than letting the stack overflow.
  */
+/** A value JSON cannot represent, e.g. a `v.int64()` bigint. */
+class TaskUnserializableError extends Error {}
+
 function exceeds(value: unknown, cap: number): boolean {
   try {
     return byteLength(stableStringify(value ?? null)) + binarySize(value) > cap;
   } catch (err) {
     if (err instanceof TaskStringifyDepthError) return true;
     // A value JSON cannot represent at all: `v.int64()` returns a bigint
-    // and `JSON.stringify` throws on it. Measuring is the only thing
-    // this function promises, so an unmeasurable value counts as over
-    // the cap. The alternative is rethrowing into `completeTask`, which
-    // strands the row `working` after the tool already committed.
-    if (err instanceof TypeError) return true;
+    // and `JSON.stringify` throws on it. Rethrowing would strand the row
+    // `working` after the tool already committed, so it is refused, but
+    // the caller reports it as unrepresentable rather than oversized:
+    // telling an operator that seven bytes exceed 256 KiB sends them
+    // hunting for a size problem that does not exist.
+    if (err instanceof TypeError) throw new TaskUnserializableError();
     throw err;
   }
 }
@@ -1071,10 +1075,30 @@ export const completeTask = mutation({
       args.isError !== true &&
       tool?.outputSchema !== undefined &&
       structuredShaped;
-    if (exceeds(args.result, TASK_MAX_RESULT_BYTES)) {
+    // Both caps are measured here so a value JSON cannot represent is
+    // reported as that, rather than as a size the operator would go
+    // looking for.
+    let unserializable = false;
+    let valueTooLarge = false;
+    let derivedTooLarge = false;
+    try {
+      valueTooLarge = exceeds(args.result, TASK_MAX_RESULT_BYTES);
+      if (!valueTooLarge) {
+        derivedTooLarge = exceeds(
+          callToolResult(args.result, structured, args.isError === true),
+          TASK_MAX_DERIVED_RESULT_BYTES,
+        );
+      }
+    } catch (err) {
+      if (!(err instanceof TaskUnserializableError)) throw err;
+      unserializable = true;
+    }
+    if (unserializable || valueTooLarge) {
       const error = {
         code: -32000,
-        message: `Task result exceeds ${TASK_MAX_RESULT_BYTES} serialized bytes`,
+        message: unserializable
+          ? "Task result contains a value that cannot be serialized (e.g. a v.int64() bigint)"
+          : `Task result exceeds ${TASK_MAX_RESULT_BYTES} serialized bytes`,
       };
       await ctx.db.patch("tasks", row._id, {
         status: "failed",
@@ -1095,12 +1119,7 @@ export const completeTask = mutation({
     // caller to answer. Unreachable for a value inside the cap above, so a
     // hit means the bound in `callToolResult` needs revisiting rather than
     // that the caller did anything wrong.
-    if (
-      exceeds(
-        callToolResult(args.result, structured, args.isError === true),
-        TASK_MAX_DERIVED_RESULT_BYTES,
-      )
-    ) {
+    if (derivedTooLarge) {
       const error = {
         code: -32000,
         message: `Task result does not fit a readable CallToolResult (over ${TASK_MAX_DERIVED_RESULT_BYTES} serialized bytes)`,
@@ -1539,10 +1558,18 @@ function callToolResult(
     content: [
       {
         type: "text",
-        // A string passes through as itself (the sanitized error message);
-        // anything else is serialized. `String(value)` here would render a
-        // structured error payload as "[object Object]", and the new
-        // `completeTask` contract invites hosts to pass exactly that.
+        // A string passes through as itself, anything else is
+        // serialized. That covers the two things a host completes with:
+        // a sanitized error message, and a human-readable completion
+        // message such as a declined confirmation, both of which the
+        // inline path also ships as plain text (the hook writes the
+        // content block directly via `completeCall`). The cost is that a
+        // TOOL returning a bare string renders unquoted here and quoted
+        // on an inline dispatch; `docs/tasks.md` states that limit
+        // rather than papering over it. `String(value)` instead of
+        // `JSON.stringify` would render a structured error payload as
+        // "[object Object]", which the `completeTask` contract invites
+        // hosts to pass.
         text:
           typeof value === "string" ? value : JSON.stringify(value ?? null),
       },

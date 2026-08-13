@@ -555,20 +555,23 @@ keeps working without glue code.
 
 ## Why some component functions are `mutation` not `internalMutation`
 
-If you read the source you will notice that `audit.recordEntry`,
-`registry.*`, and `dispatch.*` are declared as `mutation` / `query` /
-`action` rather than the `internal*` variants. This is intentional and
-specific to Convex components.
+If you read the source you will notice that `registry.*` and
+`dispatch.*` are declared as `mutation` / `query` / `action` rather than
+the `internal*` variants. This is intentional and specific to Convex
+components. `audit.recordEntry` is the counter-example and stays
+`internalMutation`: nothing outside the component calls it, so it does
+not need to be reachable from the host.
 
 Generated component API references (`api`, `internal` exported from
 `_generated/api.ts`) are both backed by `anyApi` at runtime, which
-strips the public/internal marker. A component that calls its own
-`internalMutation` via `internal.audit.recordEntry` fails at runtime
-with `Couldn't resolve api.audit.recordEntry`. Declaring the function as
-public `mutation` fixes the resolution; the component boundary still
-prevents external callers from invoking it (only the host can reach
-`components.mcpGateway.audit.recordEntry`, and the host already trusts
-itself).
+strips the public/internal marker. The rule that matters is which side calls the function. A function the
+HOST must reach through `components.mcpGateway.*` has to be public,
+because the component boundary exposes only public functions; that is
+`registry.*` and `dispatch.*`. A function only the component calls, like
+`audit.recordEntry`, stays `internalMutation` and is invoked through
+`internal.*` from inside the component, which resolves fine. Declaring
+something public that the host never calls widens the boundary for
+nothing.
 
 ## Failure modes summary
 
@@ -576,9 +579,9 @@ itself).
 |---|---|
 | Tool not registered | `-32602 Unknown tool` (no audit row) |
 | Authorize returns `allowed: false` | `-32001 Unauthorized` if reason starts `Unauth*`, else `-32003 Forbidden`. 401 also gets `WWW-Authenticate`. (audit `denied`) |
-| Authorize throws | `-32603 Authorizer threw: ...` (audit `error`) |
+| Authorize throws | `-32603 Authorization check failed` on the wire; the full `Authorizer threw: ...` text goes to the audit row only (audit `error`) |
 | Authorize returns malformed shape | Treated as `allowed: false` with explanatory reason (audit `denied`) |
-| Tool handler throws | `-32000` with the error message (audit `error`) |
+| Tool handler throws | `-32000 Tool execution failed` on the wire, unless it threw a `ConvexError`, whose message is deliberate and passes through. Full text in the audit row (audit `error`) |
 | Audit-write fails | Logged via `console.error`, swallowed. Dispatch outcome unchanged. |
 | Session id missing on a non-`initialize` request | HTTP 400 |
 | Session id unknown / terminated | HTTP 404 (forces fresh `initialize`) |

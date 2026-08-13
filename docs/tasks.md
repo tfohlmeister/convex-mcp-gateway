@@ -60,7 +60,13 @@ gateway.handleMcpRequest(ctx, request, {
   validates it exactly as it would a `tools/call` response, and the
   example suite asserts the two match for the same tool and arguments:
   same `structuredContent`, same `isError`, same content-block types, and
-  the same parsed text. Only whitespace differs. The task path serializes
+  the same parsed text. Only whitespace differs, with one stated
+  exception: a value that is already a **string** is shipped as plain
+  text rather than serialized, so that a host completing with a message
+  (a declined confirmation, a sanitized error) reads as that message
+  rather than as a quoted JSON string, matching what `completeCall()`
+  produces inline. A tool whose return value is a bare string therefore
+  renders unquoted through a task and quoted through an inline dispatch. The task path serializes
   compactly on purpose, because the synchronous path's two-space indent
   multiplies structured data (a 256 KiB value reached 98x when the
   envelope was pretty-printed), and the compact form is bounded at 3x by

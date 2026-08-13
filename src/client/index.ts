@@ -88,13 +88,7 @@ export {
   buildResourceUrl,
   convexValidatorToJsonSchema,
   mcpCallerValidator,
-  resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
-  SCHEMA_MAX_REF_EXPANSIONS,
-  SCHEMA_MAX_RESOLVED_BYTES,
-  SCHEMA_MAX_STRUCTURAL_DEPTH,
-  SCHEMA_RESOLVER_VERSION,
-  type ResolvedJsonSchema,
 } from "../shared.js";
 
 export type RunQueryCtx = {

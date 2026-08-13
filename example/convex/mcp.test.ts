@@ -4042,7 +4042,7 @@ describe("MCP tasks (host executor, e2e)", () => {
     // Note what this does and does not pin: the refusal comes from the
     // scope MISMATCH, which exists whether or not the main mount sets its
     // own `scope`. So this test protects `scope: "host-tasks"`, not
-    // `scope: "main"` — that one is defence in depth against a future
+    // `scope: "main"`, which is defence in depth against a future
     // third, unscoped mount, and no two-mount topology can observe it.
     const fromOtherMount = await t.fetch("/mcp/", {
       method: "POST",

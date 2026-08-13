@@ -32,10 +32,14 @@ app.use(mcpGateway);
 export default app;
 ```
 
-The component owns Convex tables for `tools`, `resources`,
-`resourceTemplates`, `config`, and `audit`, plus `sessions` (and
-`subscriptions`) for Streamable-HTTP. It does **not** mount any HTTP routes
-of its own. The `/mcp/` endpoint and the OAuth discovery route both live
+The component owns ten Convex tables: `tools`, `resources`,
+`resourceTemplates`, `config` and `audit`, plus `sessions` and
+`subscriptions` for Streamable-HTTP, and `mrtrRedemptions`, `mrtrChains`
+and `tasks` for the multi-round-trip and task features. The last three
+are TTL-bounded and want a cron: `gateway.pruneMrtrRedemptions` drains
+the first two, `gateway.pruneTasks` the third.
+
+The component does **not** mount any HTTP routes of its own. The `/mcp/` endpoint and the OAuth discovery route both live
 in your host's `http.ts` (steps 3 and 6 below). The reason is structural:
 Convex doesn't propagate `ctx.auth` into component code, so the only place
 the gateway can read the JWT-validated identity is from a host-mounted
@@ -85,8 +89,10 @@ style) are rejected by most MCP clients and will throw at
 registration time. Use `invoices_list` instead.
 
 **Typed return values (optional)**: pass `returns:` with a Convex
-validator and the gateway advertises an MCP `outputSchema` plus
-ships `structuredContent` in every `tools/call` response. The
+validator and the gateway advertises an MCP `outputSchema` and ships the
+value as `structuredContent` alongside the text block. MCP models
+structured output as an object, so a scalar return (a bare string or
+number) is shipped as text only, with no `structuredContent`. The
 validator is type-checked against the Convex function's actual
 return type at compile time:
 
