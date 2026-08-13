@@ -47,17 +47,25 @@ export const TASK_MAX_INPUT_BYTES = 64 * 1024;
  * returns fine inline.
  *
  * With compact serialization the derived form is bounded at about 3x this
- * (see `callToolResult`), i.e. ~768 KiB, inside Convex's 1 MiB return
- * limit. `completeTask` still measures the derived form once, at write
+ * (see `callToolResult`), i.e. ~768 KiB. That is comfortably inside the
+ * function return limit (16 MiB); the 1 MiB figure is the DOCUMENT limit,
+ * which the derived envelope never touches because it is never stored. `completeTask` still measures the derived form once, at write
  * time, so a value that somehow escapes that reasoning fails loudly then
  * rather than making the task unreadable on every poll afterwards.
  */
 export const TASK_MAX_RESULT_BYTES = 256 * 1024;
 /**
  * Ceiling on the DERIVED envelope, checked once at completion. Not a
- * storage bound (the row holds only the value) and unreachable for any
- * value inside the cap above; it exists so the failure, if the bound is
- * ever wrong, lands where a client can be told about it.
+ * storage bound: the row holds only the value.
+ *
+ * Nearly unreachable by size, since compact serialization bounds the
+ * envelope at 3x the value. Reachable by DEPTH, though: `callToolResult`
+ * nests the value one level further under `structuredContent`, so a value
+ * sitting exactly at `TASK_MAX_STRINGIFY_DEPTH` passes the value cap and
+ * fails here. The message says "does not fit a readable CallToolResult",
+ * which covers both, and failing loudly at completion is the point:
+ * anything that escapes the reasoning above must not become a task that
+ * is unreadable on every poll instead.
  */
 export const TASK_MAX_DERIVED_RESULT_BYTES = 3 * TASK_MAX_RESULT_BYTES + 4096;
 
@@ -204,11 +212,42 @@ function byteLength(serialized: string): number {
  */
 function exceeds(value: unknown, cap: number): boolean {
   try {
-    return byteLength(stableStringify(value ?? null)) > cap;
+    return byteLength(stableStringify(value ?? null)) + binarySize(value) > cap;
   } catch (err) {
     if (err instanceof TaskStringifyDepthError) return true;
+    // A value JSON cannot represent at all: `v.int64()` returns a bigint
+    // and `JSON.stringify` throws on it. Measuring is the only thing
+    // this function promises, so an unmeasurable value counts as over
+    // the cap. The alternative is rethrowing into `completeTask`, which
+    // strands the row `working` after the tool already committed.
+    if (err instanceof TypeError) return true;
     throw err;
   }
+}
+
+/**
+ * Bytes that `JSON.stringify` cannot see. A `v.bytes()` value is an
+ * `ArrayBuffer`, which serializes as `{}`, so a megabyte of binary
+ * measures eleven bytes and sails past every cap, only to be rejected by
+ * the document limit at write time and strand the task. Counted here so
+ * the caps mean what they say.
+ */
+function binarySize(value: unknown, depth = 0): number {
+  if (depth > TASK_MAX_STRINGIFY_DEPTH) return 0;
+  if (value instanceof ArrayBuffer) return value.byteLength;
+  if (Array.isArray(value)) {
+    let total = 0;
+    for (const entry of value) total += binarySize(entry, depth + 1);
+    return total;
+  }
+  if (value !== null && typeof value === "object") {
+    let total = 0;
+    for (const entry of Object.values(value)) {
+      total += binarySize(entry, depth + 1);
+    }
+    return total;
+  }
+  return 0;
 }
 
 /**
@@ -534,9 +573,18 @@ export const createTask = mutation({
         // because its executor is what called `requireTaskInput`, so
         // "starting" it again would re-run the executor against a paused
         // task and fail one the owner is still answering.
+        // `inputRound` is the tell that execution demonstrably happened:
+        // only `requireTaskInput` sets it, and only the executor can call
+        // that. A row that was answered and resumed is back to `working`
+        // with `startedAt` still unset (the marker is written after
+        // `execute` returns and its failure is only logged), so status
+        // alone cannot distinguish "never started" from "started, asked,
+        // and was answered". Restarting the latter re-fires the
+        // elicitation and discards the answer the owner just gave.
         ...(reusable.executor === "host" &&
         reusable.startedAt === undefined &&
-        reusable.status === "working"
+        reusable.status === "working" &&
+        reusable.inputRound === undefined
           ? { startPending: true as const }
           : {}),
       };
@@ -1005,8 +1053,24 @@ export const completeTask = mutation({
       .query("tools")
       .withIndex("by_name", (q: any) => q.eq("name", row.toolName))
       .unique()) as { outputSchema?: unknown } | null;
+    // A tool advertising an `outputSchema` is necessary but not
+    // sufficient: the VALUE has to be shaped like structured output too.
+    // The documented decline (`completeTask(ctx, id, "Declined.")`,
+    // deliberately without `isError`) is a string, and stamping it as
+    // `structuredContent` would ship a payload that violates the tool's
+    // own schema. The synchronous path already refuses exactly that
+    // shape, in `describeCompleteCallResultProblem`: "structuredContent
+    // must be an object or array". Same rule here, or the gateway
+    // forbids inline what it emits from a task.
+    const value = args.result;
+    const structuredShaped =
+      value !== null &&
+      typeof value === "object" &&
+      (Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype);
     const structured =
-      args.isError !== true && tool?.outputSchema !== undefined;
+      args.isError !== true &&
+      tool?.outputSchema !== undefined &&
+      structuredShaped;
     if (exceeds(args.result, TASK_MAX_RESULT_BYTES)) {
       const error = {
         code: -32000,
