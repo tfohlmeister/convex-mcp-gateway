@@ -58,8 +58,13 @@ gateway.handleMcpRequest(ctx, request, {
   synchronously**: the text-JSON `content` block, `structuredContent` when
   the tool declares an `outputSchema`, and `isError`. A client renders and
   validates it exactly as it would a `tools/call` response, and the
-  example suite asserts the two are byte-identical for the same tool and
-  arguments.
+  example suite asserts the two match for the same tool and arguments:
+  same `structuredContent`, same `isError`, same content-block types, and
+  the same parsed text. Only whitespace differs. The task path serializes
+  compactly on purpose, because the synchronous path's two-space indent
+  multiplies structured data (a 256 KiB value reached 98x when the
+  envelope was pretty-printed), and the compact form is bounded at 3x by
+  construction.
 
   The envelope is **derived when the task is read**, not stored. The row
   keeps the tool's value once, plus two flags recorded at completion time

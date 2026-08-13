@@ -5,6 +5,7 @@ import { modules } from "./setup.test.js";
 import { api } from "./_generated/api.js";
 import {
   TASK_DEFAULT_TTL_MS,
+  TASK_MAX_RESULT_BYTES,
   TASK_MAX_TTL_MS,
   TASK_MIN_TTL_MS,
   TASK_OWNER_ACTIVE_CAP,
@@ -1526,3 +1527,109 @@ describe("tasks: executor gate mirrors the synchronous one", () => {
     expect(task?.error?.message ?? "").not.toMatch(/no longer eligible/);
   });
 });
+
+describe("tasks: result shaping and size accounting", () => {
+  async function seedCompleted(
+    t: ReturnType<typeof newTest>,
+    opts: {
+      taskId: string;
+      outputSchema?: unknown;
+      result: unknown;
+      isError?: boolean;
+    },
+  ) {
+    await t.mutation(api.registry.registerTool, {
+      name: "shaper",
+      description: "shapes",
+      kind: "mutation",
+      functionHandle: "function://shaper",
+      inputSchema: { type: "object" },
+      taskSupport: true,
+      ...(opts.outputSchema !== undefined
+        ? { outputSchema: opts.outputSchema }
+        : {}),
+    });
+    const now = Date.now();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("tasks", {
+        taskId: opts.taskId,
+        ownerSubject: "alice",
+        toolName: "shaper",
+        toolKind: "mutation" as const,
+        args: {},
+        status: "working" as const,
+        idempotencyKey: "idem-" + opts.taskId,
+        executor: "component" as const,
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: now + TASK_DEFAULT_TTL_MS,
+      });
+    });
+    return await t.mutation(api.tasks.completeTask, {
+      taskId: opts.taskId,
+      result: opts.result,
+      ...(opts.isError !== undefined ? { isError: opts.isError } : {}),
+    });
+  }
+
+  test("a non-object value never becomes structuredContent", async () => {
+    // The documented decline passes a plain string and deliberately no
+    // isError. Stamping it as structuredContent would violate the tool's
+    // own outputSchema, and the synchronous path already refuses that
+    // exact shape in describeCompleteCallResultProblem.
+    const t = newTest();
+    await seedCompleted(t, {
+      taskId: "shape-1",
+      outputSchema: { type: "object", required: ["paid"] },
+      result: "Confirmation declined.",
+    });
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "shape-1",
+      ownerSubject: "alice",
+    });
+    expect(task?.result).toEqual({
+      content: [{ type: "text", text: "Confirmation declined." }],
+      isError: false,
+    });
+    expect(task?.result).not.toHaveProperty("structuredContent");
+  });
+
+  test("an object value still becomes structuredContent", async () => {
+    const t = newTest();
+    await seedCompleted(t, {
+      taskId: "shape-2",
+      outputSchema: { type: "object", required: ["paid"] },
+      result: { paid: 2 },
+    });
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "shape-2",
+      ownerSubject: "alice",
+    });
+    expect(task?.result).toMatchObject({ structuredContent: { paid: 2 } });
+  });
+
+  test("binary payloads count against the cap instead of measuring as {}", async () => {
+    // An ArrayBuffer serializes as {}, so a megabyte of v.bytes() used to
+    // measure eleven bytes, pass every cap, and then be rejected by the
+    // document limit at write time, stranding the task after the tool
+    // had already committed.
+    const t = newTest();
+    const outcome = await seedCompleted(t, {
+      taskId: "shape-3",
+      result: { blob: new ArrayBuffer(TASK_MAX_RESULT_BYTES + 1) },
+    });
+    expect(outcome).toBe("result_too_large");
+  });
+
+  test("a value JSON cannot represent is refused, not thrown past", async () => {
+    // v.int64() is a bigint and JSON.stringify throws on it. Rethrowing
+    // would land in the executor's catch and strand the row working.
+    const t = newTest();
+    const outcome = await seedCompleted(t, {
+      taskId: "shape-4",
+      result: { count: BigInt(7) },
+    });
+    expect(outcome).toBe("result_too_large");
+  });
+});
+
