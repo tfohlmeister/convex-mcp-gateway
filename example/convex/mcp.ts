@@ -63,7 +63,7 @@ export const tools: McpToolRegistration[] = [
     // The gateway-side confirmation state machine. The mutation above is
     // MCP-unaware: accept dispatches it, decline finishes the call right
     // here, and a malformed answer simply asks again.
-    beforeCall: async (_ctx, { args, inputResponses }) => {
+    beforeCall: async (_ctx, { args, inputResponses, round }) => {
       const ask = () =>
         inputRequired(
           {
@@ -82,11 +82,16 @@ export const tools: McpToolRegistration[] = [
           },
           { invoiceId: args.id },
         );
-      // First call: no responses yet, request the confirmation round.
-      if (inputResponses === undefined) return ask();
+      // First call: no continuation yet, request the confirmation round.
+      // Discriminate on `round`, not on `inputResponses`. Both work for
+      // this hook, because its "no answer yet" branch below also asks,
+      // but `round` says what is actually being tested: a state-only
+      // retry is a continuation, not a first call, and a hook that
+      // treats the two differently needs to tell them apart.
+      if (round === undefined) return ask();
       // Verified continuation: `inputResponses` is client-controlled,
       // so validate every field before acting on it.
-      const confirm = inputResponses.confirm as
+      const confirm = inputResponses?.confirm as
         | { action?: string; content?: { confirm?: unknown } }
         | undefined;
       if (confirm === undefined) return ask(); // missing answer: ask again

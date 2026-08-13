@@ -2945,7 +2945,7 @@ async function handlePost(
       // Fail closed: a gated registry row served by a handler with no
       // matching hook (imperative registration, stale declarative
       // catalog, or a mount without the `tools` option) must never
-      // dispatch ungated — that would silently skip the confirmation
+      // dispatch ungated: that would silently skip the confirmation
       // the row promises, on any transport.
       if (mrtrGated && !beforeCall) {
         console.error(
@@ -3198,7 +3198,7 @@ async function handlePost(
       // the first call AND on every verified continuation, so the
       // decision to dispatch (accept), ask again (missing input), or
       // finish without dispatching (decline/cancel) lives in the
-      // gateway hook — the underlying Convex function never parses MCP
+      // gateway hook; the underlying Convex function never parses MCP
       // envelopes. It runs on EVERY transport so required input is
       // never silently bypassed: when it demands input and the request
       // cannot carry a continuation (legacy protocol, or `mrtr` not

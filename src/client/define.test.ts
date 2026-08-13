@@ -2,6 +2,8 @@ import { describe, expect, test } from "vitest";
 import { v } from "convex/values";
 import type { FunctionReference } from "convex/server";
 import {
+  defineMcpAction,
+  defineMcpMutation,
   defineMcpQuery,
   defineMcpResource,
   defineMcpResourceTemplate,
@@ -240,6 +242,33 @@ describe("defineMcp* mrtrArgs", () => {
         beforeCall: async () => null,
       }),
     ).toThrow(/must be an optional validator/);
+
+    // A replayed continuation dispatches again, so a mutation or action
+    // that gates on a hook must be able to recognize the repeat. The
+    // chain's idempotency key is that mechanism, so it is mandatory.
+    for (const define of [defineMcpMutation, defineMcpAction]) {
+      expect(() =>
+        (define as unknown as (c: unknown) => unknown)({
+          name: "hooked_without_key",
+          description: "x",
+          fn: {},
+          args: { id: v.string() },
+          beforeCall: async () => null,
+        }),
+      ).toThrow(/beforeCall requires mrtrArgs/);
+    }
+
+    // A query has no durable side effect, so replaying it is harmless
+    // and the key stays optional.
+    expect(() =>
+      (defineMcpQuery as unknown as (c: unknown) => unknown)({
+        name: "hooked_query_without_key",
+        description: "x",
+        fn: {},
+        args: { id: v.string() },
+        beforeCall: async () => null,
+      }),
+    ).not.toThrow();
   });
 
   test("requires declarative tools for beforeCall", async () => {

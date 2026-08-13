@@ -266,8 +266,10 @@ interface McpToolConfigBase<
    * Name of the argument the gateway fills with the MRTR continuation's
    * stable idempotency key when a verified retry continues to dispatch.
    * Removed from the public schema and stripped from client requests.
-   * Requires `beforeCall`; distinct from `identityArg`. Optional: a tool
-   * without durable side effects does not need the key.
+   * Requires `beforeCall`; distinct from `identityArg`. Required for
+   * `defineMcpMutation` / `defineMcpAction` tools that use `beforeCall`,
+   * since a replayed continuation dispatches again; optional only for
+   * queries, which have no durable side effect to deduplicate.
    */
   mrtrArgs?: {
     idempotencyKey: McpArgKey<ArgsV>;
@@ -368,6 +370,27 @@ function build<
   // only confirms (or completes calls itself) needs no injected key.
   if (config.beforeCall === undefined && config.mrtrArgs !== undefined) {
     throw new Error(`mrtrArgs requires beforeCall for tool "${config.name}".`);
+  }
+  // A redeemed continuation can come back as an idempotent "replay"
+  // (byte-identical re-send), and a replay re-runs the hook and
+  // dispatches again. For a query that is harmless; for a mutation or
+  // action it repeats the side effect unless the tool can recognize the
+  // retry, which is exactly what the chain's idempotency key is for.
+  // Require it rather than trust every host to notice.
+  if (
+    config.beforeCall !== undefined &&
+    config.mrtrArgs === undefined &&
+    kind !== "query"
+  ) {
+    throw new Error(
+      `beforeCall requires mrtrArgs for ${kind} tool "${config.name}", ` +
+        `because a replayed continuation dispatches again and the ` +
+        `idempotency key is how the tool deduplicates it. Declare an ` +
+        `optional key argument, or use defineMcpQuery if the tool has no ` +
+        `durable side effect. A hook that never returns null never ` +
+        `dispatches, but that cannot be checked here, so declare the key ` +
+        `and leave it unused.`,
+    );
   }
   // The key is injected only on a continuation that dispatches; a
   // first-call approval (hook returns null) and every legacy dispatch
