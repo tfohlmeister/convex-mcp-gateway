@@ -1,10 +1,21 @@
 allowBuilds:
   esbuild: true
 
-# Pin transitive `ws` to the fixed release for the uninitialized-memory
-# disclosure in `websocket.close()` (GHSA-43c4-fjxq-4qpm). `ws` only
-# enters the tree via `convex` and `convex-test` (dev), so this is
-# defense-in-depth: GitHub auto-dismissed the alert because we don't
-# exercise the affected close() path, but bumping costs nothing.
+# Transitive pins for advisories in the DEV tree. The published package
+# declares no runtime dependencies (`convex` is a peer), so none of these
+# reach a consumer of `convex-mcp-gateway`; they are pinned to keep CI's
+# vulnerability signal meaningful rather than habitually red.
+#
+#   ws              GHSA-43c4-fjxq-4qpm (uninitialized memory in close())
+#                   and memory-exhaustion DoS from tiny fragments. Enters
+#                   via `convex` / `convex-test`. The previous ^8.20.1 pin
+#                   sat below the fix line for the second advisory.
+#   postcss         path traversal in source-map auto-loading, plus the
+#                   incomplete fix for GHSA-6g55-p6wh-862q. Enters via
+#                   `vite` / `vitest`.
+#   brace-expansion DoS via exponential-time expansion. Enters via
+#                   `minimatch` under `eslint`.
 overrides:
-  ws: ^8.20.1
+  ws: ^8.21.3
+  postcss: ^8.5.26
+  brace-expansion: ^5.0.9
