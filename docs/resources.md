@@ -162,9 +162,12 @@ When `resources/read` receives a URI:
    order; the first template whose `read` returns content serves it. A
    template without a `read` handler is listing-only and is skipped here.
 3. If nothing serves the URI, the read returns `Resource not found`
-   (`-32602`). A provider/template that _throws_ (rather than declining
+   (`-32602`), with the requested URI repeated in `error.data.uri` as the
+   spec's example does, so a client can correlate the miss without parsing
+   the message. A provider/template that _throws_ (rather than declining
    with `null`) is isolated and logged; it surfaces as an internal error
-   (`-32603`) only if nothing else serves the URI.
+   (`-32603`) only if nothing else serves the URI, and carries no `data`:
+   that failure is the server's, not the caller's URI.
 
 ### What the caller is told when a read fails
 
@@ -196,6 +199,7 @@ written by the gateway and name only a field, never your data:
   non-empty string`, `content item must include text or blob`), so a
   provider bug stays diagnosable from the client
 - `Resource not found: <uri>`, which only echoes the URI the caller sent
+  (also in `error.data.uri`)
 
 ### `uriTemplate` syntax (level 1)
 

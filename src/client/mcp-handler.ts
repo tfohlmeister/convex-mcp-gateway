@@ -3007,11 +3007,17 @@ async function handlePost(
               errorMessage: providerError?.full ?? notFound,
             });
           }
-          body = jsonErrorEnvelope(
-            message.id,
-            code,
-            providerError?.wire ?? notFound,
-          );
+          // The spec's not-found example carries the offending URI in
+          // `data`, so a client can correlate the miss with the request it
+          // made instead of parsing our prose. Only on the genuine miss:
+          // the provider-error branch is our fault rather than the
+          // caller's, and that path exists precisely to keep provider
+          // detail off the wire, so it stays message-only.
+          // Same condition `code` was derived from, written the same way,
+          // so the payload and the code cannot drift apart.
+          body = providerError
+            ? jsonErrorEnvelope(message.id, code, providerError.wire)
+            : jsonErrorEnvelopeWithData(message.id, code, notFound, { uri });
         }
       } catch (err) {
         // Hard faults: invalid provider contents, a throwing audit path,

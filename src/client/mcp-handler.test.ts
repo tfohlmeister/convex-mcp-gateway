@@ -1656,7 +1656,13 @@ describe("handleMcpRequest metadata and resources", () => {
       },
     );
     expect(await readJson(readWithoutProvider)).toMatchObject({
-      error: { code: -32602, message: "Resource not found: docs://registered" },
+      error: {
+        code: -32602,
+        message: "Resource not found: docs://registered",
+        // The spec's not-found example carries the URI in `data` so a
+        // client can correlate the miss without parsing the message.
+        data: { uri: "docs://registered" },
+      },
     });
   });
 
@@ -2556,6 +2562,7 @@ describe("handleMcpRequest metadata and resources", () => {
       error: {
         code: -32602,
         message: "Resource not found: weather://london/history",
+        data: { uri: "weather://london/history" },
       },
     });
   });
@@ -3670,6 +3677,102 @@ describe("handleMcpRequest metadata and resources", () => {
       { authorize: async () => ({ allowed: true }), resources: [empty] },
     );
     expect((await readJson(readMiss)).error?.code).toBe(-32602);
+  });
+});
+
+describe("resources/read not-found error payload", () => {
+  const provider = {
+    name: "docs",
+    list: async () => [{ uri: "docs://a", name: "a" }],
+    read: async () => null,
+  };
+
+  async function readUri(
+    uri: string,
+    resources: unknown[] = [provider],
+  ): Promise<{
+    error?: { code: number; message: string; data?: Record<string, unknown> };
+    result?: unknown;
+  }> {
+    const component = createComponent();
+    const ctx = createCtx(component).ctx;
+    const options = {
+      authorize: async () => ({ allowed: true as const }),
+      resources: resources as never,
+    };
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+    const res = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri } },
+        sessionId!,
+      ),
+      component,
+      options,
+    );
+    return (await readJson(res)) as never;
+  }
+
+  test("a URI that needs escaping survives the data payload intact", async () => {
+    // The message interpolates the URI, so quotes and newlines are the case
+    // where reading it out of the prose breaks and `data` does not.
+    const uri = 'docs://a"b\nc';
+    const body = await readUri(uri);
+    expect(body.error?.code).toBe(-32602);
+    expect(body.error?.data).toEqual({ uri });
+  });
+
+  test("the modern path answers identically, since this is a result shape", async () => {
+    const component = createComponent();
+    const ctx = createCtx(component).ctx;
+    const res = await handleMcpRequest(
+      ctx,
+      modernJsonRpcRequest({
+        id: 2,
+        method: "resources/read",
+        params: { uri: "docs://missing" },
+      }),
+      component,
+      {
+        authorize: async () => ({ allowed: true as const }),
+        resources: [provider] as never,
+      },
+    );
+    const body = (await readJson(res)) as {
+      error: { code: number; data?: Record<string, unknown> };
+    };
+    // No era difference: the not-found branch is one code path, and the
+    // sibling tests above assert the same payload after `initialize`.
+    expect(body.error.code).toBe(-32602);
+    expect(body.error.data).toEqual({ uri: "docs://missing" });
+  });
+
+  test("a provider fault carries no data, since the URI is not the problem", async () => {
+    const throwing = {
+      name: "throwing",
+      list: async () => [],
+      read: async () => {
+        throw new Error("upstream timeout at https://internal/creds");
+      },
+    };
+    const body = await readUri("docs://boom", [throwing]);
+    // -32603: ours, not the caller's. This path exists to keep provider
+    // detail off the wire, so it stays message-only.
+    //
+    // Asserted on the whole object rather than through optional chaining:
+    // `error?.data` would also be undefined if `error` itself vanished, so
+    // a refactor that turned this fault into a result would slip through.
+    expect(body.error).toEqual({
+      code: -32603,
+      message: expect.any(String),
+    });
+    expect(body.error?.message).not.toContain("internal/creds");
   });
 });
 
