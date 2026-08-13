@@ -205,10 +205,15 @@ export default defineSchema({
    * A continuation stays cryptographically valid until its TTL, so
    * without this table a captured `requestState` could be replayed
    * with different `inputResponses` and flip an already-resolved
-   * decision (decline → accept). First redemption wins: a retry with
-   * byte-identical responses is an idempotent replay and re-processes;
-   * different responses for the same `jti` are rejected. Expired rows
-   * are dropped by `pruneMrtrRedemptions` from a host cron.
+   * decision (decline to accept) on that same continuation. First
+   * redemption wins: a retry with byte-identical responses is an
+   * idempotent replay and re-processes; different responses for the
+   * same `jti` are rejected. Expired rows are dropped by
+   * `pruneMrtrRedemptions` from a host cron.
+   *
+   * This is per continuation. Chain-level resolution lives in
+   * `mrtrChains` below, because `jti` is fresh per round and cannot
+   * express "this conversation is over".
    */
   mrtrRedemptions: defineTable({
     jti: v.string(),
@@ -216,6 +221,56 @@ export default defineSchema({
     expiresAt: v.number(),
   })
     .index("by_jti", ["jti"])
+    .index("by_expiresAt", ["expiresAt"]),
+
+  /**
+   * One row per resolved MRTR chain, keyed by the chain's stable
+   * idempotency key (constant across every round, unlike `jti`).
+   *
+   * A chain resolves exactly once, when the gateway either dispatches
+   * the tool or finishes the call itself via `completeCall()`. The row
+   * is inserted BEFORE either happens, so the insert is the decision:
+   * whoever claims first wins, and every other continuation of that
+   * chain is refused afterwards.
+   *
+   * Without it, redemption only protects a single continuation. Each
+   * `inputRequired()` seals a new `jti` with no row of its own, so any
+   * path that makes the hook ask again (an idempotent replay, or a
+   * state-only retry) forks an independent branch that stays answerable
+   * after a sibling already resolved the decision. Claiming the chain
+   * closes every branch at once and makes dispatch at-most-once per
+   * chain gateway-side, rather than relying on the tool to deduplicate
+   * on the injected idempotency key.
+   *
+   * Expired rows are dropped by `pruneMrtrRedemptions` alongside the
+   * redemption rows, so hosts wire one cron, not two.
+   */
+  mrtrChains: defineTable({
+    chainKey: v.string(),
+    /** What resolved it, for operator forensics. Never sent on the wire. */
+    resolution: v.union(v.literal("dispatched"), v.literal("completed")),
+    /**
+     * WHICH continuation resolved it. A lost response may be retried,
+     * so the resolving continuation is allowed to reproduce its own
+     * outcome; every other continuation of the chain is not, even one
+     * re-sent byte-identically. Without this the gateway could only ask
+     * "was this continuation re-sent?", which a sibling also answers
+     * yes to, letting it pass its own hook output off as the
+     * chain's settled result.
+     */
+    resolvedByJti: v.string(),
+    /**
+     * Digest of the `inputResponses` that continuation carried, absent
+     * when it carried none. A repeat has to present the same answer,
+     * not just the same continuation: otherwise the holder of a
+     * state-only continuation that already resolved the chain could
+     * re-send it with arbitrary responses and run the host's hook on a
+     * settled decision.
+     */
+    resolvedByDigest: v.optional(v.string()),
+    expiresAt: v.number(),
+  })
+    .index("by_chainKey", ["chainKey"])
     .index("by_expiresAt", ["expiresAt"]),
 
   /**

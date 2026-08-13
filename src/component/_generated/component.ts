@@ -106,6 +106,35 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       >;
     };
     mrtr: {
+      claimChain: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          chainKey: string;
+          expiresAt: number;
+          jti: string;
+          resolution: "dispatched" | "completed";
+          responsesDigest?: string;
+        },
+        | "claimed"
+        | {
+            resolution: "dispatched" | "completed";
+            resolvedByDigest?: string;
+            resolvedByJti: string;
+          },
+        Name
+      >;
+      getChainResolution: FunctionReference<
+        "query",
+        "internal",
+        { chainKey: string },
+        null | {
+          resolution: "dispatched" | "completed";
+          resolvedByDigest?: string;
+          resolvedByJti: string;
+        },
+        Name
+      >;
       pruneMrtrRedemptions: FunctionReference<
         "mutation",
         "internal",
@@ -116,7 +145,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       redeemContinuation: FunctionReference<
         "mutation",
         "internal",
-        { expiresAt: number; jti: string; responsesDigest: string },
+        { expiresAt: number; jti: string; responsesDigest?: string },
         "fresh" | "replay" | "conflict",
         Name
       >;

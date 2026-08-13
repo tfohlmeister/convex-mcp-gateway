@@ -1062,6 +1062,15 @@ type VerifiedMrtrState = {
 
 const MRTR_DEFAULT_TTL_MS = 5 * 60 * 1000;
 const MRTR_MAX_TTL_MS = 60 * 60 * 1000;
+/**
+ * Slack added to a chain claim's lifetime on top of the TTL ceiling.
+ * The claim must outlive every continuation of its chain, and a branch
+ * that read the chain as open can still be sealing one while the
+ * winner's claim is being written. With a host `ttlMs` at the ceiling
+ * that sibling's expiry exceeds the claim's by exactly that scheduling
+ * delta, so cover it rather than reason about how small it is.
+ */
+const MRTR_CLAIM_SLACK_MS = 60 * 1000;
 const MRTR_MAX_STATE_BYTES = 8 * 1024;
 const MRTR_MIN_SECRET_BYTES = 32;
 /**
@@ -1406,6 +1415,135 @@ async function ensureCatalogSynced(
   options: InternalHandleMcpRequestOptions,
 ): Promise<void> {
   await options.ensureCatalogSynced?.();
+}
+
+
+/**
+ * True when this request is the resolving continuation of an
+ * already-resolved chain, re-sent with the same answer: the lost
+ * response retry. Same continuation with a DIFFERENT answer is not a
+ * repeat, which matters for a chain resolved on state alone, whose
+ * continuation the redemption table never pinned.
+ */
+function isChainRepeat(
+  chain: ResolvedChain,
+  jti: string,
+  responsesDigest: string | undefined,
+  resolution: "dispatched" | "completed",
+): boolean {
+  return (
+    chain.resolution === resolution &&
+    chain.resolvedByJti === jti &&
+    chain.resolvedByDigest === responsesDigest
+  );
+}
+
+/**
+ * Response for a continuation whose chain another branch already
+ * resolved. Deliberately says nothing about how it resolved: whether
+ * the call was accepted or declined is not the caller's business when
+ * the caller is presenting a superseded continuation.
+ */
+function alreadyResolvedEnvelope(
+  id: JsonRpcMessage["id"],
+  toolName: string,
+): string {
+  console.warn(
+    "[mcp-gateway] MRTR continuation presented for an already-resolved " +
+      "chain; rejecting",
+    toolName,
+  );
+  return jsonErrorEnvelope(
+    id,
+    INVALID_PARAMS,
+    "This MRTR request has already been resolved. Start a new call " +
+      "without requestState",
+  );
+}
+
+/**
+ * Claim an MRTR chain's single resolution, immediately before the
+ * gateway dispatches or finishes the call itself. The claim IS the
+ * decision: a continuation forked by an idempotent replay finds the
+ * chain already resolved and is refused, which is what per-continuation
+ * redemption cannot do (`jti` is fresh per round, so every
+ * `inputRequired()` mints an unpinned sibling).
+ *
+ * Guarded like every other component call on this path: a claim that
+ * cannot RUN is a logged `"error"` the caller turns into `-32603`,
+ * never a raw 500 that skips the CORS wrapper.
+ */
+async function claimMrtrChain(
+  ctx: HandlerCtx,
+  component: ComponentApi,
+  toolName: string,
+  chainKey: string,
+  jti: string,
+  responsesDigest: string | undefined,
+  resolution: "dispatched" | "completed",
+  expiresAt: number,
+): Promise<{ status: "claimed" } | ({ status: "lost" } & ResolvedChain) | { status: "error" }> {
+  try {
+    const result = await ctx.runMutation(component.mrtr.claimChain, {
+      chainKey,
+      jti,
+      ...(responsesDigest !== undefined ? { responsesDigest } : {}),
+      resolution,
+      expiresAt,
+    });
+    return result === "claimed"
+      ? { status: "claimed" }
+      : { status: "lost", ...result };
+  } catch (err) {
+    console.error(
+      "[mcp-gateway] MRTR chain claim failed to run (is the component " +
+        "deployment up to date?)",
+      toolName,
+      err,
+    );
+    return { status: "error" };
+  }
+}
+
+/**
+ * Read-only pre-check of a chain's resolution, run once per verified
+ * continuation before the hook's decision is acted on. It exists so an
+ * already-resolved chain refuses a continuation up front instead of
+ * handing back one that could never resolve anything, and so an
+ * idempotent re-send of a completed call can still reproduce its
+ * result. The binding decision remains `claimMrtrChain`.
+ */
+type ResolvedChain = {
+  resolution: "dispatched" | "completed";
+  resolvedByJti: string;
+  resolvedByDigest?: string;
+};
+
+type MrtrChainState =
+  | { status: "open" }
+  | ({ status: "resolved" } & ResolvedChain)
+  | { status: "error" };
+
+async function readMrtrChain(
+  ctx: HandlerCtx,
+  component: ComponentApi,
+  toolName: string,
+  chainKey: string,
+): Promise<MrtrChainState> {
+  try {
+    const row = await ctx.runQuery(component.mrtr.getChainResolution, {
+      chainKey,
+    });
+    return row === null ? { status: "open" } : { status: "resolved", ...row };
+  } catch (err) {
+    console.error(
+      "[mcp-gateway] MRTR chain lookup failed to run (is the component " +
+        "deployment up to date?)",
+      toolName,
+      err,
+    );
+    return { status: "error" };
+  }
 }
 
 let warnedRequireAuthWithoutOAuth = false;
@@ -3065,6 +3203,17 @@ async function handlePost(
       // and anonymous callers went through the audited 401 path above.
       let continuation: VerifiedMrtrState | null = null;
       let mrtrArgsDigest: string | null = null;
+      // A chain resolves exactly once, and remembers WHICH continuation
+      // resolved it. Only that continuation may reproduce the outcome
+      // (a client whose response was lost); every sibling is refused,
+      // including one re-sent byte-identically, because its hook output
+      // is not the settled result. Re-read after `beforeCall`, which is
+      // an await point another branch can resolve the chain across.
+      let chain: MrtrChainState = { status: "open" };
+      // Digest of THIS request's `inputResponses` (absent when it
+      // carries none). Compared against the digest the chain recorded
+      // when it resolved, so a repeat has to present the same answer.
+      let requestDigest: string | undefined;
       if (
         isModern &&
         (requestState !== undefined || inputResponses !== undefined)
@@ -3146,15 +3295,18 @@ async function handlePost(
         // cannot RUN (e.g. the component deployment predates the
         // mrtrRedemptions table) is a logged -32603, not a raw 500 that
         // skips the CORS wrapper.
+        if (inputResponses !== undefined) {
+          requestDigest = await sha256Base64Url(stableJson(inputResponses));
+        }
         let redemption: "fresh" | "replay" | "conflict";
         try {
           redemption = await ctx.runMutation(
             component.mrtr.redeemContinuation,
             {
               jti: continuation.jti,
-              responsesDigest: await sha256Base64Url(
-                stableJson(inputResponses ?? null),
-              ),
+              ...(requestDigest !== undefined
+                ? { responsesDigest: requestDigest }
+                : {}),
               expiresAt: continuation.exp,
             },
           );
@@ -3203,6 +3355,47 @@ async function handlePost(
       // never silently bypassed: when it demands input and the request
       // cannot carry a continuation (legacy protocol, or `mrtr` not
       // configured), the call fails closed instead of dispatching.
+      //
+      // A chain resolves exactly once. Read that state up front for a
+      // verified continuation, so an already-resolved chain refuses the
+      // outcomes that would re-open it (another input round, or a
+      // dispatch) while still letting an idempotent re-send of a
+      // completed call reproduce its result.
+      if (beforeCall && continuation) {
+        const read = await readMrtrChain(
+          ctx,
+          component,
+          tool.name,
+          continuation.idempotencyKey,
+        );
+        if (read.status === "error") {
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR verification failed",
+          );
+          break;
+        }
+        chain = read;
+      }
+      // Refuse a superseded continuation BEFORE running the host hook.
+      // Only the continuation that actually resolved the chain has
+      // anything to reproduce; every other branch is answering a
+      // decision that is over, and running arbitrary client-chosen
+      // `inputResponses` through host code just to discard the result
+      // is work nobody asked for. `beforeCall` is not documented as
+      // side-effect-free, so do not call it.
+      if (
+        continuation &&
+        chain.status === "resolved" &&
+        !(
+          chain.resolvedByJti === continuation.jti &&
+          chain.resolvedByDigest === requestDigest
+        )
+      ) {
+        body = alreadyResolvedEnvelope(message.id, tool.name);
+        break;
+      }
       if (beforeCall) {
         // Digest BEFORE the hook, over the client-sent (stripped)
         // arguments: a hook that mutates even a nested value of its
@@ -3259,6 +3452,87 @@ async function handlePost(
             );
             break;
           }
+          // Terminal for the whole chain, so claim it before answering.
+          // Only a continuation can be forked; a first call has no
+          // earlier round to replay.
+          //
+          // A chain already resolved by a *completion* may reproduce
+          // that result: the hook is deterministic over the same
+          // inputs, so an idempotent re-send (a client whose response
+          // was lost) legitimately gets its answer again. One resolved
+          // by a dispatch may not: the tool has run, and telling the
+          // caller "declined" afterwards would be a lie.
+          if (continuation) {
+            const fresh = await readMrtrChain(
+              ctx,
+              component,
+              tool.name,
+              continuation.idempotencyKey,
+            );
+            if (fresh.status === "error") {
+              body = jsonErrorEnvelope(
+                message.id,
+                INTERNAL_ERROR,
+                "MRTR verification failed",
+              );
+              break;
+            }
+            chain = fresh;
+          }
+          if (continuation) {
+            // Reproducing a completion is legitimate for exactly one
+            // continuation: the one that resolved the chain, re-sent
+            // after its response was lost. Any sibling would be handing
+            // the caller its own hook output as the settled result.
+            const mayRepeat =
+              chain.status === "resolved" &&
+              isChainRepeat(
+                chain,
+                continuation.jti,
+                requestDigest,
+                "completed",
+              );
+            if (!mayRepeat) {
+              const claim =
+                chain.status === "resolved"
+                  ? { ...chain, status: "lost" as const }
+                  : await claimMrtrChain(
+                      ctx,
+                      component,
+                      tool.name,
+                      continuation.idempotencyKey,
+                      continuation.jti,
+                      requestDigest,
+                      "completed",
+                      Date.now() + MRTR_MAX_TTL_MS + MRTR_CLAIM_SLACK_MS,
+                    );
+              if (claim.status === "error") {
+                body = jsonErrorEnvelope(
+                  message.id,
+                  INTERNAL_ERROR,
+                  "MRTR verification failed",
+                );
+                break;
+              }
+              // Losing to a concurrent send of this very continuation
+              // with this very answer is the same lost-response retry,
+              // just interleaved. Refusing it would push the client to
+              // start a new chain, i.e. a new idempotency key, i.e. the
+              // duplicate the key exists to prevent.
+              if (
+                claim.status === "lost" &&
+                !isChainRepeat(
+                  claim,
+                  continuation.jti,
+                  requestDigest,
+                  "completed",
+                )
+              ) {
+                body = alreadyResolvedEnvelope(message.id, tool.name);
+                break;
+              }
+            }
+          }
           body = jsonResultEnvelope(message.id, requested.result);
           break;
         }
@@ -3280,6 +3554,35 @@ async function handlePost(
               INTERNAL_ERROR,
               "MRTR beforeCall returned an invalid result",
             );
+            break;
+          }
+          // Asking again on a chain that already resolved would mint a
+          // fresh continuation for a decision that is over: exactly the
+          // sibling an attacker needs. Re-read rather than trusting the
+          // pre-hook snapshot, because `beforeCall` is an await point
+          // another branch can resolve the chain across, and the
+          // continuation minted here would outlive that branch's claim.
+          // No repeat case applies: asking again is never a
+          // reproduction of a terminal outcome.
+          if (continuation) {
+            const fresh = await readMrtrChain(
+              ctx,
+              component,
+              tool.name,
+              continuation.idempotencyKey,
+            );
+            if (fresh.status === "error") {
+              body = jsonErrorEnvelope(
+                message.id,
+                INTERNAL_ERROR,
+                "MRTR verification failed",
+              );
+              break;
+            }
+            chain = fresh;
+          }
+          if (chain.status === "resolved") {
+            body = alreadyResolvedEnvelope(message.id, tool.name);
             break;
           }
           if (!isModern) {
@@ -3402,6 +3705,84 @@ async function handlePost(
             );
           }
           break;
+        }
+      }
+
+      // Dispatch resolves the chain, so claim it first: the claim is
+      // the decision, not a record of one. Without this, a replay that
+      // re-runs the hook mints an unpinned sibling continuation that
+      // stays answerable after another branch already resolved, and a
+      // captured `requestState` could still turn a decline into a
+      // dispatch. Claiming also makes dispatch at-most-once per chain
+      // gateway-side, ahead of the tool's own idempotency key.
+      // A chain resolved by a dispatch may dispatch again: that is the
+      // idempotent replay of an accept whose response was lost, and the
+      // mandatory `mrtrArgs` key is what stops the tool double-applying
+      // it. A chain resolved by a *completion* may not: turning a
+      // settled decline into a run is precisely the flip being
+      // prevented.
+      if (beforeCall && continuation) {
+        const fresh = await readMrtrChain(
+          ctx,
+          component,
+          tool.name,
+          continuation.idempotencyKey,
+        );
+        if (fresh.status === "error") {
+          body = jsonErrorEnvelope(
+            message.id,
+            INTERNAL_ERROR,
+            "MRTR verification failed",
+          );
+          break;
+        }
+        chain = fresh;
+        // Only the continuation that dispatched may dispatch again,
+        // which is the lost-response retry the tool deduplicates via
+        // its injected idempotency key. Everything else claims, and
+        // losing the claim means another branch settled this chain
+        // first: there is no idempotent case for a second dispatch.
+        const mayRepeat =
+          chain.status === "resolved" &&
+          isChainRepeat(chain, continuation.jti, requestDigest, "dispatched");
+        if (!mayRepeat) {
+          const claim =
+            chain.status === "resolved"
+              ? { ...chain, status: "lost" as const }
+              : await claimMrtrChain(
+                  ctx,
+                  component,
+                  tool.name,
+                  continuation.idempotencyKey,
+                  continuation.jti,
+                  requestDigest,
+                  "dispatched",
+                  Date.now() + MRTR_MAX_TTL_MS + MRTR_CLAIM_SLACK_MS,
+                );
+          if (claim.status === "error") {
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR verification failed",
+            );
+            break;
+          }
+          // As on the completion path: losing to a concurrent send of
+          // the same continuation with the same answer is that same
+          // retry, and dispatching it again under the unchanged chain
+          // key is what the tool deduplicates on.
+          if (
+            claim.status === "lost" &&
+            !isChainRepeat(
+              claim,
+              continuation.jti,
+              requestDigest,
+              "dispatched",
+            )
+          ) {
+            body = alreadyResolvedEnvelope(message.id, tool.name);
+            break;
+          }
         }
       }
 

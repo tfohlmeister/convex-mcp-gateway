@@ -55,7 +55,7 @@ client class.
 
 ![Component data model](./diagrams/data-model.svg)
 
-Seven tables, all owned by the component:
+Nine tables, all owned by the component:
 
 - `tools` is a per-tool row keyed by `name`. `functionHandle` is the
   opaque reference returned by `createFunctionHandle(fn)` and dispatched
@@ -77,6 +77,10 @@ Seven tables, all owned by the component:
   their read functions are executable handles.
 - `subscriptions` records legacy resource subscription intent. The component
   does not provide a durable push connection; hosts own notification delivery.
+- `mrtrRedemptions` and `mrtrChains` back the multi-round-trip guarantees
+  below: one row per redeemed continuation id, and one row per resolved
+  chain. Both are TTL-bounded and drained by the same
+  `gateway.pruneMrtrRedemptions` cron.
 
 ## MCP Streamable HTTP transport
 
@@ -143,21 +147,67 @@ continuation id. On retry it verifies all of these, then **redeems the
 continuation id once** in the component's `mrtrRedemptions` table:
 re-sending byte-identical responses is an idempotent replay, while the
 same continuation replayed with different responses is rejected. Hosts
-prune expired redemption rows with `gateway.pruneMrtrRedemptions` from a
-cron.
+prune expired redemption rows and chain claims with
+`gateway.pruneMrtrRedemptions` from a cron.
 
-State that guarantee precisely, because it is narrower than it looks:
-**a continuation that was itself already answered cannot be answered
-differently.** It is not a guarantee about the chain. The `jti` is fresh
-per round, so every `inputRequired()` seals an independent continuation
-with no redemption row of its own, and any path that makes the hook ask
-again (an idempotent replay, or a state-only retry of an unanswered
-round) forks a new unpinned branch that can still be answered after a
-sibling resolved. Tracked in
-[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27);
-until it is fixed, treat the redemption table as replay protection for a
-single continuation, not as a resolved-decision lock for the chain, and
-rely on the tool's own idempotency key for anything durable.
+That covers one continuation. It cannot make a *decision* final on its
+own, because `jti` is fresh per round: every `inputRequired()` seals an
+independent continuation with no redemption row of its own, so any path
+that makes the hook ask again would otherwise fork a branch that is
+still answerable after a sibling already resolved the call.
+
+**A chain therefore resolves exactly once**, tracked separately in the
+component's `mrtrChains` table, keyed by the chain's idempotency key
+(stable across every round, unlike `jti`). The gateway claims the chain
+immediately *before* it dispatches or finishes the call via
+`completeCall()`, so the claim is the decision rather than a record of
+one, and the claim is what every later continuation of that chain runs
+into:
+
+The chain row records both **how** it was resolved and **which
+continuation** resolved it, and the rule follows from that: only the
+resolving continuation may reproduce its own outcome, and nothing may
+change it.
+
+- **Asking again** on a resolved chain is refused. The decision is over,
+  so the forked branch is never handed out in the first place.
+- **Re-sending the resolving continuation with the same answer**
+  repeats its outcome. A client whose response was lost dispatches again
+  under the same idempotency key (which is what keeps the tool from
+  double-applying) instead of getting an error. Note what "repeats"
+  means for a completion: the hook runs again and its output is
+  returned, so a hook that reads state outside the chain may word the
+  answer differently. The decision class cannot change; the message is
+  not replayed from storage.
+- **Every other continuation** is refused, including one re-sent
+  byte-identically, and so is the resolving continuation re-sent with a
+  *different* answer. A sibling's hook output is not the settled result:
+  a hook that reads state outside the chain will answer a stale round
+  differently, and passing that off as the resolution would report an
+  outcome that never happened.
+
+That last point is why the row stores the resolving `jti` rather than
+just a flag. "Was this continuation re-sent?" is a question a sibling
+also answers yes to; "is this the continuation that settled the chain?"
+is not.
+
+Each of the three terminal decisions re-reads the chain **after**
+`beforeCall` returns, because the hook is an await point another branch
+can resolve the chain across, and a continuation sealed from stale state
+would outlive that branch's claim. A superseded continuation is refused
+before the hook runs at all, so host code is not executed for a decision
+that is over.
+
+Two branches racing before either resolves is possible and intended:
+whoever claims first wins, and the loser is refused.
+
+The claim is written with the TTL **ceiling**, not with the expiry of
+the continuation that resolved the chain. Siblings forked earlier expire
+later, so a claim scoped to the resolving continuation would be pruned
+while one of them is still valid and could resolve the chain a second
+time; `claimChain` raises an existing row's window and never shortens
+it. Claims drain through `gateway.pruneMrtrRedemptions` alongside the
+redemption rows, so hosts wire one cron, not two.
 
 Because a redeemed replay re-runs the hook and dispatches again,
 `defineMcpMutation` and `defineMcpAction` configs that pass `beforeCall`
@@ -181,10 +231,9 @@ the current request's `clientCapabilities` before returning input
 requests (per elicitation mode, accumulated across all requests of the
 round) and reports `-32021` carrying only the missing capabilities. A
 misconfigured signing secret surfaces as `-32603`, never as a client
-error. State-only continuations remain valid without `inputResponses`,
-but such a retry redeems the continuation with an empty answer, so the
-real responses must arrive on a fresh call rather than on that same
-state (see #27).
+error. State-only continuations remain valid without `inputResponses`:
+carrying no answer decides nothing, so such a retry is not redeemed and
+does not burn the continuation for the answer that follows.
 
 Audit posture, stated explicitly: rounds that end gateway-side (an
 `input_required` response, a declined confirmation completed by the
@@ -257,7 +306,7 @@ not follow references, so storing the resolved schema guarantees an
 annotation validated at registration is the same one enforced per call,
 and clients that do not resolve references still get a usable schema.
 
-Two properties keep that honest. Resolution is reachability-driven —
+Two properties keep that honest. Resolution is reachability-driven:
 definition containers are consumed on demand and dropped from the
 output, so an unused definition (a recursive type or remote `$ref` in a
 generated bundle) can neither fail the catalog nor consume budget. And a

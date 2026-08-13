@@ -2960,6 +2960,57 @@ describe("MRTR (modern, e2e)", () => {
     expect(executions).toHaveLength(1);
   });
 
+  test("a settled decline cannot be flipped through a forked sibling", async () => {
+    const t = newTest();
+    const invoiceId = await seedInvoice(t);
+
+    const first = (await (
+      await mrtrRpc(t, 1, { arguments: { id: invoiceId } })
+    ).json()) as MrtrBody;
+    const c1 = first.result!.requestState;
+
+    // A state-only retry forks a second, independently sealed
+    // continuation of the same chain while nothing is decided yet.
+    const resumed = (await (
+      await mrtrRpc(t, 2, { arguments: { id: invoiceId }, requestState: c1 })
+    ).json()) as MrtrBody;
+    const sibling = resumed.result!.requestState;
+    expect(sibling).toBeDefined();
+    expect(sibling).not.toBe(c1);
+
+    // The user declines on the original continuation.
+    const declined = (await (
+      await mrtrRpc(t, 3, {
+        arguments: { id: invoiceId },
+        requestState: c1,
+        inputResponses: { confirm: { action: "decline" } },
+      })
+    ).json()) as MrtrBody;
+    expect(declined.result?.content?.[0]?.text).toBe(
+      "Invoice was not archived.",
+    );
+
+    // The sibling is a different jti, so per-continuation redemption
+    // has nothing to say about it. Only the chain claim stops it, and
+    // this is the layer where the real component enforces that.
+    const flipped = (await (
+      await mrtrRpc(t, 4, {
+        arguments: { id: invoiceId },
+        requestState: sibling,
+        inputResponses: {
+          confirm: { action: "accept", content: { confirm: true } },
+        },
+      })
+    ).json()) as MrtrBody;
+    expect(flipped.error?.code).toBe(-32602);
+    expect(
+      await t.run(async (ctx) => ctx.db.query("mrtrExecutions").collect()),
+    ).toHaveLength(0);
+    expect(
+      await t.run(async (ctx) => ctx.db.get("invoices", invoiceId)),
+    ).toMatchObject({ status: "open" });
+  });
+
   test("decline finishes gateway-side and cannot be replayed into an accept", async () => {
     const t = newTest();
     const invoiceId = await seedInvoice(t);

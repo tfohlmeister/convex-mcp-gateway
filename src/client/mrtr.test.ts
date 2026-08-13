@@ -43,7 +43,11 @@ function component() {
       runTool: Symbol("runTool"),
       recordAuthDenial: Symbol("recordAuthDenial"),
     },
-    mrtr: { redeemContinuation: Symbol("redeemContinuation") },
+    mrtr: {
+      redeemContinuation: Symbol("redeemContinuation"),
+      claimChain: Symbol("claimChain"),
+      getChainResolution: Symbol("getChainResolution"),
+    },
     sessions: {
       getSession: Symbol("getSession"),
       touchSession: Symbol("touchSession"),
@@ -123,26 +127,84 @@ function harness(overrides: { tool?: unknown; oauthConfig?: unknown } = {}) {
   const dispatched: Record<string, unknown>[] = [];
   const denials: Record<string, unknown>[] = [];
   const redemptions = new Map<string, string>();
+  // Chain claims model `expiresAt` too, so a test can drive the prune
+  // and prove the claim outlives every continuation of its chain. A map
+  // without expiry cannot express that failure at all.
+  const chains = new Map<
+    string,
+    {
+      resolution: string;
+      resolvedByJti: string;
+      resolvedByDigest?: string;
+      expiresAt: number;
+    }
+  >();
+  /** Mirrors `pruneMrtrRedemptions`: drop claims that expired before `now`. */
+  const pruneChains = (now: number) => {
+    for (const [key, row] of chains) {
+      if (row.expiresAt < now) chains.delete(key);
+    }
+  };
   const ctx = {
-    runQuery: async (ref: unknown) => {
+    runQuery: async (ref: unknown, args: Record<string, unknown> = {}) => {
       if (ref === api.registry.getTool) {
         return overrides.tool ?? registeredTool;
       }
       if (ref === api.registry.getOAuthConfig) {
         return overrides.oauthConfig ?? null;
       }
+      if (ref === api.mrtr.getChainResolution) {
+        const row = chains.get(args.chainKey as string);
+        if (!row) return null;
+        return {
+          resolution: row.resolution,
+          resolvedByJti: row.resolvedByJti,
+          ...(row.resolvedByDigest !== undefined
+            ? { resolvedByDigest: row.resolvedByDigest }
+            : {}),
+        };
+      }
       throw new Error("unexpected query");
     },
     runMutation: async (ref: unknown, args: Record<string, unknown>) => {
       if (ref === api.mrtr.redeemContinuation) {
         const jti = args.jti as string;
-        const digest = args.responsesDigest as string;
+        const digest = args.responsesDigest as string | undefined;
+        // No responses decides nothing, so nothing is pinned.
+        if (digest === undefined) return "fresh";
         const existing = redemptions.get(jti);
         if (existing === undefined) {
           redemptions.set(jti, digest);
           return "fresh";
         }
         return existing === digest ? "replay" : "conflict";
+      }
+      if (ref === api.mrtr.claimChain) {
+        const chainKey = args.chainKey as string;
+        // Mirrors the component: losing the claim reports the WINNER's
+        // resolution, so the handler can tell an idempotent repeat from
+        // a cross-resolution flip, and never shortens the window.
+        const existing = chains.get(chainKey);
+        const expiresAt = args.expiresAt as number;
+        if (existing !== undefined) {
+          if (expiresAt > existing.expiresAt) existing.expiresAt = expiresAt;
+          return {
+            resolution: existing.resolution,
+            resolvedByJti: existing.resolvedByJti,
+            ...(existing.resolvedByDigest !== undefined
+              ? { resolvedByDigest: existing.resolvedByDigest }
+              : {}),
+          };
+        }
+        chains.set(chainKey, {
+          resolution: args.resolution as string,
+          resolvedByJti: args.jti as string,
+          ...(args.responsesDigest !== undefined
+            ? { resolvedByDigest: args.responsesDigest as string }
+            : {}),
+          expiresAt,
+        });
+        return "claimed";
       }
       if (ref === api.dispatch.recordAuthDenial) {
         denials.push(args);
@@ -157,7 +219,7 @@ function harness(overrides: { tool?: unknown; oauthConfig?: unknown } = {}) {
     },
     auth: { getUserIdentity: async () => ({ subject: "user-1" }) },
   };
-  return { api, ctx, dispatched, denials };
+  return { api, ctx, dispatched, denials, pruneChains };
 }
 
 function options(tool: McpToolRegistration, secret = "x".repeat(32)) {
@@ -955,6 +1017,416 @@ describe("continuation integrity", () => {
       await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
     );
     expect(body.error?.code).toBe(-32603);
+    expect(dispatched).toHaveLength(0);
+  });
+});
+
+/**
+ * A chain resolves exactly once. The per-continuation redemption above
+ * cannot provide this: `jti` is fresh per round, so every
+ * `inputRequired()` seals an independent continuation, and any path
+ * that makes the hook ask again forks a branch that no sibling's
+ * redemption covers. See issue #27.
+ */
+describe("chain resolution", () => {
+  /** The confirmation hook shape shipped in README + example. */
+  const confirmHook = async (
+    _ctx: unknown,
+    hookArgs: McpBeforeCallArgs,
+  ): Promise<unknown> => {
+    if (hookArgs.round === undefined) return inputRequired(CONFIRM_REQUEST);
+    const confirm = hookArgs.inputResponses?.confirm as
+      | { action?: string }
+      | undefined;
+    if (confirm === undefined) return inputRequired(CONFIRM_REQUEST);
+    if (confirm.action !== "accept") {
+      return completeCall({
+        content: [{ type: "text", text: "declined" }],
+        isError: false,
+      });
+    }
+    return null;
+  };
+
+  test("a replay cannot fork a branch that outlives the resolved decision", async () => {
+    const { api, ctx, dispatched } = harness();
+    const tool = declarativeTool(
+      confirmHook as McpToolRegistration["beforeCall"],
+    );
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    // Round 1 answered with a payload carrying no usable answer, so the
+    // hook asks again and round 2 mints c2. c1 is pinned with that
+    // payload's digest, which is what makes the replay below "valid".
+    const incomplete = { unrelated: { action: "accept" } };
+    const second = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1, inputResponses: incomplete }),
+        api,
+        options(tool),
+      ),
+    );
+    const c2 = second.result!.requestState!;
+    expect(c2).toBeDefined();
+
+    // The user declines on c2. The chain is now resolved.
+    const declined = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, {
+          requestState: c2,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(declined.result?.content?.[0]?.text).toBe("declined");
+    expect(dispatched).toHaveLength(0);
+
+    // An attacker who captured c1 re-sends it byte-identically. The
+    // redemption calls that an idempotent replay and re-runs the hook,
+    // which asks again: without a chain claim that mints a brand-new,
+    // unpinned continuation the attacker could answer with "accept".
+    const forked = await json(
+      await handleMcpRequest(
+        ctx,
+        request(4, { requestState: c1, inputResponses: incomplete }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(forked.result?.requestState).toBeUndefined();
+    expect(forked.error?.code).toBe(-32602);
+    expect(dispatched).toHaveLength(0);
+
+    // And the already-issued sibling c2 cannot be answered again either.
+    const reused = await json(
+      await handleMcpRequest(
+        ctx,
+        request(5, {
+          requestState: c2,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(reused.error?.code).toBe(-32602);
+    expect(dispatched).toHaveLength(0);
+  });
+
+  test("a state-only retry resumes the chain, and the answer still lands", async () => {
+    const { api, ctx, dispatched } = harness();
+    const tool = declarativeTool(
+      confirmHook as McpToolRegistration["beforeCall"],
+    );
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    // Resuming with state but no answer must not pin the continuation
+    // with an empty answer: nothing has been decided yet.
+    const resumed = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1 }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(resumed.error).toBeUndefined();
+    expect(resumed.result?.requestState).toBeDefined();
+
+    // The real answer arrives on that same continuation and resolves
+    // the chain by dispatching.
+    const accepted = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, {
+          requestState: c1,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(accepted.error).toBeUndefined();
+    expect(dispatched).toHaveLength(1);
+
+    // The sibling minted by the state-only round is refused: only a
+    // byte-identical re-send of the continuation that actually resolved
+    // the chain may repeat the outcome, never a different branch.
+    const sibling = await json(
+      await handleMcpRequest(
+        ctx,
+        request(4, {
+          requestState: resumed.result!.requestState,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(sibling.error?.code).toBe(-32602);
+    expect(dispatched).toHaveLength(1);
+
+    // The continuation that DID resolve it may be re-sent verbatim: a
+    // client whose response was lost dispatches again under the same
+    // chain key, which is what the tool deduplicates on.
+    const lostResponse = await json(
+      await handleMcpRequest(
+        ctx,
+        request(5, {
+          requestState: c1,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(lostResponse.error).toBeUndefined();
+    expect(dispatched).toHaveLength(2);
+    expect(dispatched[1]!.args).toEqual(dispatched[0]!.args);
+  });
+
+  test("a replayed sibling cannot pass its own answer off as the resolution", async () => {
+    const { api, ctx, dispatched } = harness();
+    // A hook whose decision depends on state outside the chain, which
+    // is the realistic case (it reads the database). The same round-1
+    // payload therefore asks again now and completes later.
+    let external: "asking" | "ready" = "asking";
+    const tool = declarativeTool(async (_ctx, hookArgs) => {
+      if (hookArgs.round === undefined) return inputRequired(CONFIRM_REQUEST);
+      const confirm = hookArgs.inputResponses?.confirm as
+        | { action?: string }
+        | undefined;
+      if (external === "asking" && confirm === undefined) {
+        return inputRequired(CONFIRM_REQUEST);
+      }
+      return completeCall({
+        content: [{ type: "text", text: `settled-in-round-${hookArgs.round}` }],
+        isError: false,
+      });
+    });
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    // Round 1 answered with nothing usable, so a sibling c2 is minted.
+    const incomplete = { unrelated: { action: "accept" } };
+    const second = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1, inputResponses: incomplete }),
+        api,
+        options(tool),
+      ),
+    );
+    const c2 = second.result!.requestState!;
+
+    // c2 resolves the chain.
+    const settled = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, {
+          requestState: c2,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(settled.result?.content?.[0]?.text).toBe("settled-in-round-2");
+
+    // Now the same round-1 payload would COMPLETE rather than ask again.
+    external = "ready";
+
+    // Re-sending c1 byte-identically is a genuine redemption "replay",
+    // but c1 is not the continuation that resolved the chain. Handing
+    // back its hook output would report an answer that was never the
+    // settled one.
+    const replayedSibling = await json(
+      await handleMcpRequest(
+        ctx,
+        request(4, { requestState: c1, inputResponses: incomplete }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(replayedSibling.result?.content?.[0]?.text).not.toBe(
+      "settled-in-round-1",
+    );
+    expect(replayedSibling.error?.code).toBe(-32602);
+
+    // The continuation that DID resolve it still reproduces its result.
+    const lostResponse = await json(
+      await handleMcpRequest(
+        ctx,
+        request(5, {
+          requestState: c2,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(lostResponse.result?.content?.[0]?.text).toBe("settled-in-round-2");
+    expect(dispatched).toHaveLength(0);
+  });
+
+  test("a state-only chain can still retry its lost response", async () => {
+    const { api, ctx, dispatched } = harness();
+    // Resolves on state alone: no inputResponses ever, so there is no
+    // redemption row to recognise the retry by.
+    const tool = declarativeTool(async (_ctx, hookArgs) =>
+      hookArgs.round === undefined ? inputRequired(CONFIRM_REQUEST) : null,
+    );
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    const dispatchedOnce = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1 }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(dispatchedOnce.error).toBeUndefined();
+    expect(dispatched).toHaveLength(1);
+
+    // The client never saw the response and retries the same state. It
+    // must dispatch again under the SAME chain key, which is what the
+    // tool deduplicates on, rather than being told to start over (which
+    // would mint a new key and re-apply the side effect for real).
+    const retried = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, { requestState: c1 }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(retried.error).toBeUndefined();
+    expect(dispatched).toHaveLength(2);
+    expect(dispatched[1]!.args).toEqual(dispatched[0]!.args);
+  });
+
+  test("the claim outlives every continuation, so pruning cannot re-open it", async () => {
+    const { api, ctx, dispatched, pruneChains } = harness();
+    const tool = declarativeTool(
+      confirmHook as McpToolRegistration["beforeCall"],
+    );
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    // A state-only retry forks a sibling LATER than c1, so the sibling
+    // stays cryptographically valid after c1 has expired. If the claim
+    // were written with the resolving continuation's expiry, the prune
+    // would drop it while this sibling can still be answered.
+    const resumed = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1 }),
+        api,
+        options(tool),
+      ),
+    );
+    const sibling = resumed.result!.requestState!;
+
+    // The user declines on c1, resolving the chain.
+    const declined = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, {
+          requestState: c1,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(declined.result?.content?.[0]?.text).toBe("declined");
+
+    // Run the prune well past c1's own five-minute expiry. The claim
+    // must survive: the sibling has not expired yet.
+    pruneChains(Date.now() + 10 * 60 * 1000);
+
+    const flipped = await json(
+      await handleMcpRequest(
+        ctx,
+        request(4, {
+          requestState: sibling,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(flipped.error?.code).toBe(-32602);
+    expect(dispatched).toHaveLength(0);
+  });
+
+  test("a settled decline cannot be dispatched through a sibling", async () => {
+    const { api, ctx, dispatched } = harness();
+    const tool = declarativeTool(
+      confirmHook as McpToolRegistration["beforeCall"],
+    );
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const c1 = first.result!.requestState!;
+
+    // A state-only retry forks a sibling while nothing is decided yet.
+    const resumed = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, { requestState: c1 }),
+        api,
+        options(tool),
+      ),
+    );
+    const sibling = resumed.result!.requestState!;
+
+    // The user declines on the original continuation.
+    const declined = await json(
+      await handleMcpRequest(
+        ctx,
+        request(3, {
+          requestState: c1,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(declined.result?.content?.[0]?.text).toBe("declined");
+
+    // Answering the sibling with an accept must not run the tool: that
+    // is the decline-to-accept flip, taken through a forked branch.
+    const flipped = await json(
+      await handleMcpRequest(
+        ctx,
+        request(4, {
+          requestState: sibling,
+          inputResponses: { confirm: { action: "accept" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(flipped.error?.code).toBe(-32602);
     expect(dispatched).toHaveLength(0);
   });
 });

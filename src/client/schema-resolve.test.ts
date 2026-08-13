@@ -191,7 +191,7 @@ describe("resolveJsonSchemaBounded", () => {
 
   test("a ref-shaped object in a data position is rejected once resolution runs", () => {
     // With a real reference present, the definition containers are
-    // dropped — so a ref-shaped OBJECT parked in a data keyword can no
+    // dropped, so a ref-shaped OBJECT parked in a data keyword can no
     // longer be resolved against anything. Rather than ship it dangling,
     // resolution fails by path. (Such a schema is unstorable in Convex
     // anyway: `$ref` as a field name is rejected at the boundary.)
@@ -295,7 +295,7 @@ describe("resolveJsonSchemaBounded", () => {
   test("the walk does not pollute prototypes on a __proto__ key", () => {
     // `setOwn` keeps a `__proto__` key as an own property instead of
     // hitting the inherited setter, so the walk cannot be steered into
-    // prototype pollution. NOTE: this is a property of the walk only —
+    // prototype pollution. NOTE: this is a property of the walk only:
     // Convex's own serialization drops a `__proto__` field at the
     // storage boundary, so end to end such a field does not survive
     // registration. Do not read this as an end-to-end guarantee.

@@ -665,8 +665,8 @@ const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]
  * resolution is reachability-driven, so an entry is only resolved (and
  * only charged against the expansion budget) when something actually
  * references it. Walking them eagerly would let an unused authoring
- * artefact in a generated bundle — a self-referential type, a remote
- * `$ref`, or simply many definitions — fail a schema whose resolved
+ * artefact in a generated bundle (a self-referential type, a remote
+ * `$ref`, or simply many definitions) fail a schema whose resolved
  * form is perfectly fine, and a declarative sync is all-or-nothing.
  */
 const DEFINITION_CONTAINER_KEYWORDS = new Set(["$defs", "definitions"]);
@@ -809,8 +809,8 @@ export type ResolvedJsonSchema =
  *   binding guarantee) ends.
  * - Resolution is **reachability-driven**: definition containers
  *   (`$defs`, `definitions`) are never walked as output, only pulled
- *   from when something references them. An unused definition — a
- *   self-referential type or a remote `$ref` in a generated bundle —
+ *   from when something references them. An unused definition (a
+ *   self-referential type or a remote `$ref` in a generated bundle)
  *   therefore cannot fail a schema whose resolved form is fine, and the
  *   expansion budget counts only definitions that end up in the output.
  * - Expansion is bounded three ways: traversal depth (each nesting
@@ -825,8 +825,8 @@ export type ResolvedJsonSchema =
  *   `$ref` through: the advertised schema works for every client, and
  *   the runtime `Mcp-Param-*` walk sees exactly what was validated at
  *   registration). A reference that survives resolution anywhere in the
- *   output — e.g. under a keyword the walker does not treat as a schema
- *   position, or inside a nested definition container — is rejected by
+ *   output (e.g. under a keyword the walker does not treat as a schema
+ *   position, or inside a nested definition container) is rejected by
  *   name rather than shipped dangling.
  */
 export function resolveJsonSchemaBounded(schema: unknown): ResolvedJsonSchema {
@@ -945,8 +945,8 @@ export function resolveJsonSchemaBounded(schema: unknown): ResolvedJsonSchema {
   }
   // No-dangling-ref guard. Position-INDEPENDENT by design (see
   // `findRefLikePath`): the definition containers are gone from the
-  // output, so any surviving reference — under a keyword the walker
-  // treats as data, or inside a nested definition container — would
+  // output, so any surviving reference (under a keyword the walker
+  // treats as data, or inside a nested definition container) would
   // otherwise ship unresolvable. Reject it by path instead.
   const danglingPath = findRefLikePath(resolved);
   if (danglingPath !== null) {

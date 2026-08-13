@@ -229,8 +229,8 @@ Base64-encoded routing headers must decode to at most 8 KiB of valid UTF-8
 without control characters.
 
 Tool schemas may use local `#/$defs/<name>` references: registration
-resolves them within hard budgets (traversal depth 64 — one unit per
-nesting level of the schema tree — 64 `$ref` expansions, and 64 KiB of
+resolves them within hard budgets (traversal depth 64, one unit per
+nesting level of the schema tree; 64 `$ref` expansions; and 64 KiB of
 UTF-8 in the resolved result; cycles rejected by name) and
 stores/advertises the **inlined**, self-contained schema, so clients
 never need `$ref` support and the runtime `Mcp-Param-*` walk sees exactly
@@ -240,8 +240,8 @@ such a reference therefore works, as long as it lands on a plain
 
 Resolution is **reachability-driven**: definition containers (`$defs`,
 `definitions`) are pulled from only when referenced and dropped from the
-output, so an unused authoring artefact in a generated bundle — a
-self-referential type, a remote `$ref`, or simply many definitions —
+output, so an unused authoring artefact in a generated bundle (a
+self-referential type, a remote `$ref`, or simply many definitions)
 cannot fail a schema whose resolved form is fine, and the expansion
 budget counts only what ends up advertised. Everything else stays
 deliberately out: remote (`https:`) references are never fetched, `$ref`
@@ -350,14 +350,16 @@ TTL, binding it to the tool name, original public arguments, authenticated
 caller subject, and a per-round continuation id. Each continuation is
 additionally **redeemed once server-side**: re-sending the same responses is an
 idempotent replay, but that same continuation replayed with a different answer
-(decline to accept) is rejected. The guarantee is per continuation, not per
-chain: because each round seals a fresh continuation id, a replay that makes
-the hook ask again forks a branch that is not covered by a sibling's
-redemption. See
-[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27); until that
-is fixed, tools that must not run twice should rely on the injected idempotency
-key rather than on the redemption table. Chains may run multiple rounds (asking again for
-missing input, per the spec's error-handling guidance) up to a hard ceiling.
+(decline to accept) is rejected. On top of that a **chain resolves exactly
+once**: the gateway claims the chain before it dispatches or finishes the call,
+recording which continuation resolved it and with which answer. Re-sending that
+same continuation and answer repeats the outcome, so a lost response still
+retries cleanly: an accepted call dispatches again under the same idempotency
+key, and a completed one re-runs the hook rather than erroring. Every other continuation of the chain is refused, including one
+re-sent byte-identically, and asking again is refused outright, so a branch
+forked by replaying an earlier round is never handed out and a settled decline
+cannot be turned into a dispatch. Chains may run multiple rounds (asking again for missing input, per
+the spec's error-handling guidance) up to a hard ceiling.
 
 The hook receives the client's untrusted `inputResponses` and decoded `state`;
 neither is ever injected into the Convex function. Only the chain's stable
@@ -365,7 +367,7 @@ idempotency key is, via `mrtrArgs`, and it is audited like any other argument.
 Persist it around the tool's side effect for durable replay protection. The
 state is signed, not encrypted, so never put credentials or other secrets in
 it. Wire `gateway.pruneMrtrRedemptions` into a cron to drop expired
-redemption rows.
+redemption rows and resolved-chain claims.
 
 Safety properties: the hook runs only for `tools` passed to
 `handleMcpRequest`, and a registry row registered as MRTR-gated (a hook, or
@@ -376,10 +378,9 @@ unconfirmed. MRTR tools require an authenticated caller on every transport
 row). The gateway returns `-32021` (listing only the missing entries, per
 mode for elicitation) rather than sending input requests for a capability
 absent from that request's `clientCapabilities`, and supports state-only
-retries without `inputResponses` (note that such a retry pins the continuation
-with an empty answer, so send the real responses on a fresh call instead of
-resuming that same state, see
-[#27](https://github.com/tfohlmeister/convex-mcp-gateway/issues/27)). Required input is never silently bypassed:
+retries without `inputResponses`: such a retry decides nothing, so it is not
+redeemed and never burns the continuation for the answer that follows.
+Required input is never silently bypassed:
 the hook also runs for legacy 2025-era requests, and when it demands input
 there (or when `mrtr` is not configured), the call fails closed instead of
 dispatching. Note that rounds that end gateway-side (an `input_required`

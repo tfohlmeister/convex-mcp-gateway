@@ -1376,11 +1376,18 @@ export class McpGateway {
   }
 
   /**
-   * Drop MRTR one-time-redemption rows whose continuation has expired
-   * (the sealed state they guard can no longer verify). Bounded per
-   * call; drains by looping until a call deletes nothing. Wire it into
-   * the same cron as `pruneAuditEntries` when the `mrtr` option is
-   * enabled.
+   * Drop expired MRTR bookkeeping: one-time-redemption rows whose
+   * continuation has expired, and resolved-chain claims past their
+   * window. Both drain through this one call, so hosts wire a single
+   * cron. A chain claim is deliberately written with the TTL ceiling
+   * rather than the expiry of the continuation that resolved it: it has
+   * to outlive every continuation of that chain, or pruning it would
+   * let a still-valid sibling resolve the chain a second time. Draining
+   * on a schedule is safe; shortening that window is not.
+   *
+   * Bounded per call; drains by looping until a call deletes nothing.
+   * Wire it into the same cron as `pruneAuditEntries` when the `mrtr`
+   * option is enabled.
    */
   async pruneMrtrRedemptions(ctx: RunMutationCtx): Promise<number> {
     let total = 0;
