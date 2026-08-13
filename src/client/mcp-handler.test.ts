@@ -41,6 +41,10 @@ function createComponent() {
     audit: {
       recordResourceEntry: Symbol("recordResourceEntry"),
     },
+    dispatch: {
+      runTool: Symbol("runTool"),
+      recordAuthDenial: Symbol("recordAuthDenial"),
+    },
   } as unknown as ComponentApi;
 }
 
@@ -55,6 +59,12 @@ type RegisteredTool = {
 };
 
 function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
+  // What `dispatch.runTool` answers. Tests that exercise a dispatch set
+  // this; everything else never reaches it.
+  let dispatchResult: unknown = {
+    ok: false as const,
+    error: { code: -32000, message: "no dispatch result configured" },
+  };
   let resourcesFingerprint: string | null = null;
   let resources: Array<{
     uri: string;
@@ -204,7 +214,10 @@ function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
         }
         throw new Error("unexpected mutation");
       },
-      runAction: async () => {
+      runAction: async (ref: unknown) => {
+        if (ref === component.dispatch.runTool) {
+          return dispatchResult;
+        }
         throw new Error("unexpected action");
       },
       auth: {
@@ -224,6 +237,9 @@ function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
       return resourceTemplates;
     },
     resourceAuditEntries,
+    setDispatchResult(value: unknown) {
+      dispatchResult = value;
+    },
   };
 }
 
@@ -3889,3 +3905,76 @@ describe("resource shape validators", () => {
     );
   });
 });
+
+describe("structuredContent shape on a dispatch", () => {
+  function scalarTool(outputSchema: unknown): RegisteredTool {
+    return {
+      name: "scalar_tool",
+      description: "returns a string",
+      kind: "query",
+      functionHandle: "function://scalar",
+      inputSchema: { type: "object" },
+      outputSchema,
+    };
+  }
+
+  async function call(state: ReturnType<typeof createCtx>, component: ComponentApi) {
+    const response = await handleMcpRequest(
+      state.ctx,
+      modernJsonRpcRequest({
+        id: 1,
+        method: "tools/call",
+        params: { name: "scalar_tool", arguments: {} },
+      }),
+      component,
+      { authorize: async () => ({ allowed: true as const }) },
+    );
+    return (await readJson(response)) as {
+      result?: { content?: { text?: string }[]; structuredContent?: unknown };
+    };
+  }
+
+  test("a scalar return ships as text only, even with an outputSchema", async () => {
+    // MCP models structured output as an object, so stamping a bare
+    // string as `structuredContent` fails a validating client. The task
+    // path applies the same rule, so a tool run either way agrees.
+    const component = createComponent();
+    const state = createCtx(component, [scalarTool({ type: "string" })]);
+    state.setDispatchResult({ ok: true, data: "hello" });
+
+    const body = await call(state, component);
+    expect(body.result?.content?.[0]?.text).toBe(
+      JSON.stringify("hello", null, 2),
+    );
+    expect(body.result).not.toHaveProperty("structuredContent");
+  });
+
+  test("an object return still ships structuredContent", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      scalarTool({ type: "object", properties: { total: { type: "number" } } }),
+    ]);
+    state.setDispatchResult({ ok: true, data: { total: 2 } });
+
+    const body = await call(state, component);
+    expect(body.result?.structuredContent).toEqual({ total: 2 });
+  });
+
+  test("a value that cannot be serialized fails the call instead of the request", async () => {
+    // `v.int64()` is a supported `returns` validator and JSON.stringify
+    // throws on a bigint. Unwrapped, that escaped the switch as a raw
+    // 500 with no JSON-RPC envelope and no CORS headers.
+    const component = createComponent();
+    const state = createCtx(component, [scalarTool(undefined)]);
+    state.setDispatchResult({ ok: true, data: { count: BigInt(7) } });
+
+    const body = (await call(state, component)) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+      error?: unknown;
+    };
+    expect(body.error).toBeUndefined();
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toMatch(/cannot be represented/);
+  });
+});
+
