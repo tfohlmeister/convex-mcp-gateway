@@ -1289,78 +1289,94 @@ describe("tasks: completion and failure", () => {
 });
 
 describe("tasks: executor gate mirrors the synchronous one", () => {
+  /**
+   * Rows are inserted directly, like the sibling executor tests: going
+   * through `createTask` would also SCHEDULE the executor, and the
+   * pending job then writes outside the test transaction.
+   */
+  async function seed(
+    t: ReturnType<typeof newTest>,
+    row: {
+      taskId: string;
+      toolName: string;
+      toolKind: "query" | "mutation" | "action";
+      idempotencyKey: string;
+      mrtrApproved?: boolean;
+    },
+  ) {
+    const now = Date.now();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("tasks", {
+        ...row,
+        ownerSubject: "alice",
+        args: {},
+        status: "working" as const,
+        executor: "component" as const,
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: now + TASK_DEFAULT_TTL_MS,
+      });
+    });
+  }
+
   test("a confirmed task whose row lost mrtrArgs is refused, not dispatched", async () => {
     // The synchronous path refuses a hook without the reserved key at
     // call time, because a replay would dispatch with nothing to
     // deduplicate on. An ordinary redeploy reaches the same state for a
     // queued task, so the executor has to refuse it too.
-    const t = convexTest(schema, modules);
-    await t.run(async (ctx) => {
-      await ctx.runMutation(api.registry.registerTool, {
-        name: "archive",
-        description: "no longer reserves a key",
-        kind: "mutation",
-        functionHandle: "handle-archive",
-        inputSchema: { type: "object" },
-        taskSupport: true,
-      });
-      const created = await ctx.runMutation(api.tasks.createTask, {
-        taskId: "task-mirror-1",
-        ownerSubject: "alice",
-        toolName: "archive",
-        toolKind: "mutation",
-        args: {},
-        idempotencyKey: "key-1",
-        executor: "component",
-        mrtrApproved: true,
-      });
-      expect(created.created).toBe(true);
+    const t = newTest();
+    await t.mutation(api.registry.registerTool, {
+      name: "archive",
+      description: "no longer reserves a key",
+      kind: "mutation",
+      functionHandle: "function://fake-archive",
+      inputSchema: { type: "object" },
+      taskSupport: true,
+    });
+    await seed(t, {
+      taskId: "task-mirror-1",
+      toolName: "archive",
+      toolKind: "mutation",
+      idempotencyKey: "idem-mirror-1",
+      mrtrApproved: true,
     });
 
     await t.action(api.tasks.executeScheduledTask, { taskId: "task-mirror-1" });
 
-    await t.run(async (ctx) => {
-      const task = await ctx.runQuery(api.tasks.getTaskInternal, {
-        taskId: "task-mirror-1",
-      });
-      expect(task?.status).toBe("failed");
-      expect(task?.error?.message).toMatch(/no longer eligible/);
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "task-mirror-1",
+      ownerSubject: "alice",
     });
+    expect(task?.status).toBe("failed");
+    expect(task?.error?.message).toMatch(/no longer eligible/);
   });
 
-  test("a gated QUERY without mrtrArgs still runs", async () => {
-    // `defineMcpQuery({ beforeCall })` is valid without a key, so the
-    // gate must not fail its tasks: the synchronous path runs them.
-    const t = convexTest(schema, modules);
-    await t.run(async (ctx) => {
-      await ctx.runMutation(api.registry.registerTool, {
-        name: "search",
-        description: "gated read, no key by design",
-        kind: "query",
-        functionHandle: "handle-search",
-        inputSchema: { type: "object" },
-        taskSupport: true,
-      });
-      await ctx.runMutation(api.tasks.createTask, {
-        taskId: "task-mirror-2",
-        ownerSubject: "alice",
-        toolName: "search",
-        toolKind: "query",
-        args: {},
-        idempotencyKey: "key-2",
-        executor: "component",
-        mrtrApproved: true,
-      });
+  test("a gated QUERY without mrtrArgs is not refused by that rule", async () => {
+    // `defineMcpQuery({ beforeCall })` is valid with no key, so the gate
+    // must not fail its tasks: the synchronous path runs them.
+    const t = newTest();
+    await t.mutation(api.registry.registerTool, {
+      name: "search",
+      description: "gated read, no key by design",
+      kind: "query",
+      functionHandle: "function://fake-search",
+      inputSchema: { type: "object" },
+      taskSupport: true,
+    });
+    await seed(t, {
+      taskId: "task-mirror-2",
+      toolName: "search",
+      toolKind: "query",
+      idempotencyKey: "idem-mirror-2",
+      mrtrApproved: true,
     });
 
     await t.action(api.tasks.executeScheduledTask, { taskId: "task-mirror-2" });
 
-    await t.run(async (ctx) => {
-      const task = await ctx.runQuery(api.tasks.getTaskInternal, {
-        taskId: "task-mirror-2",
-      });
-      expect(task?.error?.message ?? "").not.toMatch(/no longer eligible/);
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "task-mirror-2",
+      ownerSubject: "alice",
     });
+    expect(task?.error?.message ?? "").not.toMatch(/no longer eligible/);
   });
 });
-
