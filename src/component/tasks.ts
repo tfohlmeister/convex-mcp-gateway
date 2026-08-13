@@ -210,22 +210,35 @@ function byteLength(serialized: string): number {
  * to serialize safely. A too-deep value is treated as over-cap so the
  * caller rejects it cleanly rather than letting the stack overflow.
  */
-/** A value JSON cannot represent, e.g. a `v.int64()` bigint. */
-class TaskUnserializableError extends Error {}
-
 function exceeds(value: unknown, cap: number): boolean {
   try {
     return byteLength(stableStringify(value ?? null)) + binarySize(value) > cap;
   } catch (err) {
     if (err instanceof TaskStringifyDepthError) return true;
     // A value JSON cannot represent at all: `v.int64()` returns a bigint
-    // and `JSON.stringify` throws on it. Rethrowing would strand the row
-    // `working` after the tool already committed, so it is refused, but
-    // the caller reports it as unrepresentable rather than oversized:
-    // telling an operator that seven bytes exceed 256 KiB sends them
-    // hunting for a size problem that does not exist.
-    if (err instanceof TypeError) throw new TaskUnserializableError();
+    // and `JSON.stringify` throws on it. Refused as over-cap so that every
+    // caller reports an outcome; throwing from here would reject the
+    // executor's action and strand the row `working` after the tool
+    // already committed. `completeTask` re-probes with `isUnserializable`
+    // to name the real reason, because telling an operator that seven
+    // bytes exceed 256 KiB sends them hunting for a size problem that
+    // does not exist.
+    if (err instanceof TypeError) return true;
     throw err;
+  }
+}
+
+/**
+ * True when JSON cannot represent `value` at all, e.g. a `v.int64()`
+ * bigint. Only ever called once a cap already reported a refusal, so the
+ * extra serialization pass stays on the failure path.
+ */
+function isUnserializable(value: unknown): boolean {
+  try {
+    stableStringify(value ?? null);
+    return false;
+  } catch (err) {
+    return err instanceof TypeError;
   }
 }
 
@@ -1057,43 +1070,30 @@ export const completeTask = mutation({
       .query("tools")
       .withIndex("by_name", (q: any) => q.eq("name", row.toolName))
       .unique()) as { outputSchema?: unknown } | null;
-    // A tool advertising an `outputSchema` is necessary but not
-    // sufficient: the VALUE has to be shaped like structured output too.
-    // The documented decline (`completeTask(ctx, id, "Declined.")`,
-    // deliberately without `isError`) is a string, and stamping it as
-    // `structuredContent` would ship a payload that violates the tool's
-    // own schema. The synchronous path already refuses exactly that
-    // shape, in `describeCompleteCallResultProblem`: "structuredContent
-    // must be an object or array". Same rule here, or the gateway
-    // forbids inline what it emits from a task.
-    const value = args.result;
-    const structuredShaped =
-      value !== null &&
-      typeof value === "object" &&
-      (Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype);
+    // A tool advertising an `outputSchema` gets a `structuredContent`
+    // block for whatever value it returned, scalars included: the
+    // 2026-07-28 revision types the field as `unknown`, and a validating
+    // client rejects the call outright when a tool with a schema answers
+    // without one. Same rule as the synchronous path, so the two agree.
+    // A host completing with something that is not the tool's output at
+    // all (a declined confirmation) should pass `isError`, which drops
+    // the block instead of shipping a value the schema will refuse.
     const structured =
-      args.isError !== true &&
-      tool?.outputSchema !== undefined &&
-      structuredShaped;
+      args.isError !== true && tool?.outputSchema !== undefined;
     // Both caps are measured here so a value JSON cannot represent is
     // reported as that, rather than as a size the operator would go
     // looking for.
-    let unserializable = false;
-    let valueTooLarge = false;
-    let derivedTooLarge = false;
-    try {
-      valueTooLarge = exceeds(args.result, TASK_MAX_RESULT_BYTES);
-      if (!valueTooLarge) {
-        derivedTooLarge = exceeds(
-          callToolResult(args.result, structured, args.isError === true),
-          TASK_MAX_DERIVED_RESULT_BYTES,
-        );
-      }
-    } catch (err) {
-      if (!(err instanceof TaskUnserializableError)) throw err;
-      unserializable = true;
-    }
-    if (unserializable || valueTooLarge) {
+    const valueTooLarge = exceeds(args.result, TASK_MAX_RESULT_BYTES);
+    // An unrepresentable value always reports over-cap, so the probe only
+    // has to run once a refusal is already certain.
+    const unserializable = valueTooLarge && isUnserializable(args.result);
+    const derivedTooLarge =
+      !valueTooLarge &&
+      exceeds(
+        callToolResult(args.result, structured, args.isError === true),
+        TASK_MAX_DERIVED_RESULT_BYTES,
+      );
+    if (valueTooLarge) {
       const error = {
         code: -32000,
         message: unserializable

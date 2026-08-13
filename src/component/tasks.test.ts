@@ -1303,6 +1303,32 @@ describe("tasks: completion and failure", () => {
     });
   });
 
+  test("requireTaskInput reports an unrepresentable request, never throws", async () => {
+    // `inputRequests` is built by host code, so a bigint read straight off
+    // a Convex document lands here. Every caller of the size check has to
+    // get an OUTCOME back: the one that matters is the executor, which
+    // measures the tool's return value AFTER the call committed, and a
+    // throw there rejects the action and strands the row `working` until
+    // its TTL. This mutation is the reachable proof of the same rule.
+    const t = newTest();
+    await t.run(async (ctx) => {
+      await createTask(ctx);
+      expect(
+        await ctx.runMutation(api.tasks.requireTaskInput, {
+          taskId: "task-1",
+          inputRequests: { confirm: { amount: BigInt(7) } },
+        }),
+      ).toBe("too_large");
+      // Refused, so the row keeps its pre-call state rather than moving
+      // to a round nobody can answer.
+      const task = await ctx.runQuery(api.tasks.getTaskForOwner, {
+        taskId: "task-1",
+        ownerSubject: "alice",
+      });
+      expect(task?.status).toBe("working");
+    });
+  });
+
   test("an isError result audits as an error, not a clean success", async () => {
     const t = newTest();
     await t.run(async (ctx) => {
@@ -1572,15 +1598,17 @@ describe("tasks: result shaping and size accounting", () => {
     });
   }
 
-  test("a non-object value never becomes structuredContent", async () => {
-    // The documented decline passes a plain string and deliberately no
-    // isError. Stamping it as structuredContent would violate the tool's
-    // own outputSchema, and the synchronous path already refuses that
-    // exact shape in describeCompleteCallResultProblem.
+  test("a scalar value still becomes structuredContent, as inline", async () => {
+    // Matches the synchronous path: an advertised `outputSchema` earns a
+    // block for whatever the tool returned, because a validating client
+    // errors on a schema-bearing tool that answers without one. A host
+    // completing with something that is NOT the tool's output (the
+    // documented decline) passes `isError` to drop the block, which the
+    // sibling test below covers.
     const t = newTest();
     await seedCompleted(t, {
       taskId: "shape-1",
-      outputSchema: { type: "object", required: ["paid"] },
+      outputSchema: { type: "string" },
       result: "Confirmation declined.",
     });
     const task = await t.query(api.tasks.getTaskForOwner, {
@@ -1589,9 +1617,28 @@ describe("tasks: result shaping and size accounting", () => {
     });
     expect(task?.result).toEqual({
       content: [{ type: "text", text: "Confirmation declined." }],
+      structuredContent: "Confirmation declined.",
       isError: false,
     });
+  });
+
+  test("an isError completion drops structuredContent entirely", async () => {
+    // The escape hatch for a value that is not the tool's output: a
+    // client skips schema validation on an error result, so a decline
+    // reported this way cannot collide with the tool's own schema.
+    const t = newTest();
+    await seedCompleted(t, {
+      taskId: "shape-1b",
+      outputSchema: { type: "object", required: ["paid"] },
+      result: "Confirmation declined.",
+      isError: true,
+    });
+    const task = await t.query(api.tasks.getTaskForOwner, {
+      taskId: "shape-1b",
+      ownerSubject: "alice",
+    });
     expect(task?.result).not.toHaveProperty("structuredContent");
+    expect(task?.result?.isError).toBe(true);
   });
 
   test("an object value still becomes structuredContent", async () => {

@@ -904,12 +904,35 @@ function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
 }
 
 /**
- * Whether a value may be shipped as `structuredContent`. MCP models it
- * as structured output, and a scalar there fails a validating client.
- * Mirrored in the component for task results.
+ * `jsonResultEnvelope` for a host-authored result, where a value JSON
+ * cannot represent (a `v.int64()` field read straight off a document)
+ * would otherwise escape the switch as a raw 500: no JSON-RPC envelope,
+ * no CORS headers, nothing the client can act on. Reported as an error
+ * RESULT because the call itself already happened.
  */
-function isStructuredShape(value: unknown): boolean {
-  return Array.isArray(value) || isPlainObject(value);
+function hostResultEnvelope(
+  id: JsonRpcMessage["id"],
+  value: unknown,
+  toolName: string,
+): string {
+  try {
+    return jsonResultEnvelope(id, value);
+  } catch (err) {
+    console.error(
+      "[mcp-gateway] hook result cannot be serialized for the wire",
+      toolName,
+      err,
+    );
+    return jsonResultEnvelope(id, {
+      content: [
+        {
+          type: "text",
+          text: `Tool "${toolName}" returned a value that cannot be represented on the wire`,
+        },
+      ],
+      isError: true,
+    });
+  }
 }
 
 function jsonErrorEnvelope(
@@ -3888,7 +3911,9 @@ async function handlePost(
               }
             }
           }
-          body = jsonResultEnvelope(message.id, requested.result);
+          // The MRTR chain claim above is already written, so an escape
+          // here would leave the client with a 500 it cannot even retry.
+          body = hostResultEnvelope(message.id, requested.result, tool.name);
           break;
         }
         if (requested !== null && requested !== undefined) {
@@ -4462,12 +4487,13 @@ async function handlePost(
             text: serializedResult,
           },
         ],
-        // MCP defines `structuredContent` as structured output, so a
-        // scalar must not be stamped as one just because the tool
-        // advertises a schema: a validating client rejects the whole
-        // result. Same rule the task path applies, so the two agree.
-        ...(tool.outputSchema !== undefined &&
-        isStructuredShape(dispatched.data)
+        // Emitted for ANY JSON value once the tool advertises a schema.
+        // The 2026-07-28 revision types `structuredContent` as `unknown`
+        // ("object, array, string, number, boolean, or null"), and a
+        // validating client treats a missing block as a protocol error
+        // whenever an `outputSchema` was advertised, so withholding it
+        // for a scalar breaks the very clients it would try to protect.
+        ...(tool.outputSchema !== undefined
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,

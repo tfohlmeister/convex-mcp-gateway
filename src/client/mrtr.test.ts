@@ -739,6 +739,42 @@ describe("gating and negotiation", () => {
     expect(dispatched).toHaveLength(0);
   });
 
+  test("a completeCall result JSON cannot represent stays a JSON-RPC response", async () => {
+    // Hook code runs in the host isolate, so a `v.int64()` field read
+    // straight off a document reaches the wire as a bigint. The shape
+    // check passes (there IS a content array), so only serialization
+    // catches it, and by this point the MRTR chain claim is written:
+    // escaping as a raw 500 would leave the client with no envelope, no
+    // CORS header and no retry.
+    const { api, ctx, dispatched } = harness();
+    const tool = declarativeTool(async (_ctx, { inputResponses }) => {
+      if (inputResponses === undefined) return inputRequired(CONFIRM_REQUEST);
+      return completeCall({
+        content: [{ type: "text", text: "Not archived." }],
+        structuredContent: { attempts: BigInt(2) },
+        isError: false,
+      } as never);
+    });
+    const first = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    const body = await json(
+      await handleMcpRequest(
+        ctx,
+        request(2, {
+          requestState: first.result!.requestState,
+          inputResponses: { confirm: { action: "decline" } },
+        }),
+        api,
+        options(tool),
+      ),
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toMatch(/cannot be represented/);
+    expect(dispatched).toHaveLength(0);
+  });
+
   test("a hook chain past the round ceiling is rejected", async () => {
     const { api, ctx, dispatched } = harness();
     // A hook that asks for input forever; the gateway caps the chain.

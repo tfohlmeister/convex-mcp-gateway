@@ -3934,10 +3934,13 @@ describe("structuredContent shape on a dispatch", () => {
     };
   }
 
-  test("a scalar return ships as text only, even with an outputSchema", async () => {
-    // MCP models structured output as an object, so stamping a bare
-    // string as `structuredContent` fails a validating client. The task
-    // path applies the same rule, so a tool run either way agrees.
+  test("a scalar return still ships structuredContent", async () => {
+    // The 2026-07-28 revision types `structuredContent` as `unknown`
+    // ("object, array, string, number, boolean, or null"), and a
+    // validating client raises a protocol error when a tool advertising
+    // an `outputSchema` answers WITHOUT the block. Withholding it for a
+    // scalar therefore breaks exactly the clients it looks like it
+    // protects, so `returns: v.string()` keeps emitting one.
     const component = createComponent();
     const state = createCtx(component, [scalarTool({ type: "string" })]);
     state.setDispatchResult({ ok: true, data: "hello" });
@@ -3946,7 +3949,20 @@ describe("structuredContent shape on a dispatch", () => {
     expect(body.result?.content?.[0]?.text).toBe(
       JSON.stringify("hello", null, 2),
     );
-    expect(body.result).not.toHaveProperty("structuredContent");
+    expect(body.result?.structuredContent).toBe("hello");
+  });
+
+  test("a null return ships structuredContent rather than omitting it", async () => {
+    // The presence test a client applies is `=== undefined`, so `null`
+    // is a legal structured value and must not be silently dropped: a
+    // `v.union(v.object({...}), v.null())` tool answers null on the miss.
+    const component = createComponent();
+    const state = createCtx(component, [scalarTool({ type: ["object", "null"] })]);
+    state.setDispatchResult({ ok: true, data: null });
+
+    const body = await call(state, component);
+    expect(body.result).toHaveProperty("structuredContent");
+    expect(body.result?.structuredContent).toBeNull();
   });
 
   test("an object return still ships structuredContent", async () => {
