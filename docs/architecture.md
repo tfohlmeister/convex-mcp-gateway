@@ -81,8 +81,21 @@ Seven tables, all owned by the component:
 ## MCP Streamable HTTP transport
 
 The host-mounted `handleMcpRequest` supports two protocol eras on the same
-`/mcp/` endpoint. Legacy 2025-03-26 and 2025-06-18 requests retain the
-session lifecycle below. A 2026-07-28 POST is stateless when both
+`/mcp/` endpoint. Legacy 2025-03-26, 2025-06-18, and 2025-11-25 requests
+retain the session lifecycle below; `initialize` negotiates the newest
+supported revision (2025-11-25) when a client requests one the gateway
+does not speak. All three legacy revisions share one wire contract:
+2025-11-25's additions over 2025-06-18 are optional and not emitted here.
+Its SSE resumability framing (a priming event plus `retry` hint) is
+emitted by the reference server only when it has an event store backing
+GET + `Last-Event-ID` replay; this gateway has neither an event store
+nor a GET channel (GET is a hard 405), so emitting a priming event would
+advertise resumability it cannot honor — a client whose connection died
+mid-frame would reconnect via GET, get 405, and silently abandon the
+request. Not emitting the optional additions is conforming, and it keeps
+every legacy revision's SSE frame identical (one message event, id 1).
+The revision's additive capabilities (tasks, url-mode elicitation) are
+likewise not advertised. A 2026-07-28 POST is stateless when both
 `MCP-Protocol-Version` and
 `params._meta["io.modelcontextprotocol/protocolVersion"]` equal
 `2026-07-28`; it must also mirror its JSON-RPC method in `Mcp-Method` and,

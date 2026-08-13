@@ -480,7 +480,23 @@ type RegisteredResourceTemplate = {
   annotations?: McpResourceAnnotations;
 };
 
-const LEGACY_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"] as const;
+/**
+ * Session-based protocol revisions this gateway speaks, newest first.
+ * The first entry is what `initialize` negotiates when a client requests
+ * a version the gateway does not support (per spec, the server answers
+ * with its latest supported version). The gateway serves all three with
+ * an identical wire contract: `2025-11-25`'s additions over `2025-06-18`
+ * are its optional SSE resumability framing (which requires an event
+ * store + GET replay this gateway does not have, so it is not emitted,
+ * see `sseResponseFrame`) and additive capabilities (tasks, url-mode
+ * elicitation, which are not advertised). Not emitting optional features
+ * is conforming.
+ */
+const LEGACY_PROTOCOL_VERSIONS = [
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+] as const;
 const MAX_MCP_HEADER_VALUE_LENGTH = 8 * 1024;
 
 function hasMcpHeaderControlCharacter(value: string): boolean {
@@ -726,9 +742,30 @@ function splitErrorText(
   return { full, wire: deliberate ? full : generic };
 }
 
-function sseEvent(id: number | null, payload: string): string {
-  const idLine = id === null ? "" : `id: ${id}\n`;
-  return `${idLine}event: message\ndata: ${payload}\n\n`;
+/**
+ * Build the single-frame SSE body of a POST response.
+ *
+ * - `2026-07-28` (`isModern`): a bare message event. The modern revision
+ *   removed `Last-Event-ID` resumability, so no event id at all.
+ * - Every session-based revision, INCLUDING `2025-11-25`: one message
+ *   event with id 1, byte-identical to what legacy sessions always
+ *   received.
+ *
+ * `2025-11-25` adds an optional priming event + `retry` hint to SSE
+ * framing, but the reference server emits those ONLY when it has an
+ * event store backing GET + `Last-Event-ID` replay (its
+ * `writePrimingEvent` returns early when `!this._eventStore`). This
+ * gateway has neither an event store nor a GET channel (GET is a hard
+ * 405), so priming here would advertise resumability it cannot honor:
+ * a client whose connection dies mid-frame would schedule a GET
+ * reconnect with `Last-Event-ID: 0`, get 405, and silently abandon the
+ * request instead of failing cleanly. Not emitting the optional
+ * additions is the conforming behavior for a server without replay,
+ * and it keeps every legacy revision's frame identical.
+ */
+function sseResponseFrame(body: string, isModern: boolean): string {
+  const idLine = isModern ? "" : "id: 1\n";
+  return `${idLine}event: message\ndata: ${body}\n\n`;
 }
 
 function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
@@ -3458,9 +3495,9 @@ async function handlePost(
       start(controller) {
         const encoder = new TextEncoder();
         // 2026-07-28 dropped `Last-Event-ID` resumability, so an event id
-        // carries no meaning there. Legacy clients may still resume, so
-        // they keep theirs.
-        controller.enqueue(encoder.encode(sseEvent(isModern ? null : 1, body)));
+        // carries no meaning there. Legacy frames keep id 1, identical
+        // across every session-based revision (see sseResponseFrame).
+        controller.enqueue(encoder.encode(sseResponseFrame(body, isModern)));
         controller.close();
       },
     });

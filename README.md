@@ -22,9 +22,14 @@ Built as a [Convex Component](https://www.convex.dev/components).
   once and pass it as `tools` to `handleMcpRequest`, the registry
   auto-syncs on connect (no separate registration mutation), or call
   `gateway.register(...)` for imperative/dynamic catalogs
-- **MCP dual-era Streamable HTTP**: legacy 2025-03-26/2025-06-18 sessions
-  remain supported alongside stateless 2026-07-28 requests, discovery,
-  routing-header validation, and private cache hints
+- **MCP dual-era Streamable HTTP**: legacy 2025-03-26/2025-06-18/2025-11-25
+  sessions remain supported alongside stateless 2026-07-28 requests,
+  discovery, routing-header validation, and private cache hints. A client
+  requesting an unknown revision negotiates down to 2025-11-25 (what the
+  current official TypeScript SDK pins as latest); all three legacy
+  revisions share one wire contract (2025-11-25's optional SSE
+  resumability framing needs an event store the gateway doesn't have, so
+  it isn't emitted, which is conforming)
 - **Stateless multi-round trips**: declarative modern tools use a host-side
   `beforeCall` hook to request input before any Convex function runs, then
   receive HMAC-verified continuation state plus an idempotency key on retry;
