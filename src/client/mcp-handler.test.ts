@@ -3934,6 +3934,52 @@ describe("structuredContent shape on a dispatch", () => {
     };
   }
 
+  async function legacyCall(
+    state: ReturnType<typeof createCtx>,
+    component: ComponentApi,
+    method: "tools/call" | "tools/list" = "tools/call",
+  ) {
+    const options = { authorize: async () => ({ allowed: true as const }) };
+    // The legacy era is session-based, so the request has to follow an
+    // `initialize` that negotiates the revision under test.
+    const init = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id")!;
+    const response = await handleMcpRequest(
+      state.ctx,
+      withHeaders(
+        jsonRpcRequest({
+          id: 2,
+          method,
+          ...(method === "tools/call"
+            ? { params: { name: "scalar_tool", arguments: {} } }
+            : {}),
+        }),
+        {
+          "mcp-session-id": sessionId,
+          "mcp-protocol-version": "2025-11-25",
+        },
+      ),
+      component,
+      options,
+    );
+    return (await readJson(response)) as {
+      result?: {
+        content?: { text?: string }[];
+        structuredContent?: unknown;
+        tools?: { name: string; outputSchema?: unknown }[];
+      };
+    };
+  }
+
   test("a scalar return still ships structuredContent", async () => {
     // The 2026-07-28 revision types `structuredContent` as `unknown`
     // ("object, array, string, number, boolean, or null"), and a
@@ -3953,9 +3999,9 @@ describe("structuredContent shape on a dispatch", () => {
   });
 
   test("a null return ships structuredContent rather than omitting it", async () => {
-    // The presence test a client applies is `=== undefined`, so `null`
-    // is a legal structured value and must not be silently dropped: a
-    // `v.union(v.object({...}), v.null())` tool answers null on the miss.
+    // `2026-07-28` lists `null` among the legal structured values, so a
+    // `v.union(v.object({...}), v.null())` tool answering null on the
+    // miss still gets a block on the modern path.
     const component = createComponent();
     const state = createCtx(component, [scalarTool({ type: ["object", "null"] })]);
     state.setDispatchResult({ ok: true, data: null });
@@ -3963,6 +4009,60 @@ describe("structuredContent shape on a dispatch", () => {
     const body = await call(state, component);
     expect(body.result).toHaveProperty("structuredContent");
     expect(body.result?.structuredContent).toBeNull();
+  });
+
+  test("a legacy client is not shown a scalar-rooted outputSchema", async () => {
+    // Through 2025-11-25 `Tool.outputSchema` must be rooted at
+    // `type: "object"`. A client validating to that revision rejects the
+    // WHOLE tools/list response over one bad schema, so a single
+    // `returns: v.string()` tool would hide every other tool from it.
+    const component = createComponent();
+    const state = createCtx(component, [scalarTool({ type: "string" })]);
+
+    const body = await legacyCall(state, component, "tools/list");
+    const tool = body.result?.tools?.find((t) => t.name === "scalar_tool");
+    expect(tool).toBeDefined();
+    expect(tool).not.toHaveProperty("outputSchema");
+  });
+
+  test("an object-rooted outputSchema is still shown to a legacy client", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      scalarTool({ type: "object", properties: { total: { type: "number" } } }),
+    ]);
+
+    const body = await legacyCall(state, component, "tools/list");
+    const tool = body.result?.tools?.find((t) => t.name === "scalar_tool");
+    expect(tool?.outputSchema).toEqual({
+      type: "object",
+      properties: { total: { type: "number" } },
+    });
+  });
+
+  test("a legacy client gets no structuredContent for a scalar", async () => {
+    // Must track the advertisement exactly: that client was shown no
+    // schema, and its own revision types `structuredContent` as an
+    // object, so a bare string here fails its result parse outright.
+    const component = createComponent();
+    const state = createCtx(component, [scalarTool({ type: "string" })]);
+    state.setDispatchResult({ ok: true, data: "hello" });
+
+    const body = await legacyCall(state, component);
+    expect(body.result?.content?.[0]?.text).toBe(
+      JSON.stringify("hello", null, 2),
+    );
+    expect(body.result).not.toHaveProperty("structuredContent");
+  });
+
+  test("a legacy client still gets structuredContent for an object", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      scalarTool({ type: "object", properties: { total: { type: "number" } } }),
+    ]);
+    state.setDispatchResult({ ok: true, data: { total: 2 } });
+
+    const body = await legacyCall(state, component);
+    expect(body.result?.structuredContent).toEqual({ total: 2 });
   });
 
   test("an object return still ships structuredContent", async () => {

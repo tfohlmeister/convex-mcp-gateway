@@ -42,7 +42,7 @@ features you actually enable:
 
 | Table | Prune with |
 |---|---|
-| `audit` | `gateway.pruneAuditEntries(ctx, maxAgeMs)` |
+| `audit` | `gateway.pruneAuditEntries(ctx, retentionMs)` |
 | `sessions` | `gateway.pruneSessions(ctx, idleMs)` |
 | `subscriptions` | `gateway.pruneResourceSubscriptions(ctx)` |
 | `mrtrRedemptions` + `mrtrChains` | `gateway.pruneMrtrRedemptions(ctx)` |
@@ -99,12 +99,9 @@ registration time. Use `invoices_list` instead.
 
 **Typed return values (optional)**: pass `returns:` with a Convex
 validator and the gateway advertises an MCP `outputSchema` and ships the
-value as `structuredContent` alongside the text block. Any JSON value
-qualifies, scalars and `null` included: the current revision types the
-field as `unknown`, and a client that validates raises a protocol error
-when a tool advertising an `outputSchema` answers without the block. The
-validator is type-checked against the Convex function's actual
-return type at compile time:
+value as `structuredContent` alongside the text block. The validator is
+type-checked against the Convex function's actual return type at compile
+time:
 
 ```ts
 defineMcpQuery({
@@ -117,6 +114,17 @@ defineMcpQuery({
 
 Tools without `returns:` keep their pre-existing wire format
 unchanged, backwards-compatible for any registration that exists today.
+
+**Prefer an object-rooted validator.** Only the `2026-07-28` revision
+permits a non-object `outputSchema`; everything up to `2025-11-25`
+requires `type: "object"` at the root, and a client validating to those
+revisions rejects the entire `tools/list` response over a single
+scalar-rooted schema. The gateway therefore withholds such a schema from
+those clients rather than hiding every tool from them, so a
+`returns: v.string()` tool reads as untyped there, with its value in the
+text block as always. Wrapping the return
+(`v.object({ value: v.string() })`) gets the schema advertised to
+everyone.
 
 **Injecting the caller identity (optional)**: a dispatched tool runs
 inside the component, where `ctx.auth` is unavailable. To give a tool

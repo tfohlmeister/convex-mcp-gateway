@@ -1504,16 +1504,24 @@ export const executeScheduledTask = action({
     // Fail an oversized value here as well as in `completeTask`, so the
     // log names the tool and says plainly that the work committed.
     if (exceeds(dispatched.data, TASK_MAX_RESULT_BYTES)) {
+      // Distinguish the two reasons as `completeTask` does: an operator
+      // told that seven bytes exceed 256 KiB goes hunting for a size
+      // problem that does not exist.
+      const unrepresentable = isUnserializable(dispatched.data);
       console.error(
         "[mcp-gateway] the tool SUCCEEDED and its side effects committed, " +
-          "but its result exceeds the documented size; the task is failed " +
+          (unrepresentable
+            ? "but its result cannot be serialized; the task is failed "
+            : "but its result exceeds the documented size; the task is failed ") +
           "and the result discarded",
         args.taskId,
         task.toolName,
       );
       await fail({
         code: -32000,
-        message: `Task result exceeds ${TASK_MAX_RESULT_BYTES} serialized bytes`,
+        message: unrepresentable
+          ? "Task result contains a value that cannot be serialized (e.g. a v.int64() bigint)"
+          : `Task result exceeds ${TASK_MAX_RESULT_BYTES} serialized bytes`,
       });
       return null;
     }

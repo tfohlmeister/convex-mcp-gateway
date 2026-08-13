@@ -568,8 +568,9 @@ strips the public/internal marker. The rule that matters is which side
 calls the function. A function the HOST must reach through
 `components.mcpGateway.*` has to be public, because the component
 boundary exposes only public functions. That covers most of `registry.*`,
-`dispatch.*`, `sessions.*`, `mrtr.*` and `tasks.*`, plus the two `audit`
-functions the host calls directly (`listEntries` and `pruneOlderThan`). A
+`dispatch.*`, `sessions.*`, `mrtr.*` and `tasks.*`, plus the three
+`audit` functions the host calls directly (`listEntries`,
+`pruneOlderThan` and `recordResourceEntry`). A
 function only the component calls, like `audit.recordEntry`, stays
 `internalMutation` and is invoked through `internal.*` from inside the
 component, which resolves fine. Declaring something public that the host

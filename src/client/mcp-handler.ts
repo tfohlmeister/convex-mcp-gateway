@@ -904,6 +904,35 @@ function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
 }
 
 /**
+ * Whether an `outputSchema` may be advertised, and its value shipped as
+ * `structuredContent`, to a client speaking `revision`.
+ *
+ * The two eras disagree, and the disagreement is not cosmetic. Through
+ * `2025-11-25`, `Tool.outputSchema` must be rooted at `type: "object"`
+ * and `CallToolResult.structuredContent` is typed `{ [key: string]:
+ * unknown }`. A client validating to that revision rejects the WHOLE
+ * `tools/list` response over one scalar-rooted schema, so a single
+ * `returns: v.string()` tool hides every other tool from it. `2026-07-28`
+ * widened both: any JSON Schema 2020-12, and `structuredContent` as
+ * `unknown` ("object, array, string, number, boolean, or null").
+ *
+ * So a non-object schema is withheld from legacy clients and advertised
+ * to modern ones. The tool still works either way; a legacy client just
+ * sees it untyped, with the value in the text block as always.
+ */
+function mayAdvertiseOutputSchema(
+  outputSchema: unknown,
+  isModern: boolean,
+): boolean {
+  if (outputSchema === undefined) return false;
+  if (isModern) return true;
+  return (
+    isPlainObject(outputSchema) &&
+    (outputSchema as { type?: unknown }).type === "object"
+  );
+}
+
+/**
  * `jsonResultEnvelope` for a host-authored result, where a value JSON
  * cannot represent (a `v.int64()` field read straight off a document)
  * would otherwise escape the switch as a raw 500: no JSON-RPC envelope,
@@ -1277,16 +1306,21 @@ function isMcpCompleteCallResult(
  */
 function describeCompleteCallResultProblem(
   result: Record<string, unknown>,
+  isModern: boolean,
 ): string | null {
   if (!Array.isArray(result.content)) {
     return "result.content must be an array";
   }
+  // Same era split the emit paths apply: `2026-07-28` types
+  // `structuredContent` as `unknown`, everything before it as an object.
+  // Judging a hook's result by a different rule than the gateway's own
+  // output is what let the two drift apart before.
   if (
     result.structuredContent !== undefined &&
-    !isPlainObject(result.structuredContent) &&
-    !Array.isArray(result.structuredContent)
+    !isModern &&
+    !isPlainObject(result.structuredContent)
   ) {
-    return "result.structuredContent must be an object or array";
+    return "result.structuredContent must be an object on this protocol revision";
   }
   if (result.isError !== undefined && typeof result.isError !== "boolean") {
     return "result.isError must be a boolean";
@@ -3210,8 +3244,10 @@ async function handlePost(
             inputSchema: tool.inputSchema,
             // Only emit `outputSchema` when the tool actually declared
             // one, some MCP clients (Inspector older versions) are
-            // strict about the field being absent vs null vs {}.
-            ...(tool.outputSchema !== undefined
+            // strict about the field being absent vs null vs {}. A
+            // non-object schema is withheld from legacy clients, which
+            // would reject this entire response over it.
+            ...(mayAdvertiseOutputSchema(tool.outputSchema, isModern)
               ? { outputSchema: tool.outputSchema }
               : {}),
             // Advertise task support only when the host actually
@@ -3815,7 +3851,10 @@ async function handlePost(
           // Validate the shape rather than forward a malformed result a
           // spec-compliant client would reject, matching how every other
           // hook output is checked.
-          const problem = describeCompleteCallResultProblem(requested.result);
+          const problem = describeCompleteCallResultProblem(
+            requested.result,
+            isModern,
+          );
           if (problem) {
             console.error(
               "[mcp-gateway] MRTR beforeCall completeCall() returned a " +
@@ -4487,13 +4526,13 @@ async function handlePost(
             text: serializedResult,
           },
         ],
-        // Emitted for ANY JSON value once the tool advertises a schema.
-        // The 2026-07-28 revision types `structuredContent` as `unknown`
-        // ("object, array, string, number, boolean, or null"), and a
-        // validating client treats a missing block as a protocol error
-        // whenever an `outputSchema` was advertised, so withholding it
-        // for a scalar breaks the very clients it would try to protect.
-        ...(tool.outputSchema !== undefined
+        // Tied to the SAME condition as the advertisement in
+        // `tools/list`: a client that was shown an `outputSchema` treats
+        // a missing `structuredContent` as a protocol error, and one
+        // that was not shown a schema rejects a scalar block against its
+        // own revision's type. Deciding both with one predicate is what
+        // keeps the two halves from contradicting each other.
+        ...(mayAdvertiseOutputSchema(tool.outputSchema, isModern)
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,
