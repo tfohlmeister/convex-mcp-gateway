@@ -5,6 +5,240 @@ import { modules } from "./setup.test.js";
 import { api } from "./_generated/api.js";
 
 describe("registry", () => {
+  test("an ungated row cannot join a gated one on the same function", async () => {
+    // The confirmation is worth only as much as the least guarded route
+    // to the same function. The client checks this across a declarative
+    // catalog; the registry is the only place that sees a later
+    // imperative row added beside an earlier gated one.
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "invoices_archiveAfterConfirmation",
+        description: "Confirmed",
+        kind: "mutation",
+        functionHandle: "handle-archive",
+        inputSchema: { type: "object" },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+        mrtrGated: true,
+      });
+
+      await expect(
+        ctx.runMutation(api.registry.registerTool, {
+          name: "invoices_archive_raw",
+          description: "Not confirmed",
+          kind: "mutation",
+          functionHandle: "handle-archive",
+          inputSchema: { type: "object" },
+        }),
+      ).rejects.toThrow(/different MRTR gate/);
+
+      // Only the gated row survives.
+      const names = (await ctx.runQuery(api.registry.listTools, {})).map(
+        (tool: { name: string }) => tool.name,
+      );
+      expect(names).toEqual(["invoices_archiveAfterConfirmation"]);
+    });
+  });
+
+  test("replaceTools rejects a catalog carrying both a gated and an ungated alias", async () => {
+    // Most rows reach the registry this way, so the component has to
+    // refuse it here too rather than trusting the client's own check.
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await expect(
+        ctx.runMutation(api.registry.replaceTools, {
+          tools: [
+            {
+              name: "invoices_archiveAfterConfirmation",
+              description: "Confirmed",
+              kind: "mutation",
+              functionHandle: "handle-archive",
+              inputSchema: { type: "object" },
+              mrtrGated: true,
+            },
+            {
+              name: "invoices_archive_raw",
+              description: "Not confirmed",
+              kind: "mutation",
+              functionHandle: "handle-archive",
+              inputSchema: { type: "object" },
+            },
+          ],
+          fingerprint: "fp-1",
+        }),
+      ).rejects.toThrow(/both a gated and an ungated tool/);
+      expect((await ctx.runQuery(api.registry.listTools, {})).length).toBe(0);
+    });
+  });
+
+  test("mrtrArgs alone counts as gated, in both directions", async () => {
+    // The handler gates on `mrtrGated === true || mrtrArgs !== undefined`,
+    // and a host registering straight against the component marks the
+    // gate with `mrtrArgs` only. A check reading just `mrtrGated` would
+    // both miss that gate and reject a legitimate pair.
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "archive_confirmed",
+        description: "Confirmed the documented direct way",
+        kind: "mutation",
+        functionHandle: "handle-archive",
+        inputSchema: { type: "object" },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+      });
+
+      // Missed gate: the ungated alias must still be refused.
+      await expect(
+        ctx.runMutation(api.registry.registerTool, {
+          name: "archive_raw",
+          description: "Not confirmed",
+          kind: "mutation",
+          functionHandle: "handle-archive",
+          inputSchema: { type: "object" },
+        }),
+      ).rejects.toThrow(/different MRTR gate/);
+
+      // False positive: a client-registered row sets BOTH fields, and
+      // pairing it with the mrtrArgs-only row above is legitimate.
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "archive_confirmed_alias",
+        description: "Also confirmed, via the client wrapper",
+        kind: "mutation",
+        functionHandle: "handle-archive",
+        inputSchema: { type: "object" },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+        mrtrGated: true,
+      });
+      expect((await ctx.runQuery(api.registry.listTools, {})).length).toBe(2);
+    });
+  });
+
+  test("re-registering a name cannot strip its gate", async () => {
+    // The declarative catalog still supplies the hook, so the handler
+    // would keep confirming while dispatching without the idempotency
+    // key, and a replayed continuation would double-apply.
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "archive",
+        description: "Gated",
+        kind: "mutation",
+        functionHandle: "handle-archive",
+        inputSchema: { type: "object" },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+        mrtrGated: true,
+      });
+      await expect(
+        ctx.runMutation(api.registry.registerTool, {
+          name: "archive",
+          description: "Same name, gate dropped",
+          kind: "mutation",
+          functionHandle: "handle-archive",
+          inputSchema: { type: "object" },
+        }),
+      ).rejects.toThrow(/removes it/);
+    });
+  });
+
+  test("an upsert cannot shed its gate by changing handle or kind", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "archive",
+        description: "Gated",
+        kind: "mutation",
+        functionHandle: "handle-A",
+        inputSchema: { type: "object" },
+        mrtrArgs: { idempotencyKey: "continuationKey" },
+        mrtrGated: true,
+      });
+
+      // Pointing the same name at another function must not launder the
+      // gate away: the row is found by NAME, not by handle.
+      await expect(
+        ctx.runMutation(api.registry.registerTool, {
+          name: "archive",
+          description: "Same name, different function, no gate",
+          kind: "mutation",
+          functionHandle: "handle-B",
+          inputSchema: { type: "object" },
+        }),
+      ).rejects.toThrow(/removes it/);
+
+      // Nor may switching the kind skip the check entirely.
+      await expect(
+        ctx.runMutation(api.registry.registerTool, {
+          name: "archive",
+          description: "Same name, now a query",
+          kind: "query",
+          functionHandle: "handle-A",
+          inputSchema: { type: "object" },
+        }),
+      ).rejects.toThrow(/removes it/);
+    });
+  });
+
+  test("replaceTools reads mrtrArgs as a gate too", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await expect(
+        ctx.runMutation(api.registry.replaceTools, {
+          tools: [
+            {
+              name: "archive_confirmed",
+              description: "Gated via mrtrArgs only",
+              kind: "mutation",
+              functionHandle: "handle-archive",
+              inputSchema: { type: "object" },
+              mrtrArgs: { idempotencyKey: "continuationKey" },
+            },
+            {
+              name: "archive_raw",
+              description: "Not confirmed",
+              kind: "mutation",
+              functionHandle: "handle-archive",
+              inputSchema: { type: "object" },
+            },
+          ],
+          fingerprint: "fp-2",
+        }),
+      ).rejects.toThrow(/both a gated and an ungated tool/);
+    });
+  });
+
+  test("queries and unrelated functions are unaffected by the gate check", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      // A read has nothing destructive to confirm, so aliasing is fine.
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "search",
+        description: "Read",
+        kind: "query",
+        functionHandle: "handle-search",
+        inputSchema: { type: "object" },
+        mrtrGated: true,
+      });
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "search_alias",
+        description: "Read alias",
+        kind: "query",
+        functionHandle: "handle-search",
+        inputSchema: { type: "object" },
+      });
+      // A different function is a different question entirely.
+      await ctx.runMutation(api.registry.registerTool, {
+        name: "invoices_markPaid",
+        description: "Other function",
+        kind: "mutation",
+        functionHandle: "handle-markPaid",
+        inputSchema: { type: "object" },
+      });
+      expect(
+        (await ctx.runQuery(api.registry.listTools, {})).length,
+      ).toBe(3);
+    });
+  });
+
   test("registerTool inserts and is idempotent on name", async () => {
     const t = convexTest(schema, modules);
 

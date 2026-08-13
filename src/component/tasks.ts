@@ -1158,8 +1158,17 @@ export const executeScheduledTask = action({
     //   - `taskSupport`: the tool was withdrawn from task execution (e.g.
     //     re-registered with `metadata.auditArgs`, which is incompatible
     //     with it), so it must not keep executing as a task.
+    //   - a confirmed task whose row no longer reserves `mrtrArgs`: the
+    //     tool would run with no idempotency key to deduplicate on, the
+    //     state the synchronous path refuses at call time. An ordinary
+    //     redeploy that drops the key reaches it, no imperative write
+    //     needed. Queries are exempt for the same reason they are
+    //     exempt at definition time: nothing durable to double-apply.
     if (
       (tool.mrtrGated === true && task.mrtrApproved !== true) ||
+      (task.mrtrApproved === true &&
+        tool.mrtrArgs === undefined &&
+        tool.kind !== "query") ||
       tool.taskSupport !== true
     ) {
       await fail({

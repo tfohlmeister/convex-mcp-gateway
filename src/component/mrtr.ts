@@ -151,8 +151,12 @@ export const getChainResolution = query({
  *
  * This is what makes a resolved decision final. Per-continuation
  * redemption cannot, because `jti` is fresh per round and a replay that
- * re-runs the hook mints a new, unpinned sibling. It also makes
- * dispatch at-most-once per chain gateway-side.
+ * re-runs the hook mints a new, unpinned sibling.
+ *
+ * Note what this does NOT do: the resolving continuation may dispatch
+ * again when re-sent with the same answer, which is how a lost response
+ * retries. Keeping the side effect single is the tool's job, via the
+ * injected idempotency key.
  */
 export const claimChain = mutation({
   args: {

@@ -3292,6 +3292,35 @@ async function handlePost(
         break;
       }
 
+      // The mirror, and the only place both facts are visible: the hook
+      // comes from this handler's declarative catalog, the reserved key
+      // from the registry row. A hook without the key dispatches a
+      // confirmed mutation with nothing to deduplicate on, so the
+      // deliberately-allowed replay of the resolving continuation would
+      // apply the side effect twice. Take `kind` from the declarative
+      // catalog, not from the row: the row is written by the same party
+      // this check defends against, so flipping it to "query" would
+      // otherwise buy an exemption.
+      if (
+        beforeCall !== undefined &&
+        (declarativeTool?.kind ?? tool.kind) !== "query" &&
+        tool.mrtrArgs === undefined
+      ) {
+        console.error(
+          "[mcp-gateway] tool has a confirmation hook but its registry " +
+            "row reserves no mrtrArgs key; failing closed rather than " +
+            "dispatching a replayable mutation without one",
+          tool.name,
+        );
+        body = jsonErrorEnvelope(
+          message.id,
+          INTERNAL_ERROR,
+          `Tool "${tool.name}" is confirmed but its registration is ` +
+            "missing the idempotency key it needs",
+        );
+        break;
+      }
+
       // Task augmentation (`io.modelcontextprotocol/tasks`): validate the
       // whole negotiation before authorize so an unusable task request
       // never runs the tool synchronously as a silent fallback.

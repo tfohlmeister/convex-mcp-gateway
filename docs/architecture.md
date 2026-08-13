@@ -145,7 +145,11 @@ The host-side `beforeCall` hook of a declarative tool is the MRTR state
 machine. It runs after authorization but before component dispatch, on
 the first call AND on every verified continuation, and returns one of
 three decisions: `inputRequired()` (ask the client for input, again if
-a previous answer was incomplete, up to a hard round ceiling),
+a previous answer was incomplete, up to a hard ceiling on chain DEPTH,
+which is not a ceiling on hook invocations: re-sending an earlier
+continuation of a chain that has not resolved yet re-runs the hook and
+mints another live sibling each time, all of which the chain claim
+closes as soon as one of them resolves),
 `completeCall()` (finish the call without dispatching, e.g. a declined
 confirmation), or `null`/`undefined` (continue to the Convex function).
 The underlying function therefore stays MCP-unaware: it never parses
@@ -175,7 +179,7 @@ still answerable after a sibling already resolved the call.
 component's `mrtrChains` table, keyed by the chain's idempotency key
 (stable across every round, unlike `jti`). The gateway claims the chain
 immediately *before* it dispatches, finishes the call via
-`completeCall()`, or — for a task-augmented call — creates the task row,
+`completeCall()`, or (for a task-augmented call) creates the task row,
 so the claim is the decision rather than a record of one, and the claim is
 what every later continuation of that chain runs into. Task creation
 counts as a `"dispatched"` resolution because it returns a handle
@@ -195,8 +199,13 @@ change it.
   double-applying) instead of getting an error. Note what "repeats"
   means for a completion: the hook runs again and its output is
   returned, so a hook that reads state outside the chain may word the
-  answer differently. The decision class cannot change; the message is
-  not replayed from storage.
+  answer differently. Nothing is replayed from storage, which makes
+  decision-class stability a **requirement on the hook** rather than a
+  guarantee of the mechanism: a hook that answers `completeCall` on the
+  repeat where it dispatched the first time is refused, and its client
+  sees an error instead of the retry it expected. Keep hooks
+  deterministic in decision class over the same `state` and
+  `inputResponses`.
 - **Every other continuation** is refused, including one re-sent
   byte-identically, and so is the resolving continuation re-sent with a
   *different* answer. A sibling's hook output is not the settled result:
@@ -226,6 +235,62 @@ while one of them is still valid and could resolve the chain a second
 time; `claimChain` raises an existing row's window and never shortens
 it. Claims drain through `gateway.pruneMrtrRedemptions` alongside the
 redemption rows, so hosts wire one cron, not two.
+
+Two catalog rules fail the sync loudly rather than at call time, and
+both are all-or-nothing for the endpoint, so they are worth knowing
+before an upgrade:
+
+1. A **mutation or action carrying `beforeCall` must declare
+   `mrtrArgs`.** `defineMcp*` has always enforced this; it is now also
+   enforced where a catalog enters the gateway, because a hand-built
+   `McpToolRegistration` bypassed the constructor entirely and every
+   replay of an accepted continuation then dispatched with no key.
+2. **One Convex function may not be reached through both a gated and an
+   ungated tool.** The confirmation is worth only as much as the least
+   guarded route to the same function: an ungated alias left in the
+   catalog hands the model a name that runs the destructive path with no
+   confirmation, no chain and no idempotency key. Checked across a
+   declarative catalog on the resolved function handles, and again in
+   the component for every writer (`replaceTools` and `registerTool`),
+   so it holds for an older client or a host writing to the registry
+   directly. Queries are exempt from both rules.
+
+Both rules are folded into the catalog fingerprint, so a deployment that
+already synced a catalog they reject re-syncs once after the upgrade and
+fails then, rather than at whatever later moment an unrelated edit
+happens to churn the fingerprint.
+
+Re-registering an existing name may not remove its gate, whatever else
+the registration changes: the handler would keep running the hook from
+the declarative catalog while dispatching without the idempotency key,
+so a replay would double-apply. `registerTool` refuses it, matching on
+the row's name rather than its function, so switching the handle or the
+kind cannot launder the gate away.
+
+The catalog rules are registration-time defense in depth. The binding
+check is at call time, where both facts are visible for the first time:
+the hook comes from the serving handler's declarative catalog, the
+reserved key from the registry row, and the component can never see the
+former. A tool with a hook whose row carries no `mrtrArgs` fails closed
+there for mutations and actions, which covers any route that
+reintroduces that state after registration, including an
+`unregisterTool` followed by an ungated `registerTool`. The kind is
+taken from the declarative catalog rather than the registry row, so a
+row rewritten as a query cannot buy the exemption.
+
+Note that `registerTool` and `unregisterTool` leave the declarative
+fingerprint untouched, so an imperative write against a name the
+declarative catalog also owns persists until something else churns the
+fingerprint. That is deliberate (clearing it would delete legitimate
+imperative rows on the next sync), and the call-time check above is what
+makes it safe rather than merely stale.
+
+One nuance worth naming: rule 1 is checked when the catalog syncs, which
+on the legacy path happens at `initialize`, so a deploy that introduces
+a non-conforming tool while a legacy session is open does not produce
+the loud sync failure until that session re-initializes. Dispatch is not
+exposed in the meantime: the call-time check refuses it. Modern requests
+sync before dispatch and have no window at all.
 
 Because a redeemed replay re-runs the hook and dispatches again,
 `defineMcpMutation` and `defineMcpAction` configs that pass `beforeCall`
@@ -259,7 +324,13 @@ hook, a `-32021` capability rejection, a hook failure) write no audit
 rows, because nothing is dispatched and only the component writes tool
 audit entries. The audit log records authorization denials and actual
 dispatches, including the injected idempotency key, which links a
-dispatched call back to its confirmation chain. Hosts that need
+dispatched call back to its confirmation chain. That link is only there
+when the tool audits its arguments. `metadata.auditArgs: false` stores
+`args: null`, and a `redact` list naming the key replaces it with
+`"[redacted]"` while keeping the rest of the arguments; either way the
+audit row no longer ties the dispatch to its chain. Tools worth
+confirming are exactly the ones likely to do one of the two, so decide
+it deliberately. Hosts that need
 per-round visibility log from inside their hook.
 
 The table below describes the **legacy** session lifecycle. Modern
@@ -375,7 +446,7 @@ nothing) or host-owned via
 `gateway.completeTask` / `failTask` / `requireTaskInput`). Two
 invariants keep the state machine honest: a cancel always wins a race
 against completion, and the `onCancel` / `onInputResponses` host hooks
-are at-least-once — an idempotent wire retry re-fires them, so a resume
+are at-least-once, an idempotent wire retry re-fires them, so a resume
 or cancel notification that failed once stays recoverable from the
 client side. See [tasks.md](./tasks.md) for the full contract.
 

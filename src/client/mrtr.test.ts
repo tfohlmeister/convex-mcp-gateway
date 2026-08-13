@@ -524,6 +524,23 @@ describe("continuation replay protection", () => {
 });
 
 describe("gating and negotiation", () => {
+  test("a hook whose registry row lost its mrtrArgs fails closed", async () => {
+    // The mirror of the case below, and the only place both facts are
+    // visible: the hook comes from this handler's catalog, the reserved
+    // key from the row. Dispatching here would run a confirmed mutation
+    // with nothing to deduplicate the allowed replay against.
+    const { api, ctx, dispatched } = harness({
+      tool: { ...registeredTool, mrtrArgs: undefined, mrtrGated: true },
+    });
+    const tool = declarativeTool(async () => null);
+    const body = await json(
+      await handleMcpRequest(ctx, request(1, {}), api, options(tool)),
+    );
+    expect(body.error?.code).toBe(-32603);
+    expect(body.error?.message).toMatch(/missing the idempotency key/);
+    expect(dispatched).toHaveLength(0);
+  });
+
   test("a gated registry row without a hook fails closed, never dispatches", async () => {
     // The imperative-registration shape: `mrtrArgs` (or the stored
     // gate flag) without any declarativeTools on this handler.

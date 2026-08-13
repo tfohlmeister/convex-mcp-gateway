@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { v } from "convex/values";
 import type { FunctionReference } from "convex/server";
 import {
@@ -657,6 +657,83 @@ describe("x-mcp-header validation at registration time", () => {
       /MCP tool "search" has an invalid inputSchema: x-mcp-header must be reachable/,
     );
   });
+
+  test("a hand-built gated mutation without mrtrArgs is refused at the catalog boundary", async () => {
+    // defineMcp* enforces this, but a host can hand handleMcpRequest a
+    // registration it built itself. Without the chain's idempotency key
+    // every replay of an accepted continuation dispatches the mutation
+    // again with nothing to deduplicate on, so the gateway has to
+    // refuse the catalog rather than trust the constructor. The check
+    // runs before any component call, hence the inert ctx.
+    const errors: string[] = [];
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+    // Restore even when an assertion below throws, or every later test
+    // in this file loses its diagnostics.
+    onTestFinished(() => errorSpy.mockRestore());
+    const gateway = new McpGateway({} as never);
+    const request = new Request("https://gateway.example/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "tools/list",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      }),
+    });
+    const response = await gateway.handleMcpRequest(
+      {
+        auth: { getUserIdentity: async () => null },
+        runQuery: async () => {
+          throw new Error("catalog guard must run before any component call");
+        },
+        runMutation: async () => {
+          throw new Error("catalog guard must run before any component call");
+        },
+      } as never,
+      request,
+      {
+        authorize: async () => ({ allowed: true as const }),
+        tools: [
+          {
+            name: "archive",
+            description: "Archives",
+            kind: "mutation",
+            fn: { __fn: "invoices:archive" },
+            inputSchema: { type: "object" },
+            beforeCall: async () => null,
+          },
+        ] as never,
+      },
+    );
+    // The reason stays server-side (it names host internals), so the
+    // wire only carries -32603. Assert on what the operator sees, which
+    // is what actually distinguishes this from any other sync failure.
+    const body = (await response.json()) as { error?: { code: number } };
+    expect(body.error?.code).toBe(-32603);
+    expect(
+      errors.some((line) => /beforeCall but no mrtrArgs/.test(line)),
+    ).toBe(true);
+  });
+
+  // The catalog-level "no ungated alias" rule keys on resolved function
+  // handles, and `createFunctionHandle` only runs inside a Convex
+  // backend, so its coverage lives in `src/component/registry.test.ts`
+  // (registry enforcement) rather than here.
 
   test("register rejects an invalid schema before touching Convex", async () => {
     const gateway = new McpGateway({} as never);

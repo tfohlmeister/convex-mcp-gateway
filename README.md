@@ -361,7 +361,10 @@ once**: the gateway claims the chain before it dispatches or finishes the call,
 recording which continuation resolved it and with which answer. Re-sending that
 same continuation and answer repeats the outcome, so a lost response still
 retries cleanly: an accepted call dispatches again under the same idempotency
-key, and a completed one re-runs the hook rather than erroring. Every other continuation of the chain is refused, including one
+key, and a completed one re-runs the hook rather than erroring. Nothing is
+replayed from storage, so keep hooks deterministic in decision class over the
+same state and responses: a hook that completes on the repeat where it
+dispatched the first time is refused. Every other continuation of the chain is refused, including one
 re-sent byte-identically, and asking again is refused outright, so a branch
 forked by replaying an earlier round is never handed out and a settled decline
 cannot be turned into a dispatch. Chains may run multiple rounds (asking again for missing input, per
@@ -374,6 +377,14 @@ Persist it around the tool's side effect for durable replay protection. The
 state is signed, not encrypted, so never put credentials or other secrets in
 it. Wire `gateway.pruneMrtrRedemptions` into a cron to drop expired
 redemption rows and resolved-chain claims.
+
+Two catalog rules fail the sync loudly: a mutation or action with a hook must
+declare `mrtrArgs`, and one Convex function may not be registered both with and
+without a gate (an ungated alias would let the model skip the confirmation).
+Queries are exempt from both. Two failures follow from them: re-registering a
+name may not drop its gate (`unregisterTool` first if that is intended), and a
+tool whose hook is configured while its registration lost `mrtrArgs` fails the
+call closed rather than dispatching without the key.
 
 Safety properties: the hook runs only for `tools` passed to
 `handleMcpRequest`, and a registry row registered as MRTR-gated (a hook, or

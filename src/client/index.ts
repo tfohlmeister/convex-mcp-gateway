@@ -906,6 +906,83 @@ function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
   }
 }
 
+/**
+ * Per-tool MRTR invariants, enforced where a catalog enters the gateway
+ * rather than only in `defineMcp*`.
+ *
+ * `defineMcp*` cannot be the only line of defence: a host may hand
+ * `handleMcpRequest({ tools })` a hand-built or spread
+ * `McpToolRegistration`, and nothing downstream would notice. These run
+ * in the same place and for the same reason as
+ * `assertToolHeaderSchemas`, ahead of the fingerprint short-circuit.
+ */
+function assertMrtrToolInvariants(tools: McpToolRegistration[]): void {
+  for (const tool of tools) {
+    // A replayed continuation dispatches again. Without the chain's
+    // idempotency key the tool cannot tell the repeat from a new call,
+    // so a confirmed mutation would apply twice. Queries are exempt:
+    // nothing durable to double-apply.
+    if (
+      tool.beforeCall !== undefined &&
+      tool.mrtrArgs === undefined &&
+      tool.kind !== "query"
+    ) {
+      throw new Error(
+        `MCP tool "${tool.name}" is a ${tool.kind} with beforeCall but no ` +
+          `mrtrArgs. A replayed continuation dispatches again, and the ` +
+          `chain's idempotency key is how the tool deduplicates it.`,
+      );
+    }
+    // NOT ported from `defineMcp*`: "mrtrArgs requires beforeCall".
+    // That rule is right when defining a tool, but at the catalog
+    // boundary a row carrying `mrtrArgs` with no hook is the supported
+    // imperative way to mark a row gated. It fails closed by design
+    // when served by a handler without a matching `beforeCall`, which
+    // is the point, so rejecting it here would break that pattern.
+  }
+}
+
+/**
+ * Reject a catalog that reaches one Convex function through both a
+ * gated and an ungated tool.
+ *
+ * A confirmation is worth only as much as the least guarded route to
+ * the same function: leaving an ungated alias in the catalog hands the
+ * model a name that runs the destructive path with no confirmation, no
+ * chain and no idempotency key.
+ *
+ * Keyed on the resolved `functionHandle` rather than on the reference,
+ * which is why it runs here instead of alongside the per-tool rules:
+ * `api.*` refs are distinct objects per property access and component
+ * refs are freshly minted proxies that `getFunctionName` refuses
+ * outright, so nothing about the reference identifies the function.
+ * The handle does, for every reference kind.
+ *
+ * Queries are exempt for the same reason as above: an ungated alias of
+ * a read is not a bypass of anything.
+ */
+function assertNoUngatedAlias(
+  resolved: { name: string; kind: string; functionHandle: string; mrtrGated?: boolean }[],
+): void {
+  const byHandle = new Map<string, { gated: string[]; open: string[] }>();
+  for (const tool of resolved) {
+    if (tool.kind === "query") continue;
+    const entry = byHandle.get(tool.functionHandle) ?? { gated: [], open: [] };
+    (tool.mrtrGated ? entry.gated : entry.open).push(tool.name);
+    byHandle.set(tool.functionHandle, entry);
+  }
+  for (const entry of byHandle.values()) {
+    if (entry.gated.length > 0 && entry.open.length > 0) {
+      throw new Error(
+        `One Convex function is registered both with and without an MRTR ` +
+          `gate: ${entry.gated.join(", ")} require confirmation, but ` +
+          `${entry.open.join(", ")} do not. The ungated name defeats the ` +
+          `gate. Remove it, or gate every registration of that function.`,
+      );
+    }
+  }
+}
+
 type ResolvedToolSchemas = { inputSchema: unknown; outputSchema: unknown };
 
 /**
@@ -988,7 +1065,8 @@ function assertTaskAuditCompatibility(tools: McpToolRegistration[]): void {
 async function resolveToolHandles(tools: McpToolRegistration[]) {
   assertToolHeaderSchemas(tools);
   assertTaskAuditCompatibility(tools);
-  return await Promise.all(
+  assertMrtrToolInvariants(tools);
+  const handles = await Promise.all(
     tools.map(async (tool) => {
       const schemas = resolveToolSchemas(tool);
       return {
@@ -1020,6 +1098,9 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       };
     }),
   );
+  // Keyed on the resolved handles, so it runs once they exist.
+  assertNoUngatedAlias(handles);
+  return handles;
 }
 
 function assertNoImperativeBeforeCall(tools: McpToolRegistration[]): void {
@@ -1031,6 +1112,15 @@ function assertNoImperativeBeforeCall(tools: McpToolRegistration[]): void {
     );
   }
 }
+
+/**
+ * Bumped whenever a catalog-level rule is added or tightened. Folded
+ * into the fingerprint so an unchanged catalog re-syncs once after an
+ * upgrade and is checked against the current rules. Without it a
+ * deployment that already synced a catalog the new rules reject keeps
+ * its matching fingerprint, never re-syncs, and keeps serving it.
+ */
+const CATALOG_RULES_VERSION = 1;
 
 /**
  * Stable fingerprint of a declarative tool catalog, computed WITHOUT
@@ -1063,7 +1153,11 @@ function toolsFingerprint(tools: McpToolRegistration[]): string {
   // advertising schemas resolved by the old rules indefinitely. Folding
   // the resolver version in makes such a change self-healing: the next
   // request re-syncs the catalog.
-  return JSON.stringify({ resolver: SCHEMA_RESOLVER_VERSION, normalized });
+  return JSON.stringify({
+    resolver: SCHEMA_RESOLVER_VERSION,
+    rules: CATALOG_RULES_VERSION,
+    normalized,
+  });
 }
 
 /**
@@ -1084,6 +1178,7 @@ async function syncDeclaredTools(
   // matching fingerprint and never get checked at all.
   assertToolHeaderSchemas(tools);
   assertTaskAuditCompatibility(tools);
+  assertMrtrToolInvariants(tools);
   const fingerprint = toolsFingerprint(tools);
   const current = await ctx.runQuery(
     component.registry.getToolsFingerprint,
@@ -1168,6 +1263,8 @@ export class McpGateway {
     assertToolHeaderSchemas([tool]);
     assertTaskAuditCompatibility([tool]);
     assertNoImperativeBeforeCall([tool]);
+    // The cross-registration gate rule needs both rows to compare, so it
+    // lives in the component's `registry.registerTool` rather than here.
     const schemas = resolveToolSchemas(tool);
     const handle = await createFunctionHandle(tool.fn as any);
     await ctx.runMutation(this.component.registry.registerTool, {
@@ -1558,7 +1655,7 @@ export class McpGateway {
    *
    * Returns `"finalized"`; `"not_found"` (no such task, or it expired
    * while you were working); `"conflict"` (already terminal, e.g. the
-   * owner cancelled first — the cancel wins); or `"result_too_large"`,
+   * owner cancelled first, the cancel wins); or `"result_too_large"`,
    * which means the task WAS finalized but as `failed`, because the
    * result could not be stored. The last two both mean the client sees
    * something other than the work you just committed, so check the
@@ -1599,7 +1696,7 @@ export class McpGateway {
    * Anything other than `"updated"` means the task did NOT enter
    * `input_required`, so nothing will ask the owner and nothing will
    * resume: `"conflict"` (not `working` any more), `"invalid_requests"`
-   * (the value is not a plain object — a host-side bug, deliberately
+   * (the value is not a plain object, a host-side bug, deliberately
    * distinct from `"conflict"`), `"too_large"`, `"unsupported_executor"`,
    * or `"not_found"`. Throwing from `execute` on a non-`"updated"` answer
    * is the intended handling. Only valid for

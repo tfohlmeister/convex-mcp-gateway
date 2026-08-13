@@ -66,6 +66,88 @@ const resourceTemplateInputFields = {
 
 const resourceTemplateInputValidator = v.object(resourceTemplateInputFields);
 
+/**
+ * True when a stored or incoming row is MRTR-gated. Must match the gate
+ * the handler applies at call time: reserving `mrtrArgs` gates a row on
+ * its own, which is how a host registering straight against the
+ * component marks one, and `mrtrGated` is set by the client wrapper.
+ * Reading only one of the two would both miss a real gate and reject a
+ * legitimate pair.
+ */
+function isGatedRow(row: {
+  mrtrGated?: boolean;
+  mrtrArgs?: { idempotencyKey: string };
+}): boolean {
+  return row.mrtrGated === true || row.mrtrArgs !== undefined;
+}
+
+/**
+ * A confirmation is worth only as much as the least guarded route to
+ * the same Convex function: one function reached through both a gated
+ * and an ungated tool lets a caller skip the confirmation entirely.
+ *
+ * Keyed on `functionHandle`, which is a deterministic identifier for the
+ * function path (`function://<id>`): verified against a real backend to
+ * be identical across repeated calls and across redeploys, and distinct
+ * per function, so two registrations of one function always collide here.
+ *
+ * Enforced in the component so it holds for every writer, including an
+ * older client and a host calling `registry.*` directly. Queries are
+ * exempt: a read has no durable side effect to confirm.
+ */
+async function assertNoGateClash(
+  ctx: MutationCtx,
+  candidate: {
+    name: string;
+    kind: "query" | "mutation" | "action";
+    functionHandle: string;
+    mrtrGated?: boolean;
+    mrtrArgs?: { idempotencyKey: string };
+  },
+  /** The row this upsert replaces, looked up by NAME. */
+  existing: { mrtrGated?: boolean; mrtrArgs?: { idempotencyKey: string } } | null,
+): Promise<void> {
+  const candidateGated = isGatedRow(candidate);
+
+  // An upsert may not weaken an existing gate, whatever it changes
+  // alongside: the handler would keep running the hook while dispatching
+  // without the idempotency key, so a replay would double-apply. Checked
+  // for every kind and against the row found by name, so switching the
+  // function handle or the kind cannot slip past it.
+  if (existing && isGatedRow(existing) && !candidateGated) {
+    throw new ConvexError(
+      `MCP tool "${candidate.name}" is registered with an MRTR gate and ` +
+        `this registration removes it. Unregister it first if that is ` +
+        `intended.`,
+    );
+  }
+
+  // A read has no durable side effect to confirm, so aliasing one is
+  // not a bypass of anything.
+  if (candidate.kind === "query") return;
+  const rows = await ctx.db
+    .query("tools")
+    .withIndex("by_functionHandle", (q) =>
+      q.eq("functionHandle", candidate.functionHandle),
+    )
+    .collect();
+  const clash = rows.find(
+    (row) =>
+      row.name !== candidate.name &&
+      row.kind !== "query" &&
+      isGatedRow(row) !== candidateGated,
+  );
+  if (clash) {
+    throw new ConvexError(
+      `MCP tool "${candidate.name}" registers the same Convex function as ` +
+        `"${clash.name}" with a different MRTR gate. The ungated name ` +
+        `defeats the gate. Gate both, or remove one with unregisterTool ` +
+        `(replaceTools rewrites the whole catalog at once and can change ` +
+        `both together).`,
+    );
+  }
+}
+
 export const registerTool = mutation({
   args: {
     name: v.string(),
@@ -91,6 +173,8 @@ export const registerTool = mutation({
       .query("tools")
       .withIndex("by_name", (q) => q.eq("name", args.name))
       .unique();
+
+    await assertNoGateClash(ctx, args, existing);
 
     if (existing) {
       // db.replace (not patch) so an upsert that omits an optional field
@@ -431,6 +515,33 @@ export const replaceTools = mutation({
       throw new ConvexError(
         `replaceTools received duplicate tool names: ${dupes.join(", ")}`,
       );
+    }
+    // Gate consistency within the incoming catalog. The whole list
+    // lands atomically, so it is checked here rather than per row, and
+    // it is checked in the component so it holds for an older client or
+    // a host writing to the registry directly.
+    const gateByHandle = new Map<
+      string,
+      { gated: string[]; open: string[] }
+    >();
+    for (const tool of args.tools) {
+      if (tool.kind === "query") continue;
+      const entry = gateByHandle.get(tool.functionHandle) ?? {
+        gated: [],
+        open: [],
+      };
+      (isGatedRow(tool) ? entry.gated : entry.open).push(tool.name);
+      gateByHandle.set(tool.functionHandle, entry);
+    }
+    for (const entry of gateByHandle.values()) {
+      if (entry.gated.length > 0 && entry.open.length > 0) {
+        throw new ConvexError(
+          `replaceTools received one Convex function behind both a gated ` +
+            `and an ungated tool: ${entry.gated.join(", ")} require ` +
+            `confirmation, but ${entry.open.join(", ")} do not. The ` +
+            `ungated name defeats the gate.`,
+        );
+      }
     }
     const existing = await ctx.db.query("tools").collect();
     for (const tool of existing) {

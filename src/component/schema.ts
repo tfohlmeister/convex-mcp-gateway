@@ -96,7 +96,12 @@ export default defineSchema({
     /** MCP-facing title, annotations, `_meta`, and security schemes. */
     protocolMetadata: v.optional(v.any()),
     metadata: v.optional(v.any()),
-  }).index("by_name", ["name"]),
+  })
+    .index("by_name", ["name"])
+    // Gate consistency is checked per function, not per name: one Convex
+    // function reached through both a gated and an ungated tool would
+    // let a caller skip the confirmation.
+    .index("by_functionHandle", ["functionHandle"]),
 
   resources: defineTable({
     uri: v.string(),
@@ -265,9 +270,11 @@ export default defineSchema({
    * path that makes the hook ask again (an idempotent replay, or a
    * state-only retry) forks an independent branch that stays answerable
    * after a sibling already resolved the decision. Claiming the chain
-   * closes every branch at once and makes dispatch at-most-once per
-   * chain gateway-side, rather than relying on the tool to deduplicate
-   * on the injected idempotency key.
+   * closes every branch at once: only the continuation that resolved
+   * the chain, re-sent with the same answer, may dispatch again. That
+   * repeat is deliberate (a client whose response was lost), so the
+   * gateway does NOT make dispatch strictly at-most-once; the tool's
+   * injected idempotency key is what keeps the side effect single.
    *
    * Expired rows are dropped by `pruneMrtrRedemptions` alongside the
    * redemption rows, so hosts wire one cron, not two.
@@ -420,12 +427,6 @@ export default defineSchema({
    * duration) but never resource contents. Task rows capture the task
    * id, operation, tool name, and owner subject but never task
    * payloads. `identitySubject` is supplied by the host after resolving
-  /**
-   * Shared audit log for tool calls and opt-in resource operations.
-   * Tool rows capture the tool name/kind, outcome, duration, and
-   * optionally redacted args. Resource rows capture operation metadata
-   * (resource URI, list/read, outcome, duration) but never resource
-   * contents. `identitySubject` is supplied by the host after resolving
    * auth at the HTTP boundary; component code never reads identity
    * directly.
    */
