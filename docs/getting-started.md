@@ -35,9 +35,18 @@ export default app;
 The component owns ten Convex tables: `tools`, `resources`,
 `resourceTemplates`, `config` and `audit`, plus `sessions` and
 `subscriptions` for Streamable-HTTP, and `mrtrRedemptions`, `mrtrChains`
-and `tasks` for the multi-round-trip and task features. The last three
-are TTL-bounded and want a cron: `gateway.pruneMrtrRedemptions` drains
-the first two, `gateway.pruneTasks` the third.
+and `tasks` for the multi-round-trip and task features.
+
+Five of them grow with traffic and want a cron, so wire up whichever
+features you actually enable:
+
+| Table | Prune with |
+|---|---|
+| `audit` | `gateway.pruneAuditEntries(ctx, maxAgeMs)` |
+| `sessions` | `gateway.pruneSessions(ctx, idleMs)` |
+| `subscriptions` | `gateway.pruneResourceSubscriptions(ctx)` |
+| `mrtrRedemptions` + `mrtrChains` | `gateway.pruneMrtrRedemptions(ctx)` |
+| `tasks` | `gateway.pruneTasks(ctx)` |
 
 The component does **not** mount any HTTP routes of its own. The `/mcp/` endpoint and the OAuth discovery route both live
 in your host's `http.ts` (steps 3 and 6 below). The reason is structural:
@@ -90,9 +99,10 @@ registration time. Use `invoices_list` instead.
 
 **Typed return values (optional)**: pass `returns:` with a Convex
 validator and the gateway advertises an MCP `outputSchema` and ships the
-value as `structuredContent` alongside the text block. MCP models
-structured output as an object, so a scalar return (a bare string or
-number) is shipped as text only, with no `structuredContent`. The
+value as `structuredContent` alongside the text block. Any JSON value
+qualifies, scalars and `null` included: the current revision types the
+field as `unknown`, and a client that validates raises a protocol error
+when a tool advertising an `outputSchema` answers without the block. The
 validator is type-checked against the Convex function's actual
 return type at compile time:
 

@@ -426,7 +426,13 @@ Inside the workflow, finalize through the trusted gateway APIs:
   A **declined confirmation is neither.** The negotiation succeeded and its
   outcome was negative, so the example completes the task with a plain
   result and no `isError`, matching how the synchronous MRTR path reports
-  the same decline via `completeCall`. Note the consequence for auditing: a
+  the same decline via `completeCall`. One caveat if the tool also
+  declares `returns`: the decline message is not the tool's output, but
+  it is still stamped as `structuredContent` against the advertised
+  schema, and a validating client rejects the mismatch. On a tool with an
+  `outputSchema`, either decline with `isError: true` (which drops the
+  block) or complete with a value the schema accepts. Note the consequence
+  for auditing: a
   completion that is not marked as an error records `outcome: "allowed"`,
   so if you need declines distinguishable in the audit log, record that
   yourself, exactly as you would on the synchronous path where a decline

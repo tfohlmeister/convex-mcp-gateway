@@ -564,14 +564,19 @@ not need to be reachable from the host.
 
 Generated component API references (`api`, `internal` exported from
 `_generated/api.ts`) are both backed by `anyApi` at runtime, which
-strips the public/internal marker. The rule that matters is which side calls the function. A function the
-HOST must reach through `components.mcpGateway.*` has to be public,
-because the component boundary exposes only public functions; that is
-`registry.*` and `dispatch.*`. A function only the component calls, like
-`audit.recordEntry`, stays `internalMutation` and is invoked through
-`internal.*` from inside the component, which resolves fine. Declaring
-something public that the host never calls widens the boundary for
-nothing.
+strips the public/internal marker. The rule that matters is which side
+calls the function. A function the HOST must reach through
+`components.mcpGateway.*` has to be public, because the component
+boundary exposes only public functions. That covers most of `registry.*`,
+`dispatch.*`, `sessions.*`, `mrtr.*` and `tasks.*`, plus the two `audit`
+functions the host calls directly (`listEntries` and `pruneOlderThan`). A
+function only the component calls, like `audit.recordEntry`, stays
+`internalMutation` and is invoked through `internal.*` from inside the
+component, which resolves fine. Declaring something public that the host
+never calls widens the boundary for nothing.
+
+The distinction is per FUNCTION, not per module: `audit` holds both
+kinds. Judge each one by whether anything in `src/client/` calls it.
 
 ## Failure modes summary
 
