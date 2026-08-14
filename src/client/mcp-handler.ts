@@ -734,7 +734,7 @@ const SERVER_NAME = "convex-mcp-gateway";
 // Kept in step with package.json by release-please; the trailing
 // annotation is what it looks for. A host overrides the whole block
 // with `options.serverInfo`.
-const SERVER_VERSION = "0.9.0"; // x-release-please-version
+const SERVER_VERSION = "0.10.0"; // x-release-please-version
 
 const UNAUTHORIZED = -32001;
 const FORBIDDEN = -32003;
