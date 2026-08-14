@@ -11,6 +11,7 @@ import {
   type McpDeclineReadResult,
   type McpIcon,
   type McpInputRequiredResult,
+  type McpServerInfo,
   type McpToolRegistration,
 } from "../shared.js";
 
@@ -381,14 +382,42 @@ export interface HandleMcpRequestOptions {
    */
   resolveIdentity?: McpIdentityResolver;
   /**
-   * Override the `serverInfo` returned in the `initialize` response.
-   * Defaults to `{ name: "convex-mcp-gateway", version: "0.0.0" }`.
-   * Hosts that white-label or want telemetry-grade version reporting
-   * can supply their own `{ name, version }` here, the constant
-   * baked into this package is intentionally static, because Convex
-   * doesn't expose `package.json` to the runtime.
+   * Override the `serverInfo` returned in the `initialize` response and
+   * in the `_meta` of every stateless result. Defaults to this package's
+   * own name and version; that constant is intentionally static, because
+   * Convex doesn't expose `package.json` to the runtime.
+   *
+   * Supplying this replaces the whole block rather than merging into it,
+   * so a host that only wants to add an icon still restates `name` and
+   * `version`. Beyond those two, the spec's `Implementation` carries
+   * `title`, `description`, `websiteUrl` and `icons` for hosts that
+   * white-label or want telemetry-grade version reporting.
+   *
+   * Two things to know before adding `icons` here, both measured rather
+   * than reasoned about.
+   *
+   * A SPEC-CORRECT icons block takes the connection down on SDK 1.18.0
+   * through 1.18.2, and `describeServerInfoProblem` cannot stop it. Those
+   * builds typed `Icon.sizes` as a bare string, so `sizes: ["48x48"]`,
+   * which is what the spec mandates and what the validator rightly
+   * accepts, fails their parse of the whole `InitializeResult`
+   * ("Expected string, received array at serverInfo.icons.0.sizes").
+   * Omitting `sizes` is accepted by every build we have. The validator
+   * guards the MALFORMED shape, which is a different hazard: it stops the
+   * gateway emitting a block a spec-conformant client would reject. The
+   * old-client hazard is a client-side bug and the only lever here is not
+   * sending `sizes`. Note the escalation over the same field on a tool:
+   * there it costs one `tools/list`, here the client never connects.
+   *
+   * Keep it small, and prefer an `https:` src over a `data:` one. Unlike
+   * a tool descriptor, this block is repeated on every stateless result,
+   * `tools/call` and `resources/read` and every `tasks/get` poll
+   * included, not just the handshake. Measured with the smallest real
+   * inline icon there is, a 1x1 transparent PNG: `name` + `version`
+   * alone is 47 bytes, the same block with two data-URI icons is 534, so
+   * 11x per result. A realistic 48x48 icon is several KB.
    */
-  serverInfo?: { name: string; version: string };
+  serverInfo?: McpServerInfo;
   /**
    * Challenge anonymous requests with `401` instead of letting them
    * through to `initialize` / `tools/list`. Default `false`.
@@ -2306,12 +2335,6 @@ function nestsTooDeep(value: unknown): boolean {
 }
 
 /**
- * Validate MCP resource/content annotations. Returns a human-readable
- * problem string, or `null` when valid (including when `undefined`).
- * Exported so the `defineMcp*` helpers can fail loud at declaration time
- * with the same rules the request handler enforces on provider output.
- */
-/**
  * Validate an MCP `icons` array (tools, resources, and resource templates all
  * carry the same shape). Per the spec's `Icon`: `src` is required, everything
  * else optional, `theme` constrained to `"light"` / `"dark"`.
@@ -2358,6 +2381,45 @@ export function describeIconsProblem(
   return null;
 }
 
+/**
+ * Validate the `serverInfo` option against the spec's `Implementation`.
+ * Returns a human-readable problem string, or `null` when valid
+ * (including when `undefined`).
+ *
+ * The gateway's own default block is what this guards the wire against
+ * replacing badly. A host builds this object once at mount time from
+ * constants, so a problem here is wrong for every request rather than for
+ * one caller's arguments, which is why `handleMcpRequest` throws on it
+ * instead of answering the request with an error.
+ */
+export function describeServerInfoProblem(
+  serverInfo: unknown,
+): string | null {
+  if (serverInfo === undefined) return null;
+  if (!isPlainObject(serverInfo)) return "serverInfo must be an object";
+  // `name` and `version` are the two the spec requires, and the default
+  // block always carries both; an override that drops one would emit an
+  // `Implementation` a validating client rejects outright.
+  for (const key of ["name", "version"]) {
+    const value = serverInfo[key];
+    if (typeof value !== "string" || value.length === 0) {
+      return `serverInfo.${key} must be a non-empty string`;
+    }
+  }
+  for (const key of ["title", "description", "websiteUrl"]) {
+    if (serverInfo[key] !== undefined && typeof serverInfo[key] !== "string") {
+      return `serverInfo.${key} must be a string`;
+    }
+  }
+  return describeIconsProblem(serverInfo.icons, "serverInfo");
+}
+
+/**
+ * Validate MCP resource/content annotations. Returns a human-readable
+ * problem string, or `null` when valid (including when `undefined`).
+ * Exported so the `defineMcp*` helpers can fail loud at declaration time
+ * with the same rules the request handler enforces on provider output.
+ */
 export function describeAnnotationsProblem(
   annotations: unknown,
 ): string | null {
@@ -2602,6 +2664,13 @@ export async function handleMcpRequest(
       "tasks.scope must be a non-empty string; omit it for an unscoped mount.",
     );
   }
+  // Same class of error, same place: `serverInfo` is built once from
+  // constants, so a malformed one is wrong for every request. It also
+  // rides on EVERY result, `initialize` included, so emitting it and
+  // letting the client decide costs a connection that fails with a zod
+  // error on the other side of the wire instead of a named field here.
+  const serverInfoProblem = describeServerInfoProblem(options.serverInfo);
+  if (serverInfoProblem) throw new Error(serverInfoProblem);
   // Before the preflight branch: telling a browser via CORS that a
   // cross-origin POST is permitted, only to 403 the POST itself, defeats
   // the point of preflight. A disallowed origin gets a bare 403 with no

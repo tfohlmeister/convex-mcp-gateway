@@ -62,6 +62,7 @@ export type {
   McpHostCallbackCtx,
   McpIcon,
   McpInputRequiredResult,
+  McpServerInfo,
   McpToolAnnotations,
   McpToolDefinition,
   McpToolFunctionReference,

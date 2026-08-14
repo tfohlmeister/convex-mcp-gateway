@@ -311,6 +311,42 @@ recipes.
 > may cap or front-truncate the text. Keep it short, lead with what matters,
 > and enforce hard rules in `authorize` or your tool handler.
 
+> **White-labelling the server identity.** Pass `serverInfo` to replace the
+> block the gateway reports on `initialize` (and in the `_meta` of every
+> stateless result). It takes the full MCP `Implementation` shape:
+>
+> ```ts
+> serverInfo: {
+>   name: "acme-gateway",          // identifier, required
+>   version: "3.1.4",              // required
+>   title: "Acme Gateway",         // display name
+>   description: "Acme's MCP front door",
+>   websiteUrl: "https://acme.example.com",
+>   icons: [{ src: "https://acme.example.com/icon.png", sizes: ["48x48"] }],
+> }
+> ```
+>
+> It replaces the whole block rather than merging into it, so restate `name`
+> and `version` even when all you want is an icon. Omit the option entirely
+> and the response is unchanged: this package's own name and version, and no
+> other keys. `icons` follows the same rules as everywhere else (see
+> [resources.md](./resources.md)); a malformed one throws at the mount
+> instead of shipping an `initialize` result the client may reject outright.
+>
+> Two caveats specific to putting icons *here*, both measured:
+>
+> - **A spec-correct `sizes` array breaks SDK 1.18.0–1.18.2.** Those builds
+>   typed `Icon.sizes` as a bare string, so `sizes: ["48x48"]` fails their
+>   parse of the entire `InitializeResult` and the client never connects.
+>   Validation cannot help, because the array is what the spec mandates.
+>   Omitting `sizes` is accepted by every build. On a tool the same bug
+>   only costs a `tools/list`; on the handshake it costs the session.
+> - **This block rides on every stateless result**, not just the handshake:
+>   `tools/call`, `resources/read`, every `tasks/get` poll. `name` +
+>   `version` alone is 47 bytes; the same block with two 1×1 data-URI icons
+>   is 534, so 11× per response, and a realistic 48×48 icon is several KB.
+>   Prefer an `https:` src over a `data:` one.
+
 ## 5. (Optional) Mount OAuth discovery
 
 If you want MCP clients to discover your authorization server

@@ -5,6 +5,7 @@ import {
   defineMcpResource,
   defineMcpResourceTemplate,
   McpGateway,
+  type McpServerInfo,
 } from "./index.js";
 import {
   describeAnnotationsProblem,
@@ -12,6 +13,7 @@ import {
   describeResourceContentsProblem,
   describeResourceProblem,
   describeResourceTemplateProblem,
+  describeServerInfoProblem,
   handleMcpRequest,
   type McpResourceProvider,
   type McpResourceTemplateProvider,
@@ -3916,6 +3918,183 @@ describe("icons validation", () => {
         icons: "nope",
       }),
     ).toBe("template.icons must be an array");
+  });
+});
+
+describe("serverInfo carries the full Implementation shape", () => {
+  // Annotated rather than inferred: this also pins that a full spec block
+  // is assignable to the public type, through the entry point a host imports.
+  const fullServerInfo: McpServerInfo = {
+    name: "acme-gateway",
+    title: "Acme Gateway",
+    version: "3.1.4",
+    description: "Acme's MCP front door",
+    websiteUrl: "https://acme.example.com",
+    icons: [
+      { src: "https://acme.example.com/icon.png", sizes: ["48x48"] },
+      { src: "data:image/svg+xml;base64,AAA=", sizes: ["any"], theme: "dark" },
+    ],
+  };
+
+  test("reaches the initialize result whole", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        serverInfo: fullServerInfo,
+      },
+    );
+
+    const body = await readJson(response);
+    // Not toMatchObject: the point is that no field is dropped on the way
+    // through, so compare the whole block.
+    expect(body.result?.serverInfo).toEqual(fullServerInfo);
+  });
+
+  test("reaches the stateless _meta block whole", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const response = await handleMcpRequest(
+      ctx,
+      statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        serverInfo: fullServerInfo,
+      },
+    );
+
+    const body = await readJson(response);
+    expect(
+      (body.result?._meta as Record<string, unknown>)[
+        "io.modelcontextprotocol/serverInfo"
+      ],
+    ).toEqual(fullServerInfo);
+  });
+
+  test("omitting the new fields leaves the default block unchanged", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    const body = await readJson(response);
+    // Exactly two keys, so widening the type did not start emitting
+    // `title: undefined` or an empty `icons` array to every client.
+    expect(Object.keys(body.result?.serverInfo as object).sort()).toEqual([
+      "name",
+      "version",
+    ]);
+  });
+
+  test("a two-field override still works and is not merged into", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        serverInfo: { name: "acme", version: "1.0.0" },
+      },
+    );
+
+    const body = await readJson(response);
+    expect(body.result?.serverInfo).toEqual({ name: "acme", version: "1.0.0" });
+  });
+
+  test("a malformed block fails the mount rather than the client", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    // A bare-string `sizes` is what a spec-conformant client rejects the
+    // whole response over, so it must never reach the wire and the throw
+    // names the field. It is NOT the old-SDK hazard: 1.18.0-1.18.2 would
+    // accept this and break on the spec-correct array instead, which the
+    // validator accepts by design and the fixture above covers.
+    await expect(
+      handleMcpRequest(
+        ctx,
+        jsonRpcRequest({
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25" },
+        }),
+        component,
+        {
+          authorize: async () => ({ allowed: true }),
+          serverInfo: {
+            name: "acme",
+            version: "1.0.0",
+            icons: [{ src: "a", sizes: "48x48" }] as never,
+          },
+        },
+      ),
+    ).rejects.toThrow("serverInfo.icons[].sizes must be an array of strings");
+
+    // Every method rides the same block, so the guard is not
+    // initialize-only.
+    await expect(
+      handleMcpRequest(
+        ctx,
+        statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
+        component,
+        {
+          authorize: async () => ({ allowed: true }),
+          serverInfo: { name: "acme", version: "" },
+        },
+      ),
+    ).rejects.toThrow("serverInfo.version must be a non-empty string");
+  });
+
+  test("describeServerInfoProblem: accepts valid blocks, names each bad field", () => {
+    expect(describeServerInfoProblem(undefined)).toBeNull();
+    expect(describeServerInfoProblem(fullServerInfo)).toBeNull();
+    expect(describeServerInfoProblem({ name: "a", version: "1" })).toBeNull();
+
+    expect(describeServerInfoProblem("acme")).toBe(
+      "serverInfo must be an object",
+    );
+    expect(describeServerInfoProblem({ version: "1" })).toBe(
+      "serverInfo.name must be a non-empty string",
+    );
+    expect(describeServerInfoProblem({ name: "a" })).toBe(
+      "serverInfo.version must be a non-empty string",
+    );
+    expect(describeServerInfoProblem({ name: "a", version: "1", title: 1 })).toBe(
+      "serverInfo.title must be a string",
+    );
+    expect(
+      describeServerInfoProblem({ name: "a", version: "1", description: [] }),
+    ).toBe("serverInfo.description must be a string");
+    expect(
+      describeServerInfoProblem({ name: "a", version: "1", websiteUrl: 1 }),
+    ).toBe("serverInfo.websiteUrl must be a string");
+    // Delegated, and the label follows through so the message points at
+    // `serverInfo` rather than at a tool.
+    expect(
+      describeServerInfoProblem({ name: "a", version: "1", icons: [{}] }),
+    ).toBe("serverInfo.icons[].src must be a non-empty string");
   });
 });
 

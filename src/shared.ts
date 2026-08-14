@@ -178,14 +178,6 @@ export function completeCall(
 }
 
 /**
- * A single entry of a tool's `securitySchemes`. The field is still a
- * draft addition to the MCP Tool spec and the gateway only passes it
- * through, so the shape stays open: `type` plus whatever the scheme
- * carries (`scopes` for `oauth2`, nothing for `noauth`). Pinning the
- * union here would reject schemes the spec adds later without buying
- * any runtime safety.
- */
-/**
  * An icon a client may display next to a tool, resource, or template. `src`
  * is host-supplied and reaches the client verbatim: the gateway advertises
  * it and never fetches it, so the consumer-side precautions the spec
@@ -206,10 +198,10 @@ export function completeCall(
  * 1.18.0 through 1.18.2 typed `sizes` as a bare string and hard-fail on
  * the spec-mandated array form.
  *
- * The spec puts `icons` on two further types this gateway does not carry
- * it on: `Prompt` (no prompts feature here) and `Implementation`, i.e.
- * `serverInfo`, whose option type is `{ name, version }`. Both are gaps,
- * not decisions.
+ * The spec puts `icons` on one further type this gateway does not carry
+ * it on: `Prompt`. That is a gap rather than a decision, and it stays one
+ * until there is a prompts feature to hang it off. `Implementation` is
+ * covered, see `McpServerInfo`.
  */
 export interface McpIcon {
   src: string;
@@ -219,6 +211,46 @@ export interface McpIcon {
   theme?: "light" | "dark";
 }
 
+/**
+ * The spec's `Implementation`, which the gateway returns as `serverInfo`
+ * on `initialize` and in the `io.modelcontextprotocol/serverInfo` `_meta`
+ * block of every stateless result.
+ *
+ * `name` and `version` identify the build; the other four are display
+ * metadata a white-labelling host may want. All of them reach the client
+ * verbatim, so the same reasoning as `McpIcon` applies: nothing here is
+ * fetched by the gateway, and nothing here is era-gated. `title` predates
+ * the gateway's DEFAULT revision and the rest arrived with it, and the
+ * three string fields are measured safe on a client older than all of
+ * them: SDK 1.18.0 keeps them rather than rejecting the response.
+ *
+ * `icons` is the exception, and not in the direction the validator
+ * covers. `describeServerInfoProblem` stops a MALFORMED block reaching
+ * the wire, because a spec-conformant client rejects the whole response
+ * over one bad entry, and for `initialize` that means it never connects.
+ * But the input that breaks SDK 1.18.0 through 1.18.2 is the WELL-FORMED
+ * one: they typed `sizes` as a bare string, so the spec-mandated array
+ * fails their parse and no validator can help. See the `serverInfo`
+ * option docs for the measurements and the one lever a host has.
+ */
+export interface McpServerInfo {
+  name: string;
+  /** Display name, where `name` is the identifier. */
+  title?: string;
+  version: string;
+  description?: string;
+  websiteUrl?: string;
+  icons?: McpIcon[];
+}
+
+/**
+ * A single entry of a tool's `securitySchemes`. The field is still a
+ * draft addition to the MCP Tool spec and the gateway only passes it
+ * through, so the shape stays open: `type` plus whatever the scheme
+ * carries (`scopes` for `oauth2`, nothing for `noauth`). Pinning the
+ * union here would reject schemes the spec adds later without buying
+ * any runtime safety.
+ */
 export interface McpToolSecurityScheme {
   type: string;
   [key: string]: unknown;
