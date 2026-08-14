@@ -125,6 +125,15 @@ that option is off by default. So the paragraph above is a statement
 about SSE framing, not a claim that the three revisions are
 byte-identical in every respect.
 
+`ping` is served on the legacy path and refused on the stateless one,
+mirroring `resources/subscribe`: the method is gone in 2026-07-28, so a
+stateless caller gets a 404 and a `-32601` naming the revision that
+removed it. On the legacy path it answers an empty result and is gated
+on neither identity nor a capability, because no revision makes it
+conditional and the reference SDK answers it from its `Protocol`
+constructor. A client is entitled to assume a liveness check works on
+any connection it already holds.
+
 A 2026-07-28 POST is stateless when both
 `MCP-Protocol-Version` and
 `params._meta["io.modelcontextprotocol/protocolVersion"]` equal

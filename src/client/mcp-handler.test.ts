@@ -1423,6 +1423,52 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(body.result).not.toHaveProperty("instructions");
   });
 
+  test("answers ping with an empty result on a session-era connection", async () => {
+    // Not capability-gated anywhere in the spec, and the reference SDK
+    // registers its handler in the `Protocol` constructor, so every client
+    // may assume a liveness check works on a connection it already holds.
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const options = { authorize: async () => ({ allowed: true as const }) };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        { id: 2, method: "ping" },
+        init.headers.get("mcp-session-id")!,
+      ),
+      component,
+      options,
+    );
+
+    const body = await readJson(response);
+    expect(body.error).toBeUndefined();
+    expect(body.result).toEqual({});
+  });
+
+  test("refuses ping on the stateless path, where the spec removed it", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+
+    const response = await handleMcpRequest(
+      ctx,
+      statelessJsonRpcRequest({ id: 1, method: "ping" }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(response.status).toBe(404);
+    const body = await readJson(response);
+    expect(body.error?.code).toBe(-32601);
+    expect(body.error?.message).toMatch(/legacy-only/);
+  });
+
   test("advertises resources capability", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
