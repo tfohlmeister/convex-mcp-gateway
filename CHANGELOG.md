@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.7.0...v0.8.0) (2026-08-14)
+
+
+### Features
+
+* accept MCP 2025-11-25 as a supported legacy revision ([#24](https://github.com/tfohlmeister/convex-mcp-gateway/issues/24)) ([26c9d98](https://github.com/tfohlmeister/convex-mcp-gateway/commit/26c9d9856f7eb917882e6b95771523a03ee4c9cb)), closes [#14](https://github.com/tfohlmeister/convex-mcp-gateway/issues/14)
+* add poll-first MCP Tasks with Convex Workflow ([#23](https://github.com/tfohlmeister/convex-mcp-gateway/issues/23)) ([0e49fe8](https://github.com/tfohlmeister/convex-mcp-gateway/commit/0e49fe81cd4106ccb9ec3558bebb201cf87d7a56))
+* bounded JSON Schema 2020-12 $ref and composition support ([#25](https://github.com/tfohlmeister/convex-mcp-gateway/issues/25)) ([ac8f933](https://github.com/tfohlmeister/convex-mcp-gateway/commit/ac8f9332629afcaff8737342e9781285a1255648)), closes [#15](https://github.com/tfohlmeister/convex-mcp-gateway/issues/15)
+* support MCP elicitation via input_required ([#22](https://github.com/tfohlmeister/convex-mcp-gateway/issues/22)) ([1d7f8c0](https://github.com/tfohlmeister/convex-mcp-gateway/commit/1d7f8c0922559200163d9e9bed34b66fb413336c))
+
+
+### Bug Fixes
+
+* align the two result contracts and correct what the docs promise ([#36](https://github.com/tfohlmeister/convex-mcp-gateway/issues/36)) ([c4d141d](https://github.com/tfohlmeister/convex-mcp-gateway/commit/c4d141d03a355f7575ead2d5ec7c856a2b1bf578))
+* correct MRTR replay contract and dual-era docs claims ([#28](https://github.com/tfohlmeister/convex-mcp-gateway/issues/28)) ([595b677](https://github.com/tfohlmeister/convex-mcp-gateway/commit/595b67742c6ed18cd863be2a73307e2d9c4738c3))
+* enforce the MRTR confirmation gate where a catalog enters the gateway ([#31](https://github.com/tfohlmeister/convex-mcp-gateway/issues/31)) ([f4fde31](https://github.com/tfohlmeister/convex-mcp-gateway/commit/f4fde3185c672ea70e7e71640948266500d30eec))
+* include data.uri on the resource-not-found error ([#35](https://github.com/tfohlmeister/convex-mcp-gateway/issues/35)) ([c875bdc](https://github.com/tfohlmeister/convex-mcp-gateway/commit/c875bdcd57263200853ea655d8a5cb8bb101448f))
+* make a task result the CallToolResult the same call returns inline ([#33](https://github.com/tfohlmeister/convex-mcp-gateway/issues/33)) ([d235701](https://github.com/tfohlmeister/convex-mcp-gateway/commit/d235701a50256d87656b222a12cbb96b1d80d37d)), closes [#30](https://github.com/tfohlmeister/convex-mcp-gateway/issues/30)
+* make an MRTR chain resolve exactly once ([#29](https://github.com/tfohlmeister/convex-mcp-gateway/issues/29)) ([302775f](https://github.com/tfohlmeister/convex-mcp-gateway/commit/302775f6a2d7059a780e861d9bdbb1f1dca6e5ba))
+* only emit structuredContent for a value shaped like structured output ([#34](https://github.com/tfohlmeister/convex-mcp-gateway/issues/34)) ([808469d](https://github.com/tfohlmeister/convex-mcp-gateway/commit/808469d4f8cb066e878f308b8b4374847caa6ac5))
+* unbreak tools/list for legacy clients, and two result-handling holes ([#39](https://github.com/tfohlmeister/convex-mcp-gateway/issues/39)) ([7c7c93c](https://github.com/tfohlmeister/convex-mcp-gateway/commit/7c7c93c63e7ecd903aa2334748d48535d19af537))
+
 ## [0.7.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.6.1...v0.7.0) (2026-08-12)
 
 Adds the stateless MCP `2026-07-28` server path alongside the existing
