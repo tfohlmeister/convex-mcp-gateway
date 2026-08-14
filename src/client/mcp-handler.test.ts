@@ -1455,6 +1455,92 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
+  test("advertises resources on initialize for a hook-only mount", async () => {
+    // The `server/discover` half of this is covered in mrtr.test.ts. Both
+    // handshakes compute the flag separately, so advertising from only one
+    // would make the capability depend on which one the client used.
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18" },
+      }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        // No providers, no templates, no registry rows: the read hook is
+        // the entire resource implementation.
+        beforeResourceRead: async () => null,
+      },
+    );
+
+    const body = await readJson(response);
+    expect(body.result?.capabilities).toEqual({
+      tools: {},
+      resources: {},
+    });
+  });
+
+  test("lists an empty catalog on a hook-only mount rather than refusing", async () => {
+    // `resources/list` is the advertised capability's base method, so a
+    // client that lists on connect must not meet a -32601 for a feature
+    // the handshake just promised. Nothing is registered, so it lists
+    // empty.
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const options = {
+      authorize: async () => ({ allowed: true as const }),
+      beforeResourceRead: async () => null,
+    };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const sessionId = init.headers.get("mcp-session-id");
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId!),
+      component,
+      options,
+    );
+
+    const body = await readJson(response);
+    expect(body.error).toBeUndefined();
+    expect(body.result).toEqual({ resources: [] });
+  });
+
+  test("still refuses resources/list when nothing backs it at all", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const options = { authorize: async () => ({ allowed: true as const }) };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const response = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/list" },
+        init.headers.get("mcp-session-id")!,
+      ),
+      component,
+      options,
+    );
+
+    const body = await readJson(response);
+    expect(body.error?.code).toBe(-32601);
+  });
+
   test("serves resources/list and resources/read through providers", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
