@@ -6,6 +6,7 @@ import {
 } from "convex-mcp-gateway";
 import { components, internal } from "./_generated/api.js";
 import { httpAction } from "./_generated/server.js";
+import { conformanceTools } from "./conformance.js";
 import { resources, resourceTemplates, tools } from "./mcp.js";
 
 const gateway = new McpGateway(components.mcpGateway);
@@ -106,9 +107,35 @@ const resolveIdentity = async (token: string) => {
   return null;
 };
 
+/**
+ * Serve the conformance fixture catalog instead of the invoice one, for
+ * running the official MCP conformance suite against this deployment:
+ *
+ * ```sh
+ * npx convex env set MCP_CONFORMANCE 1   # then redeploy
+ * npx @modelcontextprotocol/conformance server --url <site-url>/mcp
+ * ```
+ *
+ * A switch rather than a second mount, and that is forced rather than
+ * chosen. The component keeps ONE tool registry and one catalog
+ * fingerprint, so two mounts passing different `tools` arrays re-sync
+ * (and delete each other's tools) on every reconciliation. Mounts may
+ * differ by `tasks` or `authorize`, never by their catalog, which is the
+ * same rule `invoices_bulkMarkPaid` documents in mcp.ts.
+ *
+ * The suite cannot send an Authorization header, so this mode also drops
+ * the authorization bar. It stays off by default and the example is
+ * otherwise untouched.
+ */
+// Convex exposes `process.env` in its runtime, but this example's
+// tsconfig carries no Node types (and should not: the Convex runtime is
+// not Node). Declare only the slice used here.
+declare const process: { env: Record<string, string | undefined> };
+const CONFORMANCE = process.env.MCP_CONFORMANCE === "1";
+
 const mcpHandler = httpAction(async (ctx, request) =>
   gateway.handleMcpRequest(ctx, request, {
-    authorize,
+    authorize: CONFORMANCE ? async () => ({ allowed: true }) : authorize,
     cors: true,
     // `cors` decides what a browser may read; `allowedOrigins` decides
     // which origins the gateway serves at all. Any deployment with browser
@@ -125,7 +152,7 @@ const mcpHandler = httpAction(async (ctx, request) =>
     // Declarative catalog: the registry is reconciled from this list on
     // each initialize, so no separate registerDefaults mutation is
     // needed for the HTTP path.
-    tools,
+    tools: CONFORMANCE ? conformanceTools : tools,
     // MCP resources: a concrete resource plus an RFC 6570 template. Reads
     // run through `authorizeResource` and are recorded in the audit log.
     resources,
@@ -314,7 +341,10 @@ const mcpHandlerHostTasks = httpAction(async (ctx, request) =>
     authorize,
     cors: true,
     resolveIdentity,
-    tools,
+    // Same catalog as the primary mount, in both modes. Two mounts that
+    // disagree about the catalog delete each other's tools on every
+    // reconciliation, so the conformance switch has to reach here too.
+    tools: CONFORMANCE ? conformanceTools : tools,
     tasks: {
       // Paired with `scope: "main"` on the primary mount: tasks created
       // here are invisible there and vice versa, so a confirmation sent to
