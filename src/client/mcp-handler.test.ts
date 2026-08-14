@@ -402,7 +402,9 @@ describe("handleMcpRequest metadata and resources", () => {
       _meta: {
         "io.modelcontextprotocol/serverInfo": {
           name: "convex-mcp-gateway",
-          version: "0.0.0",
+          // Not the literal version: release-please rewrites it on every
+          // release, and pinning it here would break the suite each time.
+          version: expect.stringMatching(/^\d+\.\d+\.\d+/),
         },
       },
     });

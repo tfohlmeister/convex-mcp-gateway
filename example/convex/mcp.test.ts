@@ -3529,6 +3529,26 @@ describe("MCP tasks (modern, e2e)", () => {
     }
   });
 
+  test("an unrepresentable tool value is named as that, not as a size", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = newTest();
+      // The tool SUCCEEDS and commits, then returns a `v.int64()` the
+      // envelope cannot carry. The executor measures the value after the
+      // fact, so this is the one place a seven-byte result gets refused:
+      // reporting it against the 256 KiB cap would send an operator
+      // hunting for a size problem that does not exist.
+      const taskId = await startRecountTask(t, { bigintResult: true });
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      const failed = await getTask(t, taskId);
+      expect(failed.result?.task.status).toBe("failed");
+      expect(failed.result?.task.error?.message).toMatch(/cannot be serialized/);
+      expect(failed.result?.task.error?.message).not.toMatch(/262144/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("the task result is byte-identical to the synchronous result", async () => {
     vi.useFakeTimers();
     try {

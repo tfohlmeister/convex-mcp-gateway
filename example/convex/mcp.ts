@@ -137,8 +137,13 @@ export const tools: McpToolRegistration[] = [
       failWith: v.optional(v.string()),
       failPlain: v.optional(v.string()),
       padResult: v.optional(v.float64()),
+      bigintResult: v.optional(v.boolean()),
     },
-    returns: v.object({ total: v.float64(), pad: v.optional(v.string()) }),
+    returns: v.object({
+      total: v.float64(),
+      pad: v.optional(v.string()),
+      big: v.optional(v.int64()),
+    }),
     // Opt-in MCP Tasks: with the `tasks` option configured in http.ts, a
     // modern client may send `tools/call` with a `task` request and poll
     // the returned handle. The mutation then runs after the HTTP request

@@ -148,8 +148,16 @@ export const recount = mutation({
     // Test hook: pads the result past the task result cap so the suite can
     // exercise the oversized-result path.
     padResult: v.optional(v.number()),
+    // Test hook: returns a v.int64(), which JSON cannot represent, so the
+    // suite can exercise the unrepresentable-result path separately from
+    // the oversized one. The two must not report as each other.
+    bigintResult: v.optional(v.boolean()),
   },
-  returns: v.object({ total: v.number(), pad: v.optional(v.string()) }),
+  returns: v.object({
+    total: v.number(),
+    pad: v.optional(v.string()),
+    big: v.optional(v.int64()),
+  }),
   handler: async (ctx, args) => {
     // Test hooks: `failWith` exercises the deliberate (ConvexError)
     // channel, `failPlain` the accidental one, whose text must NOT reach
@@ -162,6 +170,7 @@ export const recount = mutation({
       ...(args.padResult !== undefined
         ? { pad: "x".repeat(args.padResult) }
         : {}),
+      ...(args.bigintResult === true ? { big: BigInt(7) } : {}),
     };
   },
 });

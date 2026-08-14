@@ -120,11 +120,28 @@ permits a non-object `outputSchema`; everything up to `2025-11-25`
 requires `type: "object"` at the root, and a client validating to those
 revisions rejects the entire `tools/list` response over a single
 scalar-rooted schema. The gateway therefore withholds such a schema from
-those clients rather than hiding every tool from them, so a
-`returns: v.string()` tool reads as untyped there, with its value in the
-text block as always. Wrapping the return
-(`v.object({ value: v.string() })`) gets the schema advertised to
-everyone.
+those clients rather than hiding every tool from them: the tool reads as
+untyped there, with its value in the text block as always, and it gets
+no `structuredContent` either, since that field is object-typed on those
+same revisions.
+
+`v.string()` is the obvious case. The surprising one is a **union**,
+which compiles to `anyOf` and so has no root `type` even when every
+branch is an object:
+
+| `returns:` | root | advertised to a legacy client |
+|---|---|---|
+| `v.object({ total: v.float64() })` | `type: "object"` | yes |
+| `v.record(v.string(), v.float64())` | `type: "object"` | yes |
+| `v.string()`, `v.float64()` | scalar | no |
+| `v.union(v.object(A), v.object(B))` | `anyOf` | no |
+| `v.union(v.object(A), v.null())` | `anyOf` | no |
+| `v.any()` | `{}` | no |
+
+If you want the schema advertised to every client, keep one object at
+the root and move the choice inside it, e.g.
+`v.object({ result: v.union(A, B) })` or an optional field instead of a
+nullable union. Modern clients get the schema either way.
 
 **Injecting the caller identity (optional)**: a dispatched tool runs
 inside the component, where `ctx.auth` is unavailable. To give a tool

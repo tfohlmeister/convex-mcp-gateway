@@ -628,7 +628,10 @@ const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const SUPPORTED_PROTOCOL_VERSIONS = LEGACY_PROTOCOL_VERSIONS;
 const DEFAULT_PROTOCOL_VERSION = LEGACY_PROTOCOL_VERSIONS[0];
 const SERVER_NAME = "convex-mcp-gateway";
-const SERVER_VERSION = "0.0.0";
+// Kept in step with package.json by release-please; the trailing
+// annotation is what it looks for. A host overrides the whole block
+// with `options.serverInfo`.
+const SERVER_VERSION = "0.8.0"; // x-release-please-version
 
 const UNAUTHORIZED = -32001;
 const FORBIDDEN = -32003;
@@ -2384,8 +2387,8 @@ async function handlePost(
   }
 
   // MCP-Protocol-Version header: required on post-initialize requests
-  // by spec. Missing → silently default to 2025-03-26 (legacy clients).
-  // Unsupported value → MUST 400 per spec.
+  // by spec. Missing → silently default to DEFAULT_PROTOCOL_VERSION
+  // (legacy clients). Unsupported value → MUST 400 per spec.
   if (!isInitialize && !isModern) {
     const protoHeader = headerProtocolVersion;
     if (

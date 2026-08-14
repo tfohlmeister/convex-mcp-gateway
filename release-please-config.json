@@ -3,7 +3,13 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "release-type": "node"
+      "release-type": "node",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "src/client/mcp-handler.ts"
+        }
+      ]
     }
   }
 }
