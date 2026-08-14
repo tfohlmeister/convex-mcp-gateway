@@ -152,6 +152,15 @@ mints another live sibling each time, all of which the chain claim
 closes as soon as one of them resolves),
 `completeCall()` (finish the call without dispatching, e.g. a declined
 confirmation), or `null`/`undefined` (continue to the Convex function).
+Because the hook runs in the HOST, its first argument is the host's own
+Convex context: `ctx.runQuery` / `runMutation` / `runAction` and
+`ctx.auth` are all available and typed (`McpHostCallbackCtx`, shared
+with the `authorize` callback). That is what lets a confirmation name
+what it is about ("delete all 12 notes?") rather than asking in the
+abstract. It also means a hook can write, so keep in mind that a client
+may re-send an unresolved continuation and re-run it: anything with a
+side effect belongs behind the chain's idempotency key, not in the hook.
+
 The underlying function therefore stays MCP-unaware: it never parses
 input-response envelopes, and the only gateway-injected argument is the
 chain's stable idempotency key (`mrtrArgs`), which is audited like any

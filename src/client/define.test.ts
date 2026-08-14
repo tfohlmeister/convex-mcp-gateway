@@ -9,6 +9,8 @@ import {
   defineMcpResourceTemplate,
   mcpCallerValidator,
   McpGateway,
+  type McpAuthorizerHandler,
+  type McpBeforeCallHandler,
   type McpCaller,
 } from "./index.js";
 import { describeToolHeaderSchemaProblem } from "./mcp-handler.js";
@@ -806,5 +808,47 @@ describe("taskSupport and argument redaction are mutually exclusive", () => {
     await expect(
       gateway.registerTool({} as never, taskTool(true) as never),
     ).rejects.not.toThrow(/cannot combine taskSupport/);
+  });
+});
+
+/**
+ * The context a host callback receives is the HOST's Convex context, so
+ * a hook can read the host's tables. Both callback types once declared
+ * only `{ auth } & Record<string, unknown>`, which typed `runQuery` as
+ * `unknown` and forced every host that wanted to look something up to
+ * cast first, while the resource-side callbacks next to them were typed
+ * properly. These are compile-time assertions, enforced by the
+ * `typecheck` step of `pnpm run check` (`tsc --noEmit`) rather than by
+ * vitest, whose `--typecheck` only reads `*.test-d.ts`. Narrowing the
+ * context again turns each `ctx.runQuery` below into a TS18046 and
+ * fails the build, instead of quietly reintroducing the cast.
+ */
+describe("host callback context typing", () => {
+  test("beforeCall can query without a cast", async () => {
+    const hook: McpBeforeCallHandler = async (ctx) => {
+      const total: number = await ctx.runQuery(
+        "anything" as never,
+        {} as never,
+      );
+      await ctx.runMutation("anything" as never, {} as never);
+      await ctx.runAction("anything" as never, {} as never);
+      await ctx.auth.getUserIdentity();
+      // Still open for whatever else the host runtime provides.
+      const extra: unknown = ctx.somethingHostSpecific;
+      return total >= 0 && extra === undefined ? null : null;
+    };
+    expect(typeof hook).toBe("function");
+  });
+
+  test("authorize can query without a cast", async () => {
+    const authorize: McpAuthorizerHandler = async (ctx) => {
+      // The realistic case: roles live in a table, not in the token.
+      const roles: string[] = await ctx.runQuery(
+        "anything" as never,
+        {} as never,
+      );
+      return { allowed: roles.length > 0 };
+    };
+    expect(typeof authorize).toBe("function");
   });
 });

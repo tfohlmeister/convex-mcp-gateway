@@ -54,6 +54,7 @@ export type {
   McpBeforeCallResult,
   McpCaller,
   McpCompleteCallResult,
+  McpHostCallbackCtx,
   McpIcon,
   McpInputRequiredResult,
   McpToolAnnotations,

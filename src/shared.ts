@@ -334,11 +334,33 @@ export type McpBeforeCallArgs = {
   round?: number;
 };
 
+/**
+ * The context every host callback receives: the host's own Convex
+ * context, unchanged.
+ *
+ * These callbacks run in the HOST, not inside the component, which is
+ * what lets them read and write the host's tables. An authorizer that
+ * looks a role up in a table, or a `beforeCall` hook that names the
+ * records a confirmation is about, both need `runQuery` here.
+ *
+ * The index signature is kept so a host may reach anything else its
+ * runtime provides; the named members exist so the common ones do not
+ * have to be cast first.
+ */
+export type McpHostCallbackCtx = {
+  // Deliberately loose: a host's `api.*` function references are
+  // generated per project, so pinning them here would fix this package
+  // to one host's codegen.
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  runQuery: (ref: any, args: any) => Promise<any>;
+  runMutation: (ref: any, args: any) => Promise<any>;
+  runAction: (ref: any, args: any) => Promise<any>;
+  auth: { getUserIdentity: () => Promise<any> };
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+} & Record<string, unknown>;
+
 export type McpBeforeCallHandler = (
-  ctx: { auth: { getUserIdentity: () => Promise<unknown> } } & Record<
-    string,
-    unknown
-  >,
+  ctx: McpHostCallbackCtx,
   args: McpBeforeCallArgs,
 ) => McpBeforeCallResult | Promise<McpBeforeCallResult>;
 
@@ -462,10 +484,7 @@ export function parseAuthorizerDecision(
  * ```
  */
 export type McpAuthorizerHandler = (
-  ctx: { auth: { getUserIdentity: () => Promise<unknown> } } & Record<
-    string,
-    unknown
-  >,
+  ctx: McpHostCallbackCtx,
   args: McpAuthorizerArgs,
 ) => Promise<McpAuthorizerDecision> | McpAuthorizerDecision;
 
