@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.9.0...v0.10.0) (2026-08-14)
+
+
+### Features
+
+* answer ping on session-era connections ([#45](https://github.com/tfohlmeister/convex-mcp-gateway/issues/45)) ([a79665e](https://github.com/tfohlmeister/convex-mcp-gateway/commit/a79665e1b8208a097b0f268fa6ca256e3d7fcb7c))
+
 ## [0.9.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.8.0...v0.9.0) (2026-08-14)
 
 
