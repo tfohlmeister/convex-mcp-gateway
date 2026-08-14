@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as conformance from "../conformance.js";
 import type * as http from "../http.js";
 import type * as invoices from "../invoices.js";
 import type * as mcp from "../mcp.js";
@@ -19,6 +20,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  conformance: typeof conformance;
   http: typeof http;
   invoices: typeof invoices;
   mcp: typeof mcp;
