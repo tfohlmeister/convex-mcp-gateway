@@ -1,6 +1,6 @@
 {
   "name": "convex-mcp-gateway",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Auth-aware Convex component that exposes selected Convex functions as MCP tools.",
   "type": "module",
   "license": "Apache-2.0",

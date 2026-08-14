@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.8.0...v0.9.0) (2026-08-14)
+
+
+### Features
+
+* carry the full Implementation shape on serverInfo ([#43](https://github.com/tfohlmeister/convex-mcp-gateway/issues/43)) ([5c8a5ac](https://github.com/tfohlmeister/convex-mcp-gateway/commit/5c8a5ac804aa6c94ff5aab9c88f145bca4eafaa6))
+* pass through the icons field on tools, resources, and templates ([#38](https://github.com/tfohlmeister/convex-mcp-gateway/issues/38)) ([7e2515f](https://github.com/tfohlmeister/convex-mcp-gateway/commit/7e2515f3206a0dba85b43dc2b73192e2073e631b))
+* support MRTR input_required on resources/read ([#37](https://github.com/tfohlmeister/convex-mcp-gateway/issues/37)) ([c2dfc9a](https://github.com/tfohlmeister/convex-mcp-gateway/commit/c2dfc9adf4084e55bb183068485d9dbf5e9e03c5))
+
+
+### Bug Fixes
+
+* give the tool-side host callbacks the context they actually receive ([#40](https://github.com/tfohlmeister/convex-mcp-gateway/issues/40)) ([7d4589c](https://github.com/tfohlmeister/convex-mcp-gateway/commit/7d4589cd3e0c3f787d6bc4921202a1dbf10f1ab1))
+* list an empty catalog on a hook-only mount instead of refusing ([#44](https://github.com/tfohlmeister/convex-mcp-gateway/issues/44)) ([5cb7c43](https://github.com/tfohlmeister/convex-mcp-gateway/commit/5cb7c43012e30b9730b92c1e67001c6d60adaa5a))
+
 ## [0.8.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.7.0...v0.8.0) (2026-08-14)
 
 Completes the `2026-07-28` surface that 0.7.0 left open: MRTR
