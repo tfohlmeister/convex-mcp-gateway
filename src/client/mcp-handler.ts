@@ -3995,6 +3995,26 @@ async function handlePost(
       break;
     }
 
+    case "ping": {
+      if (isStateless) {
+        responseStatus = 404;
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `${message.method} is legacy-only; it was removed in ` +
+            STATELESS_PROTOCOL_VERSION,
+        );
+        break;
+      }
+      // An empty result is the entire contract. Deliberately gated on
+      // neither identity nor a capability: the reference SDK answers ping
+      // from its `Protocol` constructor, so a client may assume a liveness
+      // check works on any connection it already holds. The session lookup
+      // above is the only precondition.
+      body = jsonResultEnvelope(message.id, {});
+      break;
+    }
+
     case "resources/subscribe":
     case "resources/unsubscribe": {
       if (isStateless) {
