@@ -495,7 +495,7 @@ export interface HandleMcpRequestOptions {
     listChanged?: boolean;
   };
   /**
-   * Opt-in support for modern multi-round-trip requests (MRTR). A
+   * Opt-in support for stateless-era multi-round-trip requests (MRTR). A
    * declarative tool's host-side `beforeCall` hook is the state machine:
    * on the first call it can return `inputRequired(inputRequests, state)`
    * before the underlying Convex function can run; on every verified
@@ -513,7 +513,7 @@ export interface HandleMcpRequestOptions {
    * Opt-in MCP Tasks (`io.modelcontextprotocol/tasks`). **Off by
    * default**; the capability is advertised in `server/discover` only
    * when this option is set, and only tools registered with
-   * `taskSupport: true` accept a task-augmented modern `tools/call`.
+   * `taskSupport: true` accept a task-augmented stateless `tools/call`.
    *
    * Without `execute`, the gateway runs the tool once via the component's
    * built-in scheduled executor (durable across restarts, no retries) and
@@ -609,22 +609,62 @@ type RegisteredResourceTemplate = {
 };
 
 /**
- * Session-based protocol revisions this gateway speaks, newest first.
- * The first entry is what `initialize` negotiates when a client requests
- * a version the gateway does not support (per spec, the server answers
- * with its latest supported version). The gateway serves all three with
- * an identical wire contract: `2025-11-25`'s additions over `2025-06-18`
- * are its optional SSE resumability framing (which requires an event
- * store + GET replay this gateway does not have, so it is not emitted,
- * see `sseResponseFrame`) and additive capabilities (tasks, url-mode
- * elicitation, which are not advertised). Not emitting optional features
- * is conforming.
+ * The four MCP revisions this gateway speaks, split by TRANSPORT MODEL
+ * rather than by age.
+ *
+ * That is the axis the code actually branches on: a session-based
+ * request carries an `Mcp-Session-Id` minted by `initialize`, a
+ * stateless one carries its protocol metadata per request and creates
+ * no session at all. Naming them for the property rather than for
+ * recency is deliberate. Whichever revision is newest changes with every
+ * release of the spec, so a name like "modern" describes the reader's
+ * calendar instead of the code, and stops being true the day it matters
+ * most. When a further stateless revision lands, it joins
+ * `STATELESS_PROTOCOL_VERSIONS` and nothing else has to be renamed.
  */
-const LEGACY_PROTOCOL_VERSIONS = [
+const SESSION_PROTOCOL_VERSIONS = [
   "2025-11-25",
   "2025-06-18",
   "2025-03-26",
 ] as const;
+
+/**
+ * The stateless era. One entry today; kept as a list so a second
+ * stateless revision is an addition rather than a rename.
+ *
+ * `STATELESS_PROTOCOL_VERSION` is the one a client is told to speak,
+ * i.e. the newest we serve.
+ */
+const STATELESS_PROTOCOL_VERSIONS = ["2026-07-28"] as const;
+const STATELESS_PROTOCOL_VERSION = STATELESS_PROTOCOL_VERSIONS[0];
+
+/**
+ * What `initialize` may negotiate, which is the session-based set ONLY.
+ *
+ * The exclusion is the point, and it is why this is not called
+ * "supported": a stateless request never runs `initialize`, it declares
+ * its revision per request through the routing header plus `_meta`. A
+ * client asking `initialize` for `2026-07-28` is therefore answered with
+ * the newest SESSION revision, because that is the only kind of session
+ * this call can open. Adding the stateless revision to this list would
+ * hand out a session id for a transport that has no sessions.
+ *
+ * `2025-11-25`'s additions over `2025-06-18` are its optional SSE
+ * resumability framing (which needs an event store + GET replay this
+ * gateway does not have, so it is not emitted, see `sseResponseFrame`)
+ * and additive capabilities (tasks, url-mode elicitation, not
+ * advertised), so all three are served with one wire contract. Not
+ * emitting optional features is conforming.
+ */
+const SESSION_NEGOTIABLE_VERSIONS = SESSION_PROTOCOL_VERSIONS;
+
+/**
+ * Answered when a client requests a revision we do not serve: per spec
+ * the server replies with its own latest, which for a session handshake
+ * is the newest session-based one.
+ */
+const DEFAULT_PROTOCOL_VERSION = SESSION_PROTOCOL_VERSIONS[0];
+
 const MAX_MCP_HEADER_VALUE_LENGTH = 8 * 1024;
 
 function hasMcpHeaderControlCharacter(value: string): boolean {
@@ -634,9 +674,6 @@ function hasMcpHeaderControlCharacter(value: string): boolean {
   }
   return false;
 }
-const MODERN_PROTOCOL_VERSION = "2026-07-28";
-const SUPPORTED_PROTOCOL_VERSIONS = LEGACY_PROTOCOL_VERSIONS;
-const DEFAULT_PROTOCOL_VERSION = LEGACY_PROTOCOL_VERSIONS[0];
 const SERVER_NAME = "convex-mcp-gateway";
 // Kept in step with package.json by release-please; the trailing
 // annotation is what it looks for. A host overrides the whole block
@@ -889,7 +926,7 @@ function splitErrorText(
 /**
  * Build the single-frame SSE body of a POST response.
  *
- * - `2026-07-28` (`isModern`): a bare message event. The modern revision
+ * - `2026-07-28` (`isStateless`): a bare message event. The stateless revision
  *   removed `Last-Event-ID` resumability, so no event id at all.
  * - Every session-based revision, INCLUDING `2025-11-25`: one message
  *   event with id 1, byte-identical to what legacy sessions always
@@ -907,8 +944,8 @@ function splitErrorText(
  * additions is the conforming behavior for a server without replay,
  * and it keeps every legacy revision's frame identical.
  */
-function sseResponseFrame(body: string, isModern: boolean): string {
-  const idLine = isModern ? "" : "id: 1\n";
+function sseResponseFrame(body: string, isStateless: boolean): string {
+  const idLine = isStateless ? "" : "id: 1\n";
   return `${idLine}event: message\ndata: ${body}\n\n`;
 }
 
@@ -930,15 +967,15 @@ function jsonResultEnvelope(id: JsonRpcMessage["id"], value: unknown): string {
  * `unknown` ("object, array, string, number, boolean, or null").
  *
  * So a non-object schema is withheld from legacy clients and advertised
- * to modern ones. The tool still works either way; a legacy client just
+ * to stateless-era ones. The tool still works either way; a session-based client just
  * sees it untyped, with the value in the text block as always.
  */
 function mayAdvertiseOutputSchema(
   outputSchema: unknown,
-  isModern: boolean,
+  isStateless: boolean,
 ): boolean {
   if (outputSchema === undefined) return false;
-  if (isModern) return true;
+  if (isStateless) return true;
   return (
     isPlainObject(outputSchema) &&
     (outputSchema as { type?: unknown }).type === "object"
@@ -1002,7 +1039,7 @@ function jsonErrorEnvelopeWithData(
   });
 }
 
-function modernErrorResponse(
+function statelessErrorResponse(
   id: JsonRpcMessage["id"],
   code: number,
   message: string,
@@ -1015,7 +1052,7 @@ function modernErrorResponse(
   });
 }
 
-function modernProtocolVersion(message: JsonRpcMessage): string | null {
+function statelessProtocolVersion(message: JsonRpcMessage): string | null {
   const meta = message.params?._meta;
   if (!isPlainObject(meta)) return null;
   const version = meta["io.modelcontextprotocol/protocolVersion"];
@@ -1051,7 +1088,7 @@ function decodeMcpHeaderValue(value: string | null): string | null {
   }
 }
 
-function modernNameMatches(message: JsonRpcMessage, request: Request): boolean {
+function statelessNameMatches(message: JsonRpcMessage, request: Request): boolean {
   const headerName = decodeMcpHeaderValue(request.headers.get("mcp-name"));
   switch (message.method) {
     case "tools/call":
@@ -1149,7 +1186,7 @@ function collectMcpHeaderParameters(schema: unknown): McpHeaderParameterResult {
  * Returns a human-readable problem string, or `null` when the schema is
  * valid. Called when a catalog is registered or synced, so a
  * schema-authoring mistake surfaces with the tool name attached instead
- * of failing every modern `tools/call` for that tool at runtime.
+ * of failing every stateless `tools/call` for that tool at runtime.
  */
 export function describeToolHeaderSchemaProblem(
   inputSchema: unknown,
@@ -1180,17 +1217,17 @@ function headerValueForArgument(
 /** Strict decimal literal, so `Number(" 42 ")` and `Number("")` don't slip through. */
 const NUMERIC_HEADER_VALUE = /^[+-]?\d+(\.\d+)?$/;
 
-type ModernHeaderProblem =
+type StatelessHeaderProblem =
   /** The tool's own schema is invalid. A server-side configuration error. */
   | { kind: "schema"; problem: string }
   /** The client's headers disagree with the body. `-32020` territory. */
   | { kind: "mismatch"; problem: string };
 
-function validateModernToolParameterHeaders(
+function validateStatelessToolParameterHeaders(
   request: Request,
   inputSchema: unknown,
   argumentsValue: unknown,
-): ModernHeaderProblem | null {
+): StatelessHeaderProblem | null {
   const result = collectMcpHeaderParameters(inputSchema);
   if (result.parameters === undefined) {
     return { kind: "schema", problem: result.problem };
@@ -1208,7 +1245,7 @@ function validateModernToolParameterHeaders(
       }
       continue;
     }
-    const mismatch: ModernHeaderProblem = {
+    const mismatch: StatelessHeaderProblem = {
       kind: "mismatch",
       problem: `Mcp-Param-${parameter.headerName} must match the request arguments`,
     };
@@ -1231,7 +1268,7 @@ function validateModernToolParameterHeaders(
   return null;
 }
 
-function finalizeModernResult(
+function finalizeStatelessResult(
   body: string,
   method: string,
   options: HandleMcpRequestOptions,
@@ -1319,7 +1356,7 @@ function isMcpCompleteCallResult(
  */
 function describeCompleteCallResultProblem(
   result: Record<string, unknown>,
-  isModern: boolean,
+  isStateless: boolean,
 ): string | null {
   if (!Array.isArray(result.content)) {
     return "result.content must be an array";
@@ -1330,7 +1367,7 @@ function describeCompleteCallResultProblem(
   // output is what let the two drift apart before.
   if (
     result.structuredContent !== undefined &&
-    !isModern &&
+    !isStateless &&
     !isPlainObject(result.structuredContent)
   ) {
     return "result.structuredContent must be an object on this protocol revision";
@@ -2346,36 +2383,36 @@ async function handlePost(
 
   const isInitialize = message.method === "initialize";
   const headerProtocolVersion = request.headers.get("mcp-protocol-version");
-  const metadataProtocolVersion = modernProtocolVersion(message);
-  // `initialize` is always legacy, even when a broken client attaches modern
+  const metadataProtocolVersion = statelessProtocolVersion(message);
+  // `initialize` is always session-based, even when a broken client attaches stateless
   // metadata. This keeps its version negotiation and session contract intact.
-  const isModern =
+  const isStateless =
     !isInitialize &&
-    (headerProtocolVersion === MODERN_PROTOCOL_VERSION ||
+    (headerProtocolVersion === STATELESS_PROTOCOL_VERSION ||
       metadataProtocolVersion !== null);
-  // The validated `clientCapabilities` object of a modern request,
+  // The validated `clientCapabilities` object of a stateless request,
   // hoisted so MRTR and task-augmented `tools/call` can both negotiate
   // against it below.
-  let modernClientCapabilities: Record<string, unknown> | null = null;
+  let statelessClientCapabilities: Record<string, unknown> | null = null;
 
   // The 2026 protocol moves protocol negotiation to each request. Check the
   // mirrored routing metadata before identity resolution, catalog writes,
   // authorization, auditing, or tool dispatch.
-  if (isModern) {
+  if (isStateless) {
     if (headerProtocolVersion !== metadataProtocolVersion) {
-      return modernErrorResponse(
+      return statelessErrorResponse(
         message.id,
         HEADER_MISMATCH,
         "MCP-Protocol-Version must exactly match request metadata",
       );
     }
-    if (metadataProtocolVersion !== MODERN_PROTOCOL_VERSION) {
-      return modernErrorResponse(
+    if (metadataProtocolVersion !== STATELESS_PROTOCOL_VERSION) {
+      return statelessErrorResponse(
         message.id,
         UNSUPPORTED_PROTOCOL_VERSION,
         `Unsupported MCP protocol version: ${metadataProtocolVersion}`,
         {
-          supported: [MODERN_PROTOCOL_VERSION, ...LEGACY_PROTOCOL_VERSIONS],
+          supported: [STATELESS_PROTOCOL_VERSION, ...SESSION_PROTOCOL_VERSIONS],
           requested: metadataProtocolVersion,
         },
       );
@@ -2391,22 +2428,22 @@ async function handlePost(
           typeof clientInfo.name !== "string" ||
           typeof clientInfo.version !== "string"))
     ) {
-      return modernErrorResponse(
+      return statelessErrorResponse(
         message.id,
         INVALID_PARAMS,
-        "Invalid required modern request metadata",
+        "Invalid required stateless request metadata",
       );
     }
-    modernClientCapabilities = clientCapabilities;
+    statelessClientCapabilities = clientCapabilities;
     if (request.headers.get("mcp-method") !== message.method) {
-      return modernErrorResponse(
+      return statelessErrorResponse(
         message.id,
         HEADER_MISMATCH,
         "Mcp-Method must exactly match the JSON-RPC method",
       );
     }
-    if (!modernNameMatches(message, request)) {
-      return modernErrorResponse(
+    if (!statelessNameMatches(message, request)) {
+      return statelessErrorResponse(
         message.id,
         HEADER_MISMATCH,
         "Mcp-Name must exactly match the JSON-RPC request name",
@@ -2434,12 +2471,12 @@ async function handlePost(
   // Declarative catalog synchronization can write component state. Modern
   // traffic must remain stateless at the protocol level, but anonymous
   // requests must not be able to trigger those writes before requireAuth.
-  if (isModern) {
+  if (isStateless) {
     try {
       await ensureCatalogSynced(options);
     } catch (err) {
       console.error("[mcp-gateway] declarative catalog sync failed", err);
-      return modernErrorResponse(
+      return statelessErrorResponse(
         message.id,
         INTERNAL_ERROR,
         "Failed to synchronize the declarative catalog",
@@ -2452,15 +2489,15 @@ async function handlePost(
   // MCP-Protocol-Version header: required on post-initialize requests
   // by spec. Missing → silently default to DEFAULT_PROTOCOL_VERSION
   // (legacy clients). Unsupported value → MUST 400 per spec.
-  if (!isInitialize && !isModern) {
+  if (!isInitialize && !isStateless) {
     const protoHeader = headerProtocolVersion;
     if (
       protoHeader !== null &&
-      !(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(protoHeader)
+      !(SESSION_NEGOTIABLE_VERSIONS as readonly string[]).includes(protoHeader)
     ) {
       return new Response(
         `Unsupported MCP-Protocol-Version: ${protoHeader}. ` +
-          `Supported: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}`,
+          `Supported: ${SESSION_NEGOTIABLE_VERSIONS.join(", ")}`,
         { status: 400 },
       );
     }
@@ -2476,7 +2513,7 @@ async function handlePost(
   // session-scoped mutations like resources/subscribe.
   let sessionOwnerSubject: string | null | undefined;
 
-  if (isModern) {
+  if (isStateless) {
     // Modern MCP is deliberately stateless. Ignore a legacy session id rather
     // than looking it up, touching it, or echoing it back to the client.
   } else if (isInitialize) {
@@ -2533,8 +2570,8 @@ async function handlePost(
     }
   }
 
-  if (isModern && isJsonRpcNotificationOrResponse(message)) {
-    return modernErrorResponse(
+  if (isStateless && isJsonRpcNotificationOrResponse(message)) {
+    return statelessErrorResponse(
       message.id,
       -32600,
       "Client notifications are not supported by this server",
@@ -2587,7 +2624,7 @@ async function handlePost(
       const requested = message.params?.protocolVersion;
       const negotiated =
         typeof requested === "string" &&
-        (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)
+        (SESSION_NEGOTIABLE_VERSIONS as readonly string[]).includes(requested)
           ? requested
           : DEFAULT_PROTOCOL_VERSION;
       await ctx.runMutation(component.sessions.createSession, {
@@ -2635,7 +2672,7 @@ async function handlePost(
     }
 
     case "server/discover": {
-      if (!isModern) {
+      if (!isStateless) {
         body = jsonErrorEnvelope(
           message.id,
           -32601,
@@ -2659,8 +2696,8 @@ async function handlePost(
       body = jsonResultEnvelope(message.id, {
         resultType: "complete",
         supportedVersions: [
-          MODERN_PROTOCOL_VERSION,
-          ...LEGACY_PROTOCOL_VERSIONS,
+          STATELESS_PROTOCOL_VERSION,
+          ...SESSION_PROTOCOL_VERSIONS,
         ],
         ...(options.initializeInstructions
           ? { instructions: options.initializeInstructions }
@@ -2696,7 +2733,7 @@ async function handlePost(
         registeredResources.length === 0 &&
         templates.length === 0
       ) {
-        if (isModern) responseStatus = 404;
+        if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(
           message.id,
           -32601,
@@ -2796,7 +2833,7 @@ async function handlePost(
             durationMs: Date.now() - start,
           });
         }
-        if (isModern) {
+        if (isStateless) {
           resources.sort((a, b) => a.uri.localeCompare(b.uri));
         }
         body = jsonResultEnvelope(message.id, { resources });
@@ -2830,7 +2867,7 @@ async function handlePost(
       // configured at all (no runtime providers and none registered). A
       // registry-only template catalog is fully supported.
       if (providers.length === 0 && registeredTemplates.length === 0) {
-        if (isModern) responseStatus = 404;
+        if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(
           message.id,
           -32601,
@@ -2897,7 +2934,7 @@ async function handlePost(
             durationMs: Date.now() - start,
           });
         }
-        if (isModern) {
+        if (isStateless) {
           resourceTemplates.sort((a, b) =>
             a.uriTemplate.localeCompare(b.uriTemplate),
           );
@@ -2938,7 +2975,7 @@ async function handlePost(
         registeredResources.length === 0 &&
         templates.length === 0
       ) {
-        if (isModern) responseStatus = 404;
+        if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(
           message.id,
           -32601,
@@ -3177,7 +3214,7 @@ async function handlePost(
 
     case "resources/subscribe":
     case "resources/unsubscribe": {
-      if (isModern) {
+      if (isStateless) {
         responseStatus = 404;
         body = jsonErrorEnvelope(
           message.id,
@@ -3313,19 +3350,19 @@ async function handlePost(
             // strict about the field being absent vs null vs {}. A
             // non-object schema is withheld from legacy clients, which
             // would reject this entire response over it.
-            ...(mayAdvertiseOutputSchema(tool.outputSchema, isModern)
+            ...(mayAdvertiseOutputSchema(tool.outputSchema, isStateless)
               ? { outputSchema: tool.outputSchema }
               : {}),
             // Advertise task support only when the host actually
             // configured task execution AND the caller speaks the
-            // modern protocol; legacy clients cannot poll tasks.
-            ...(tool.taskSupport === true && isModern && options.tasks
+            // stateless protocol; session-based clients cannot poll tasks.
+            ...(tool.taskSupport === true && isStateless && options.tasks
               ? { execution: { taskSupport: "optional" } }
               : {}),
           });
         }
       }
-      if (isModern) {
+      if (isStateless) {
         visible.sort((a, b) => a.name.localeCompare(b.name));
       }
       body = jsonResultEnvelope(message.id, { tools: visible });
@@ -3364,8 +3401,8 @@ async function handlePost(
         delete args[tool.identityArg];
       }
 
-      if (isModern) {
-        const headerProblem = validateModernToolParameterHeaders(
+      if (isStateless) {
+        const headerProblem = validateStatelessToolParameterHeaders(
           request,
           tool.inputSchema,
           message.params?.arguments,
@@ -3382,7 +3419,7 @@ async function handlePost(
               tool.name,
               headerProblem.problem,
             );
-            return modernErrorResponse(
+            return statelessErrorResponse(
               message.id,
               INTERNAL_ERROR,
               "Tool input schema is invalid",
@@ -3390,7 +3427,7 @@ async function handlePost(
               500,
             );
           }
-          return modernErrorResponse(
+          return statelessErrorResponse(
             message.id,
             HEADER_MISMATCH,
             headerProblem.problem,
@@ -3466,12 +3503,12 @@ async function handlePost(
       // never runs the tool synchronously as a silent fallback.
       const taskRequest = message.params?.task;
       if (taskRequest !== undefined) {
-        if (!isModern) {
+        if (!isStateless) {
           body = jsonErrorEnvelope(
             message.id,
             INVALID_PARAMS,
             "Task-augmented calls require MCP protocol " +
-              `${MODERN_PROTOCOL_VERSION} or later`,
+              `${STATELESS_PROTOCOL_VERSION} or later`,
           );
           break;
         }
@@ -3488,7 +3525,7 @@ async function handlePost(
           break;
         }
         if (
-          !isPlainObject(modernClientCapabilities?.[TASKS_CAPABILITY_KEY])
+          !isPlainObject(statelessClientCapabilities?.[TASKS_CAPABILITY_KEY])
         ) {
           body = jsonErrorEnvelope(
             message.id,
@@ -3695,7 +3732,7 @@ async function handlePost(
       // when it resolved, so a repeat has to present the same answer.
       let requestDigest: string | undefined;
       if (
-        isModern &&
+        isStateless &&
         (requestState !== undefined || inputResponses !== undefined)
       ) {
         if (!options.mrtr || requestState === undefined) {
@@ -3919,7 +3956,7 @@ async function handlePost(
           // hook output is checked.
           const problem = describeCompleteCallResultProblem(
             requested.result,
-            isModern,
+            isStateless,
           );
           if (problem) {
             console.error(
@@ -4070,12 +4107,12 @@ async function handlePost(
             body = alreadyResolvedEnvelope(message.id, tool.name);
             break;
           }
-          if (!isModern) {
+          if (!isStateless) {
             body = jsonErrorEnvelope(
               message.id,
               -32601,
               `Tool "${tool.name}" requires multi-round-trip input; ` +
-                `connect with MCP protocol ${MODERN_PROTOCOL_VERSION} or later`,
+                `connect with MCP protocol ${STATELESS_PROTOCOL_VERSION} or later`,
             );
             break;
           }
@@ -4144,14 +4181,14 @@ async function handlePost(
             break;
           }
           const missingCapabilities = missingMrtrCapabilities(
-            // Guaranteed non-null here (validated for every modern
+            // Guaranteed non-null here (validated for every stateless
             // request, and legacy requests broke at the -32601 above);
             // the fallback only satisfies the type system.
-            modernClientCapabilities ?? {},
+            statelessClientCapabilities ?? {},
             requiredCapabilities,
           );
           if (Object.keys(missingCapabilities).length > 0) {
-            return modernErrorResponse(
+            return statelessErrorResponse(
               message.id,
               -32021,
               "Client lacks a capability required for MRTR input requests",
@@ -4598,7 +4635,7 @@ async function handlePost(
         // that was not shown a schema rejects a scalar block against its
         // own revision's type. Deciding both with one predicate is what
         // keeps the two halves from contradicting each other.
-        ...(mayAdvertiseOutputSchema(tool.outputSchema, isModern)
+        ...(mayAdvertiseOutputSchema(tool.outputSchema, isStateless)
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,
@@ -4608,9 +4645,9 @@ async function handlePost(
 
     case "tasks/get":
     case "tasks/update": {
-      // Task methods exist only on the modern protocol: a legacy client
+      // Task methods exist only on the stateless protocol: a session-based client
       // could never have created a task in the first place.
-      if (!isModern) {
+      if (!isStateless) {
         body = jsonErrorEnvelope(
           message.id,
           -32601,
@@ -4931,7 +4968,7 @@ async function handlePost(
     }
 
     default:
-      if (isModern) responseStatus = 404;
+      if (isStateless) responseStatus = 404;
       body = jsonErrorEnvelope(
         message.id,
         -32601,
@@ -4941,8 +4978,8 @@ async function handlePost(
 
   if (raw) return raw;
 
-  if (isModern) {
-    body = finalizeModernResult(body, message.method!, options);
+  if (isStateless) {
+    body = finalizeStatelessResult(body, message.method!, options);
   }
 
   if (responseStatus !== 200) {
@@ -4962,7 +4999,7 @@ async function handlePost(
         // 2026-07-28 dropped `Last-Event-ID` resumability, so an event id
         // carries no meaning there. Legacy frames keep id 1, identical
         // across every session-based revision (see sseResponseFrame).
-        controller.enqueue(encoder.encode(sseResponseFrame(body, isModern)));
+        controller.enqueue(encoder.encode(sseResponseFrame(body, isStateless)));
         controller.close();
       },
     });

@@ -1,7 +1,7 @@
 # MCP Tasks
 
 Opt-in support for the `io.modelcontextprotocol/tasks` extension on the
-modern (2026-07-28) protocol path: a client invokes a tool as a
+stateless (2026-07-28) protocol path: a client invokes a tool as a
 **task-augmented `tools/call`**, immediately receives a task handle, and
 polls `tasks/get` for the outcome. No long-lived connection is involved,
 which is exactly what a request-scoped Convex `httpAction` can deliver.
@@ -123,7 +123,7 @@ gateway.handleMcpRequest(ctx, request, {
   `completed` | `failed` | `cancelled`. Terminal states never change; a
   cancel that races ahead of completion wins.
 
-Task methods exist only on the modern path. A legacy request that
+Task methods exist only on the stateless path. A session-based request that
 carries `params.task` is rejected loudly (never run synchronously as a
 silent fallback), and legacy `tasks/*` methods are unknown methods.
 
@@ -231,7 +231,7 @@ diagnosable instead of silently answering "unknown task" forever.
 Note also that all mounts of one component share a single tool registry
 and a single catalog fingerprint. Mounts must pass the **same** `tools`
 array and differ only in their `tasks` / `authorize` / identity options;
-two divergent catalogs would re-sync against each other on every modern
+two divergent catalogs would re-sync against each other on every stateless
 request, and a tool that is registered could answer `-32602` to a
 concurrent call.
 

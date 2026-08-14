@@ -54,7 +54,7 @@ const handbook = defineMcpResource({
 ```
 
 Concrete resources declared this way are reconciled into the component
-registry on legacy `initialize` and before a modern 2026-07-28 request
+registry on session-based `initialize` and before a stateless 2026-07-28 request
 (change-detected), so `resources/list` returns them even from a request that
 doesn't pass a provider. See the registry-sync behaviour in
 [Architecture](./architecture.md).

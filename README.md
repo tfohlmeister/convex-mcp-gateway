@@ -30,7 +30,7 @@ Built as a [Convex Component](https://www.convex.dev/components).
   revisions share one transport wire contract (2025-11-25's SSE
   resumability framing needs an event store the gateway doesn't have, so
   it isn't emitted, a deliberate SHOULD deviation)
-- **Stateless multi-round trips**: declarative modern tools use a host-side
+- **Stateless multi-round trips**: declarative stateless-era tools use a host-side
   `beforeCall` hook to request input before any Convex function runs, then
   receive HMAC-verified continuation state plus an idempotency key on retry;
   see [Multi-round-trip requests](#multi-round-trip-requests)
@@ -222,7 +222,7 @@ The same endpoint also accepts stateless 2026-07-28 requests. Send
 `clientCapabilities`; when supplied, `clientInfo` must include a name and
 version. `tools/call`, `resources/read`,
 and `prompts/get` require `Mcp-Name` to match the requested name or URI. Start
-with `server/discover`; modern requests never create or return
+with `server/discover`; stateless requests never create or return
 `Mcp-Session-Id`. Discovery, list, and read results are explicitly
 non-shareable with `ttlMs: 0` and `cacheScope: "private"`.
 

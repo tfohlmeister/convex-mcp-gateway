@@ -137,7 +137,7 @@ Modern requests do not create, read, touch, delete, or return a session id.
 They use `server/discover` for server metadata and capabilities, and the
 declarative catalog is synchronized before discovery or dispatch. The legacy
 wire contract remains unchanged: `initialize` always uses the session path,
-including when a client incorrectly includes modern metadata.
+including when a client incorrectly includes stateless metadata.
 
 ### Stateless multi-round trips (MRTR)
 
@@ -306,7 +306,7 @@ handler that has no matching `beforeCall`, so imperative registrations
 and stale declarative catalogs can never dispatch without the promised
 confirmation. The hook runs on every transport, so required input is
 never silently bypassed: a legacy 2025-era request that reaches a hook
-demanding input is rejected with `-32601` (and a modern request without
+demanding input is rejected with `-32601` (and a stateless request without
 the `mrtr` option fails closed with `-32603`). Tools with a hook reject
 anonymous callers through the same audited denial path as
 `identityArg` tools (real 401 + `WWW-Authenticate`). The gateway checks
@@ -350,7 +350,7 @@ based on the client's `Accept` header:
   payload wrapped in an event. Used by clients that prefer streaming
   transport even for short responses; ready for future progress
   notifications without protocol change. Legacy frames carry an event
-  id; modern ones do not, because `2026-07-28` removed `Last-Event-ID`
+  id; stateless ones do not, because `2026-07-28` removed `Last-Event-ID`
   resumability. Both set `X-Accel-Buffering: no` so reverse proxies
   don't hold the frame back.
 
@@ -367,7 +367,7 @@ cron if needed.
 
 When the host passes the declarative `tools` option to
 `handleMcpRequest`, the registry is reconciled on each legacy
-`initialize` and before every modern request, since a stateless request
+`initialize` and before every stateless request, since a stateless request
 has no handshake to hang the sync on. The sync is change-detected: the
 gateway fingerprints the list (function names + schemas + protocol
 metadata + metadata, no handle creation) and compares it against the
@@ -414,7 +414,7 @@ there, failing the mutation with the tool named.
 
 ### MCP Tasks (poll-first)
 
-Tasks (`io.modelcontextprotocol/tasks`) exist only on the modern path
+Tasks (`io.modelcontextprotocol/tasks`) exist only on the stateless path
 and are doubly opt-in: the tool declares `taskSupport: true` and the
 host configures the `tasks` handler option; without both, nothing is
 advertised and every task method answers as an unknown method. A

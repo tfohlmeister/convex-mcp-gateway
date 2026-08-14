@@ -3290,7 +3290,7 @@ describe("MCP tasks (modern, e2e)", () => {
 
   const TASK_CAPS = { "io.modelcontextprotocol/tasks": {} };
 
-  function modernBody(
+  function statelessBody(
     id: number,
     method: string,
     params: Record<string, unknown>,
@@ -3318,7 +3318,7 @@ describe("MCP tasks (modern, e2e)", () => {
     bob: "valid-admin-token", // subject: admin-resolved-sub
   };
 
-  async function modernRpc(
+  async function statelessRpc(
     t: ReturnType<typeof newTest>,
     id: number,
     method: string,
@@ -3342,7 +3342,7 @@ describe("MCP tasks (modern, e2e)", () => {
           ? { authorization: `Bearer ${TOKENS[options.as]}` }
           : {}),
       },
-      body: modernBody(id, method, params, options.clientCapabilities),
+      body: statelessBody(id, method, params, options.clientCapabilities),
     });
   }
 
@@ -3350,7 +3350,7 @@ describe("MCP tasks (modern, e2e)", () => {
     t: ReturnType<typeof newTest>,
     args: Record<string, unknown> = {},
   ): Promise<string> {
-    const res = await modernRpc(
+    const res = await statelessRpc(
       t,
       1,
       "tools/call",
@@ -3374,7 +3374,7 @@ describe("MCP tasks (modern, e2e)", () => {
     as: keyof typeof TOKENS = "alice",
     path?: string,
   ) {
-    const res = await modernRpc(t, 9, "tasks/get", { taskId }, {
+    const res = await statelessRpc(t, 9, "tasks/get", { taskId }, {
       name: taskId,
       as,
       path,
@@ -3470,7 +3470,7 @@ describe("MCP tasks (modern, e2e)", () => {
       // Round 1: the hook asks for confirmation. No task row is created:
       // MRTR owns the negotiation until it approves.
       const first = (await (
-        await modernRpc(
+        await statelessRpc(
           t,
           40,
           "tools/call",
@@ -3504,7 +3504,7 @@ describe("MCP tasks (modern, e2e)", () => {
 
       // Round 2: the approved continuation becomes a task.
       const second = (await (
-        await modernRpc(
+        await statelessRpc(
           t,
           41,
           "tools/call",
@@ -3638,7 +3638,7 @@ describe("MCP tasks (modern, e2e)", () => {
       const viaTask = (await getTask(t, taskId)).result?.task.result;
 
       const sync = (await (
-        await modernRpc(
+        await statelessRpc(
           t,
           50,
           "tools/call",
@@ -3753,7 +3753,7 @@ describe("MCP tasks (modern, e2e)", () => {
     const t = newTest();
     const taskId = await startRecountTask(t);
 
-    const cancel = await modernRpc(
+    const cancel = await statelessRpc(
       t,
       2,
       "tasks/update",
@@ -3772,7 +3772,7 @@ describe("MCP tasks (modern, e2e)", () => {
     expect(after.result?.task.status).toBe("cancelled");
     expect(after.result?.task.result).toBeUndefined();
 
-    const repeat = await modernRpc(
+    const repeat = await statelessRpc(
       t,
       3,
       "tasks/update",
@@ -3834,7 +3834,7 @@ describe("MCP tasks (modern, e2e)", () => {
     const t = newTest();
 
     // Client did not declare the tasks capability.
-    const noCap = await modernRpc(
+    const noCap = await statelessRpc(
       t,
       6,
       "tools/call",
@@ -3848,7 +3848,7 @@ describe("MCP tasks (modern, e2e)", () => {
     expect(noCapBody.error?.message).toMatch(/client capability/);
 
     // Tool without taskSupport.
-    const wrongTool = await modernRpc(
+    const wrongTool = await statelessRpc(
       t,
       7,
       "tools/call",
@@ -3862,7 +3862,7 @@ describe("MCP tasks (modern, e2e)", () => {
     expect(wrongToolBody.error?.message).toMatch(/does not support task/);
 
     // Anonymous caller cannot own a task.
-    const anonymous = await modernRpc(
+    const anonymous = await statelessRpc(
       t,
       8,
       "tools/call",
@@ -3875,7 +3875,7 @@ describe("MCP tasks (modern, e2e)", () => {
     expect(anonymousBody.error?.code).toBe(-32001);
 
     // Anonymous polling is rejected before any lookup.
-    const anonymousPoll = await modernRpc(
+    const anonymousPoll = await statelessRpc(
       t,
       9,
       "tasks/get",
@@ -3898,7 +3898,7 @@ describe("MCP tasks (modern, e2e)", () => {
     // building the JSON body would overflow first.)
     let deep: unknown = 0;
     for (let i = 0; i < 200; i++) deep = [deep];
-    const res = await modernRpc(
+    const res = await statelessRpc(
       t,
       1,
       "tools/call",
@@ -3913,7 +3913,7 @@ describe("MCP tasks (modern, e2e)", () => {
 
   test("discovery and catalog advertise tasks only when configured", async () => {
     const t = newTest();
-    const discover = await modernRpc(t, 10, "server/discover", {}, { as: "alice" });
+    const discover = await statelessRpc(t, 10, "server/discover", {}, { as: "alice" });
     const discoverBody = (await discover.json()) as {
       result: { capabilities: Record<string, unknown> };
     };
@@ -3921,7 +3921,7 @@ describe("MCP tasks (modern, e2e)", () => {
       discoverBody.result.capabilities["io.modelcontextprotocol/tasks"],
     ).toEqual({ pollIntervalMs: 2000 });
 
-    const list = await modernRpc(t, 11, "tools/list", {}, { as: "alice" });
+    const list = await statelessRpc(t, 11, "tools/list", {}, { as: "alice" });
     const listBody = (await list.json()) as {
       result: {
         tools: Array<{ name: string; execution?: { taskSupport?: string } }>;

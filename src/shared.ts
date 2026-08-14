@@ -140,6 +140,26 @@ export function completeCall(
  * is host-supplied and reaches the client verbatim: the gateway advertises
  * it and never fetches it, so the consumer-side precautions the spec
  * describes (same-domain checks, care with SVG) belong to the client.
+ *
+ * Advertised to every client, on both transport eras, and that is
+ * correct: `icons` arrived in `2025-11-25`, which is the gateway's own
+ * DEFAULT revision, and `2026-07-28` changed nothing about it beyond a
+ * doc-comment typo. There is no era split to apply here, so do not go
+ * looking for the missing one. Even a client predating the field is
+ * safe, because the reference SDK's descriptor schemas are plain
+ * objects that strip unknown keys rather than rejecting the response.
+ *
+ * The shape is worth respecting exactly. `sizes` is an array of strings
+ * and `theme` is a closed union, and a client that validates rejects the
+ * WHOLE list response over one bad entry rather than dropping one icon.
+ * That is what `describeIconsProblem` is guarding against; SDK builds
+ * 1.18.0 through 1.18.2 typed `sizes` as a bare string and hard-fail on
+ * the spec-mandated array form.
+ *
+ * The spec puts `icons` on two further types this gateway does not carry
+ * it on: `Prompt` (no prompts feature here) and `Implementation`, i.e.
+ * `serverInfo`, whose option type is `{ name, version }`. Both are gaps,
+ * not decisions.
  */
 export interface McpIcon {
   src: string;

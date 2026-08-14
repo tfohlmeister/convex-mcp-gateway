@@ -264,7 +264,7 @@ function jsonRpcRequest(
   });
 }
 
-function modernJsonRpcRequest(body: Record<string, unknown>): Request {
+function statelessJsonRpcRequest(body: Record<string, unknown>): Request {
   const method = String(body.method);
   const params = (body.params ?? {}) as Record<string, unknown>;
   const name =
@@ -328,7 +328,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({ id: 1, method: "server/discover" }),
+      statelessJsonRpcRequest({ id: 1, method: "server/discover" }),
       component,
       { authorize: async () => ({ allowed: true }) },
     );
@@ -358,7 +358,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await gateway.handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({ id: 1, method: "server/discover" }),
+      statelessJsonRpcRequest({ id: 1, method: "server/discover" }),
       {
         authorize: async () => ({ allowed: true }),
         resources: [resource],
@@ -393,7 +393,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({ id: 1, method: "tools/list" }),
+      statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
       component,
       { authorize: async () => ({ allowed: true }) },
     );
@@ -423,7 +423,7 @@ describe("handleMcpRequest metadata and resources", () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
     let authorized = false;
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const headers = new Headers(request.headers);
     headers.set("mcp-method", "tools/call");
     const response = await handleMcpRequest(
@@ -449,7 +449,7 @@ describe("handleMcpRequest metadata and resources", () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
     let authorized = false;
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const response = await handleMcpRequest(
       ctx,
       withHeaders(request, { origin: "https://untrusted.example.com" }),
@@ -475,7 +475,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("allows an origin on the allowlist", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const response = await handleMcpRequest(
       ctx,
       withHeaders(request, { origin: "https://app.example.com" }),
@@ -495,7 +495,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("permissive cors does not weaken the origin allowlist", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const response = await handleMcpRequest(
       ctx,
       withHeaders(request, { origin: "https://untrusted.example.com" }),
@@ -513,7 +513,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("an unset allowlist does not reject requests carrying an Origin", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const response = await handleMcpRequest(
       ctx,
       withHeaders(request, { origin: "https://anything.example.com" }),
@@ -530,7 +530,7 @@ describe("handleMcpRequest metadata and resources", () => {
     let authorized = false;
     const response = await handleMcpRequest(
       ctx,
-      withHeaders(modernJsonRpcRequest({ id: 1, method: "tools/list" }), {
+      withHeaders(statelessJsonRpcRequest({ id: 1, method: "tools/list" }), {
         // Sandboxed iframes and some redirects send this literal value,
         // which throws in a `new URL(origin)`-style matcher.
         origin: "null",
@@ -603,7 +603,7 @@ describe("handleMcpRequest metadata and resources", () => {
     const modern = await handleMcpRequest(
       ctx,
       withHeaders(
-        modernJsonRpcRequest({ id: 1, method: "tools/list" }),
+        statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
         sseAccept,
       ),
       component,
@@ -784,7 +784,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("rejects a modern request without client capabilities metadata", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const body = await request.json();
     delete (body.params._meta as Record<string, unknown>)[
       "io.modelcontextprotocol/clientCapabilities"
@@ -808,7 +808,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("accepts a modern request without optional client info metadata", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const body = await request.json();
     delete (body.params._meta as Record<string, unknown>)[
       "io.modelcontextprotocol/clientInfo"
@@ -835,7 +835,7 @@ describe("handleMcpRequest metadata and resources", () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
     let authorized = false;
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const body = await request.json();
     (body.params._meta as Record<string, unknown>)[
       "io.modelcontextprotocol/clientInfo"
@@ -897,7 +897,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({ id: 1, method: "tools/list" }),
+      statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
       component,
       {
         requireAuth: true,
@@ -916,7 +916,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("reports the requested version in an unsupported modern version error", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);
-    const request = modernJsonRpcRequest({ id: 1, method: "tools/list" });
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
     const headers = new Headers(request.headers);
     headers.set("mcp-protocol-version", "2099-01-01");
     const body = await request.json();
@@ -950,7 +950,7 @@ describe("handleMcpRequest metadata and resources", () => {
   test("accepts a base64-encoded modern Mcp-Name", async () => {
     const component = createComponent();
     const state = createCtx(component);
-    const request = modernJsonRpcRequest({
+    const request = statelessJsonRpcRequest({
       id: 1,
       method: "tools/call",
       params: { name: "weather/世界", arguments: {} },
@@ -992,7 +992,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 1,
         method: "tools/call",
         params: { name: "literal?=", arguments: {} },
@@ -1012,7 +1012,7 @@ describe("handleMcpRequest metadata and resources", () => {
     const { ctx } = createCtx(component);
     let authorized = false;
     const request = withHeaders(
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 1,
         method: "tools/call",
         params: { name: "bad\u0000name", arguments: {} },
@@ -1040,7 +1040,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({ id: 1, method: "unknown/method" }),
+      statelessJsonRpcRequest({ id: 1, method: "unknown/method" }),
       component,
       { authorize: async () => ({ allowed: true }) },
     );
@@ -1083,7 +1083,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const rejected = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest(requestBody),
+      statelessJsonRpcRequest(requestBody),
       component,
       {
         authorize: async () => {
@@ -1100,7 +1100,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const accepted = await handleMcpRequest(
       state.ctx,
-      withHeaders(modernJsonRpcRequest(requestBody), {
+      withHeaders(statelessJsonRpcRequest(requestBody), {
         "mcp-param-region": "us-east-1",
         "mcp-param-limit": "25",
       }),
@@ -1137,7 +1137,7 @@ describe("handleMcpRequest metadata and resources", () => {
     // numerically rather than as strings (e.g., 42.0 and 42 are equal)".
     const accepted = await handleMcpRequest(
       state.ctx,
-      withHeaders(modernJsonRpcRequest(requestBody), {
+      withHeaders(statelessJsonRpcRequest(requestBody), {
         "mcp-param-limit": "25.0",
       }),
       component,
@@ -1148,7 +1148,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const rejected = await handleMcpRequest(
       state.ctx,
-      withHeaders(modernJsonRpcRequest(requestBody), {
+      withHeaders(statelessJsonRpcRequest(requestBody), {
         "mcp-param-limit": "26",
       }),
       component,
@@ -1161,7 +1161,7 @@ describe("handleMcpRequest metadata and resources", () => {
     // Number("0x19") is 25, but that is not a decimal integer literal.
     const coerced = await handleMcpRequest(
       state.ctx,
-      withHeaders(modernJsonRpcRequest(requestBody), {
+      withHeaders(statelessJsonRpcRequest(requestBody), {
         "mcp-param-limit": "0x19",
       }),
       component,
@@ -1195,7 +1195,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 1,
         method: "tools/call",
         params: { name: "search", arguments: { region: "us-east-1" } },
@@ -1232,7 +1232,7 @@ describe("handleMcpRequest metadata and resources", () => {
         },
       },
     ]);
-    const request = modernJsonRpcRequest({
+    const request = statelessJsonRpcRequest({
       id: 1,
       method: "tools/call",
       params: { name: "search", arguments: { query: "Hello, 世界" } },
@@ -1261,7 +1261,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
       const response = await handleMcpRequest(
         ctx,
-        modernJsonRpcRequest({
+        statelessJsonRpcRequest({
           id: 1,
           method,
           ...(method === "resources/read"
@@ -1285,7 +1285,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({ id: 1, method: "tools/list" }),
+      statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
       component,
       {
         authorize: async () => ({ allowed: true }),
@@ -1310,7 +1310,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({ method: "notifications/cancelled" }),
+      statelessJsonRpcRequest({ method: "notifications/cancelled" }),
       component,
       { authorize: async () => ({ allowed: true }) },
     );
@@ -1325,7 +1325,7 @@ describe("handleMcpRequest metadata and resources", () => {
 
     const response = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 1,
         method: "prompts/get",
         params: { name: "x" },
@@ -3764,7 +3764,7 @@ describe("resources/read not-found error payload", () => {
     const ctx = createCtx(component).ctx;
     const res = await handleMcpRequest(
       ctx,
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 2,
         method: "resources/read",
         params: { uri: "docs://missing" },
@@ -4048,7 +4048,7 @@ describe("structuredContent shape on a dispatch", () => {
   async function call(state: ReturnType<typeof createCtx>, component: ComponentApi) {
     const response = await handleMcpRequest(
       state.ctx,
-      modernJsonRpcRequest({
+      statelessJsonRpcRequest({
         id: 1,
         method: "tools/call",
         params: { name: "scalar_tool", arguments: {} },
