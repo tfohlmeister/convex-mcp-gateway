@@ -2,12 +2,33 @@
 
 ## [0.8.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.7.0...v0.8.0) (2026-08-14)
 
+Completes the `2026-07-28` surface that 0.7.0 left open: MRTR
+(`input_required`) with a host-side `beforeCall` hook, MCP elicitation,
+poll-first MCP Tasks, and bounded JSON Schema 2020-12 `$ref` and
+composition support. `2025-11-25` joins the supported legacy revisions.
+
+**One note on `outputSchema`, because three entries below are successive
+attempts at the same thing and only the last one describes the shipped
+behaviour.** A tool whose `returns:` validator is not object-rooted no
+longer has its `outputSchema` advertised to clients on `2025-11-25` and
+earlier, and gets no `structuredContent` from them either. Those
+revisions restrict `Tool.outputSchema` to `type: "object"` at the root
+and type `structuredContent` as an object, and a validating client
+rejects the whole `tools/list` response over a single scalar-rooted
+schema, so one `returns: v.string()` tool hid every tool from it.
+Clients on `2026-07-28` are unaffected and still receive both, for any
+JSON value.
+
+Worth knowing when writing a catalog: a **union** compiles to `anyOf`
+and so has no root `type` even when every branch is an object, which
+means `v.union(v.object(A), v.null())` is affected the same way a scalar
+is. `docs/getting-started.md` has the full table and the way out.
 
 ### Features
 
-* accept MCP 2025-11-25 as a supported legacy revision ([#24](https://github.com/tfohlmeister/convex-mcp-gateway/issues/24)) ([26c9d98](https://github.com/tfohlmeister/convex-mcp-gateway/commit/26c9d9856f7eb917882e6b95771523a03ee4c9cb)), closes [#14](https://github.com/tfohlmeister/convex-mcp-gateway/issues/14)
+* accept MCP 2025-11-25 as a supported legacy revision ([#24](https://github.com/tfohlmeister/convex-mcp-gateway/issues/24)) ([26c9d98](https://github.com/tfohlmeister/convex-mcp-gateway/commit/26c9d9856f7eb917882e6b95771523a03ee4c9cb))
 * add poll-first MCP Tasks with Convex Workflow ([#23](https://github.com/tfohlmeister/convex-mcp-gateway/issues/23)) ([0e49fe8](https://github.com/tfohlmeister/convex-mcp-gateway/commit/0e49fe81cd4106ccb9ec3558bebb201cf87d7a56))
-* bounded JSON Schema 2020-12 $ref and composition support ([#25](https://github.com/tfohlmeister/convex-mcp-gateway/issues/25)) ([ac8f933](https://github.com/tfohlmeister/convex-mcp-gateway/commit/ac8f9332629afcaff8737342e9781285a1255648)), closes [#15](https://github.com/tfohlmeister/convex-mcp-gateway/issues/15)
+* bounded JSON Schema 2020-12 $ref and composition support ([#25](https://github.com/tfohlmeister/convex-mcp-gateway/issues/25)) ([ac8f933](https://github.com/tfohlmeister/convex-mcp-gateway/commit/ac8f9332629afcaff8737342e9781285a1255648))
 * support MCP elicitation via input_required ([#22](https://github.com/tfohlmeister/convex-mcp-gateway/issues/22)) ([1d7f8c0](https://github.com/tfohlmeister/convex-mcp-gateway/commit/1d7f8c0922559200163d9e9bed34b66fb413336c))
 
 
