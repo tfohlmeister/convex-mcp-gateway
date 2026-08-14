@@ -1950,7 +1950,7 @@ async function settleMrtrChain(
  * last fail-closed checks through the sealed `input_required` envelope.
  *
  * Everything here is mechanical and must not drift between `tools/call`
- * and `resources/read` — the round ceiling, the capability gate, and above
+ * and `resources/read`: the round ceiling, the capability gate, and above
  * all the sealed envelope, whose `toolName`/`argsDigest`/`idempotencyKey`
  * are what bind a continuation to exactly one chain. The checks that DO
  * differ (whether this request can carry a continuation at all) stay at
@@ -3187,7 +3187,13 @@ async function handlePost(
       if (
         providers.length === 0 &&
         registeredResources.length === 0 &&
-        templates.length === 0
+        templates.length === 0 &&
+        // A hook-only mount advertises the `resources` capability, and
+        // `resources/list` is that capability's base method: refusing it
+        // would leave a client that lists on connect with an error for a
+        // feature the handshake just promised. Its catalog is genuinely
+        // empty, so it lists as empty rather than as unsupported.
+        options.beforeResourceRead === undefined
       ) {
         if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(

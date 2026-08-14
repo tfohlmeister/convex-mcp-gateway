@@ -236,7 +236,7 @@ expansion is a function of the URI, so expansions are bound too) or
 presented as a tool continuation; each round's id is redeemed once, and
 re-sending it with different answers is refused; and the chain resolves
 exactly once, so a branch forked by an idempotent replay cannot re-open a
-read that was already served or refused. Requires `mrtr` and the modern
+read that was already served or refused. Requires `mrtr` and a stateless-era
 protocol: a hook that demands input where no continuation can travel fails
 the read (`-32603`) rather than serving the resource with the gate skipped.
 

@@ -433,12 +433,10 @@ export type McpHostCallbackCtx = {
   // Deliberately loose: a host's `api.*` function references are
   // generated per project, so pinning them here would fix this package
   // to one host's codegen.
-  /* eslint-disable @typescript-eslint/no-explicit-any */
   runQuery: (ref: any, args: any) => Promise<any>;
   runMutation: (ref: any, args: any) => Promise<any>;
   runAction: (ref: any, args: any) => Promise<any>;
   auth: { getUserIdentity: () => Promise<any> };
-  /* eslint-enable @typescript-eslint/no-explicit-any */
 } & Record<string, unknown>;
 
 export type McpBeforeCallHandler = (
