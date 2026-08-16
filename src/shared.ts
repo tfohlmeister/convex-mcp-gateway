@@ -400,16 +400,31 @@ export const mcpCallerValidator = v.object({
 export type McpCaller = Infer<typeof mcpCallerValidator>;
 
 /**
- * What a `beforeCall` hook receives. On the first call only `args` and
- * `identity` are present. On a verified continuation the gateway adds
- * the decoded `state` the hook sealed in the previous round, the
- * client's untrusted `inputResponses` (validate every field before
+ * Trusted protocol metadata for the MCP request currently being handled.
+ *
+ * `version` is the validated stateless request version or the negotiated
+ * version of the legacy session. `clientCapabilities` is the client's
+ * validated declaration, kept open for MCP extensions and future revisions.
+ * The gateway passes hooks a copy so mutating it cannot affect protocol
+ * enforcement for the request.
+ */
+export type McpProtocolContext = {
+  version: string;
+  clientCapabilities: Record<string, unknown>;
+};
+
+/**
+ * What a `beforeCall` hook receives. `protocol` comes from the validated
+ * MCP request, never from tool arguments. On a verified continuation the
+ * gateway adds the decoded `state` the hook sealed in the previous round,
+ * the client's untrusted `inputResponses` (validate every field before
  * acting on it), the chain's stable `idempotencyKey`, and the 1-based
  * `round` number of the continuation being answered.
  */
 export type McpBeforeCallArgs = {
   args: Record<string, unknown>;
   identity: McpCaller;
+  protocol: McpProtocolContext;
   state?: unknown;
   inputResponses?: Record<string, unknown>;
   idempotencyKey?: string;
@@ -451,6 +466,9 @@ export type McpBeforeCallHandler = (
  * arguments: a read has no arguments, and its `uri` is what the sealed
  * continuation binds.
  *
+ * `protocol` is the gateway-validated version and client-capability
+ * declaration for the current request, copied before the hook runs.
+ *
  * `resourceMetadata` is the registry `metadata` of the concrete resource
  * when the URI names one, `null` otherwise (a template expansion, or a
  * provider-served URI that is not persisted). Same value the host's
@@ -460,6 +478,7 @@ export type McpBeforeResourceReadArgs = {
   uri: string;
   resourceMetadata: Record<string, unknown> | null;
   identity: McpCaller;
+  protocol: McpProtocolContext;
   state?: unknown;
   inputResponses?: Record<string, unknown>;
   round?: number;

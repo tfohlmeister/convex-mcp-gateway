@@ -181,6 +181,15 @@ abstract. It also means a hook can write, so keep in mind that a client
 may re-send an unresolved continuation and re-run it: anything with a
 side effect belongs behind the chain's idempotency key, not in the hook.
 
+The hook's `protocol` field is gateway-owned request context. On a stateless
+2026-07-28 request it contains that request's validated protocol version and
+an exact copy of its `_meta["io.modelcontextprotocol/clientCapabilities"]`.
+On a session-based request it contains the negotiated session version and
+the capabilities declaration saved during `initialize`; pre-existing session
+rows without that optional field expose `{}`. Continuations use the metadata
+on the current request, not a value stored in `requestState`, and the hook's
+copy cannot alter the gateway's separate capability-gating snapshot.
+
 The underlying function therefore stays MCP-unaware: it never parses
 input-response envelopes, and the only gateway-injected argument is the
 chain's stable idempotency key (`mrtrArgs`), which is audited like any

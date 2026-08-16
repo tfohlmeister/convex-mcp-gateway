@@ -289,6 +289,10 @@ describe("re-entrant beforeCall state machine", () => {
     expect(first.result?.inputRequests).toEqual(CONFIRM_REQUEST);
     expect(dispatched).toHaveLength(0);
     expect(hookCalls[0]).toMatchObject({ args: { file: "report.txt" } });
+    expect(hookCalls[0]!.protocol).toEqual({
+      version: "2026-07-28",
+      clientCapabilities: { elicitation: { form: {} } },
+    });
     expect(hookCalls[0]!.inputResponses).toBeUndefined();
 
     const retry = await json(
@@ -319,6 +323,83 @@ describe("re-entrant beforeCall state machine", () => {
       file: "report.txt",
       continuationKey: hookCalls[1]!.idempotencyKey,
     });
+    expect(dispatched[0]!.args).not.toHaveProperty("protocol");
+    expect(dispatched[0]!.args).not.toHaveProperty("clientCapabilities");
+  });
+
+  test("hook sees the exact current modern protocol declaration", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const tool = declarativeTool(async (_ctx, hookArgs) => {
+      seen.push(hookArgs.protocol as unknown as Record<string, unknown>);
+      return hookArgs.inputResponses === undefined
+        ? inputRequired(CONFIRM_REQUEST)
+        : null;
+    });
+    const firstCaps = { elicitation: {} };
+    const secondCaps = { elicitation: { url: {} }, sampling: { models: true } };
+    const { api, ctx, dispatched } = harness();
+
+    const first = await json(
+      await handleMcpRequest(
+        ctx,
+        request(1, {}, firstCaps),
+        api,
+        options(tool),
+      ),
+    );
+    expect(first.result?.resultType).toBe("input_required");
+
+    const second = await json(
+      await handleMcpRequest(
+        ctx,
+        request(
+          2,
+          {
+            requestState: first.result!.requestState,
+            inputResponses: { confirm: { action: "accept" } },
+          },
+          secondCaps,
+        ),
+        api,
+        options(tool),
+      ),
+    );
+    expect(second.result?.isError).toBe(false);
+    expect(seen).toEqual([
+      { version: "2026-07-28", clientCapabilities: firstCaps },
+      { version: "2026-07-28", clientCapabilities: secondCaps },
+    ]);
+    expect(dispatched).toHaveLength(1);
+  });
+
+  test("hook sees modern capabilities without normalization", async () => {
+    const declarations = [
+      { elicitation: { form: {} } },
+      { elicitation: { url: {} } },
+      { elicitation: {} },
+      {},
+      { sampling: { models: true } },
+    ];
+
+    for (const clientCapabilities of declarations) {
+      const { api, ctx } = harness();
+      let seen: McpBeforeCallArgs["protocol"] | undefined;
+      const tool = declarativeTool(async (_ctx, hookArgs) => {
+        seen = hookArgs.protocol;
+        return null;
+      });
+      const body = await json(
+        await handleMcpRequest(
+          ctx,
+          request(1, {}, clientCapabilities),
+          api,
+          options(tool),
+        ),
+      );
+
+      expect(body.result?.isError).toBe(false);
+      expect(seen).toEqual({ version: "2026-07-28", clientCapabilities });
+    }
   });
 
   test("decline: hook completes the call and the function never runs", async () => {
@@ -474,6 +555,41 @@ describe("re-entrant beforeCall state machine", () => {
     expect(retry.result?.isError).toBe(false);
     // Dispatch used the client-sent arguments, not the hook's mutation.
     expect(dispatched[0]!.args).toMatchObject({ file: "report.txt" });
+  });
+
+  test("tool arguments cannot spoof the trusted protocol context", async () => {
+    const { api, ctx, dispatched } = harness();
+    const spoof = {
+      version: "1999-01-01",
+      clientCapabilities: { elicitation: { form: {} } },
+    };
+    let seen: McpBeforeCallArgs["protocol"] | undefined;
+    const tool = declarativeTool(async (_ctx, hookArgs) => {
+      seen = hookArgs.protocol;
+      expect(hookArgs.args.protocol).toEqual(spoof);
+      return null;
+    });
+    const body = await json(
+      await handleMcpRequest(
+        ctx,
+        request(
+          1,
+          {
+            arguments: { file: "report.txt", protocol: spoof },
+          },
+          {},
+        ),
+        api,
+        options(tool),
+      ),
+    );
+
+    expect(body.result?.isError).toBe(false);
+    expect(seen).toEqual({ version: "2026-07-28", clientCapabilities: {} });
+    expect(dispatched[0]!.args).toEqual({
+      file: "report.txt",
+      protocol: spoof,
+    });
   });
 });
 
@@ -657,6 +773,25 @@ describe("gating and negotiation", () => {
     }
   });
 
+  test("hook mutation cannot weaken the gateway capability gate", async () => {
+    const { api, ctx, dispatched } = harness();
+    const tool = declarativeTool(async (_ctx, { protocol }) => {
+      protocol.clientCapabilities.elicitation = { form: {} };
+      return inputRequired(CONFIRM_REQUEST);
+    });
+    const body = await json(
+      await handleMcpRequest(
+        ctx,
+        request(1, {}, { elicitation: { url: {} } }),
+        api,
+        options(tool),
+      ),
+    );
+
+    expect(body.error?.code).toBe(-32021);
+    expect(dispatched).toHaveLength(0);
+  });
+
   test("an anonymous call gets the audited 401 challenge, like identityArg", async () => {
     const { api, ctx, denials, dispatched } = harness({
       oauthConfig: { authServerUrl: "https://as.example.com" },
@@ -830,15 +965,22 @@ describe("legacy transport", () => {
   const session = {
     sessionId: "legacy-session",
     protocolVersion: "2025-06-18",
+    clientCapabilities: { sampling: { models: true } },
     identitySubject: "user-1",
     createdAt: 0,
     lastSeenAt: 0,
   };
 
-  function legacyCtx(api: ComponentApi, onDispatch: () => void) {
+  function legacyCtx(
+    api: ComponentApi,
+    onDispatch: () => void,
+    sessionRow: Omit<typeof session, "clientCapabilities"> & {
+      clientCapabilities?: Record<string, unknown>;
+    } = session,
+  ) {
     return {
       runQuery: async (ref: unknown) => {
-        if (ref === api.sessions.getSession) return session;
+        if (ref === api.sessions.getSession) return sessionRow;
         if (ref === api.registry.getTool) return registeredTool;
         if (ref === api.registry.getOAuthConfig) return null;
         throw new Error("unexpected query");
@@ -906,6 +1048,50 @@ describe("legacy transport", () => {
       "Handled gateway-side.",
     );
     expect(dispatched).toBe(false);
+  });
+
+  test("legacy hooks receive the negotiated version and session capabilities", async () => {
+    const api = component();
+    let protocol: McpBeforeCallArgs["protocol"] | undefined;
+    const tool = declarativeTool(async (_ctx, hookArgs) => {
+      protocol = hookArgs.protocol;
+      return null;
+    });
+    const body = await json(
+      await handleMcpRequest(
+        legacyCtx(api, () => undefined),
+        legacyRequest(1, session.sessionId),
+        api,
+        options(tool),
+      ),
+    );
+
+    expect(body.result?.isError).toBe(false);
+    expect(protocol).toEqual({
+      version: "2025-06-18",
+      clientCapabilities: { sampling: { models: true } },
+    });
+  });
+
+  test("legacy pre-upgrade sessions expose no invented capabilities", async () => {
+    const api = component();
+    let protocol: McpBeforeCallArgs["protocol"] | undefined;
+    const tool = declarativeTool(async (_ctx, hookArgs) => {
+      protocol = hookArgs.protocol;
+      return null;
+    });
+    const { clientCapabilities: _ignored, ...oldSession } = session;
+    await handleMcpRequest(
+      legacyCtx(api, () => undefined, oldSession),
+      legacyRequest(1, session.sessionId),
+      api,
+      options(tool),
+    );
+
+    expect(protocol).toEqual({
+      version: "2025-06-18",
+      clientCapabilities: {},
+    });
   });
 });
 
@@ -1597,7 +1783,14 @@ describe("MRTR on resources/read", () => {
     // Nothing was read: the gate ran before any provider.
     expect(reads).toHaveLength(0);
     // The hook sees the resource identity, not tool arguments.
-    expect(hookCalls[0]).toMatchObject({ uri: URI, resourceMetadata: null });
+    expect(hookCalls[0]).toMatchObject({
+      uri: URI,
+      resourceMetadata: null,
+      protocol: {
+        version: "2026-07-28",
+        clientCapabilities: { elicitation: { form: {} } },
+      },
+    });
 
     const second = await json(
       await handleMcpRequest(

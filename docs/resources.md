@@ -196,7 +196,7 @@ gateway.handleMcpRequest(ctx, request, {
   authorizeResource,
   resources,
   mrtr: { secret: process.env.MCP_MRTR_SECRET! },
-  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity, inputResponses }) => {
+  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity, protocol, inputResponses }) => {
     if (uri !== "docs://confidential") return null;   // not gated
     if (!inputResponses) {
       return inputRequired({
@@ -228,6 +228,12 @@ It is **mount-level**, like `authorizeResource`, rather than per-resource:
 a provider serves many URIs and the gateway cannot know which one owns a
 URI without calling it, so the gate has to sit where the URI is known and
 nothing has run yet. Branch on `uri` inside the hook.
+
+`beforeResourceRead` receives the same gateway-owned `protocol` context as
+`beforeCall`: the current validated protocol version and an open-ended copy of
+the client's declared capabilities. The context is useful for choosing an
+elicitation request, but the gateway still performs the final capability
+check for every `inputRequired()` result.
 
 The guarantees are the tool path's, because it is the same machinery: the
 continuation is HMAC-sealed and bound to `resources/read:<uri>` plus the

@@ -11,6 +11,7 @@ describe("sessions", () => {
       const id = await ctx.runMutation(api.sessions.createSession, {
         sessionId: "deadbeef",
         protocolVersion: "2025-06-18",
+        clientCapabilities: { elicitation: { form: {} } },
         identitySubject: null,
       });
       expect(id).toBeTypeOf("string");
@@ -20,6 +21,9 @@ describe("sessions", () => {
       });
       expect(session?.sessionId).toBe("deadbeef");
       expect(session?.protocolVersion).toBe("2025-06-18");
+      expect(session?.clientCapabilities).toEqual({
+        elicitation: { form: {} },
+      });
       expect(session?.identitySubject).toBeNull();
       expect(session?.createdAt).toBe(session?.lastSeenAt);
     });
