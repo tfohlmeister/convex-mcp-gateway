@@ -11,6 +11,7 @@ import {
   type McpDeclineReadResult,
   type McpIcon,
   type McpInputRequiredResult,
+  type McpProtocolContext,
   type McpServerInfo,
   type McpToolRegistration,
 } from "../shared.js";
@@ -2844,6 +2845,7 @@ async function handlePost(
   // hoisted so MRTR and task-augmented `tools/call` can both negotiate
   // against it below.
   let statelessClientCapabilities: Record<string, unknown> | null = null;
+  let protocolContext: McpProtocolContext | null = null;
 
   // The 2026 protocol moves protocol negotiation to each request. Check the
   // mirrored routing metadata before identity resolution, catalog writes,
@@ -2885,6 +2887,12 @@ async function handlePost(
       );
     }
     statelessClientCapabilities = clientCapabilities;
+    protocolContext = {
+      version: metadataProtocolVersion,
+      clientCapabilities: JSON.parse(
+        JSON.stringify(clientCapabilities),
+      ) as Record<string, unknown>,
+    };
     if (request.headers.get("mcp-method") !== message.method) {
       return statelessErrorResponse(
         message.id,
@@ -3003,6 +3011,16 @@ async function handlePost(
     }
     sessionId = headerSessionId;
     sessionOwnerSubject = session.identitySubject;
+    const sessionCapabilities = session.clientCapabilities;
+    protocolContext = {
+      version: session.protocolVersion,
+      clientCapabilities: isPlainObject(sessionCapabilities)
+        ? (JSON.parse(JSON.stringify(sessionCapabilities)) as Record<
+            string,
+            unknown
+          >)
+        : {},
+    };
     try {
       await ctx.runMutation(component.sessions.touchSession, {
         sessionId: headerSessionId,
@@ -3052,6 +3070,18 @@ async function handlePost(
 
   switch (message.method) {
     case "initialize": {
+      const declaredCapabilities = message.params?.capabilities;
+      if (
+        declaredCapabilities !== undefined &&
+        !isPlainObject(declaredCapabilities)
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "Invalid initialize client capabilities",
+        );
+        break;
+      }
       // Legacy clients reconcile their declarative catalog when they
       // initialize. Modern requests do the same work before dispatch above.
       try {
@@ -3080,6 +3110,10 @@ async function handlePost(
       await ctx.runMutation(component.sessions.createSession, {
         sessionId,
         protocolVersion: negotiated,
+        clientCapabilities: (declaredCapabilities ?? {}) as Record<
+          string,
+          unknown
+        >,
         identitySubject: auditIdentitySubject,
       });
       // Advertise the resources capability when any resource feature is
@@ -3632,6 +3666,7 @@ async function handlePost(
             uri,
             resourceMetadata: metadata as Record<string, unknown> | null,
             identity,
+            protocol: protocolContext!,
             ...(continuation
               ? {
                   state: continuation.state,
@@ -4638,6 +4673,7 @@ async function handlePost(
             // the digest above and the dispatch below.
             args: JSON.parse(JSON.stringify(args)) as Record<string, unknown>,
             identity: identity!,
+            protocol: protocolContext!,
             ...(continuation
               ? {
                   state: continuation.state,

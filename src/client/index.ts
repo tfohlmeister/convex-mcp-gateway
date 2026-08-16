@@ -56,6 +56,7 @@ export type {
   McpBeforeResourceReadHandler,
   McpBeforeResourceReadResult,
   McpCaller,
+  McpProtocolContext,
   McpCompleteCallResult,
   McpCompleteReadResult,
   McpDeclineReadResult,

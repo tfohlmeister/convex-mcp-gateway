@@ -321,7 +321,7 @@ defineMcpMutation({
     continuationKey: v.optional(v.string()),
   },
   mrtrArgs: { idempotencyKey: "continuationKey" },
-  beforeCall: async (_ctx, { args, inputResponses, round }) => {
+  beforeCall: async (_ctx, { args, protocol, inputResponses, round }) => {
     const ask = () =>
       inputRequired(
         {
@@ -334,7 +334,18 @@ defineMcpMutation({
       );
     // Round one: ask before anything can run. Discriminate on `round`:
     // a state-only retry is a continuation, not a first call.
-    if (round === undefined) return ask();
+    if (round === undefined) {
+      if (!clientSupportsFormElicitation(protocol.clientCapabilities)) {
+        return completeCall({
+          content: [{
+            type: "text",
+            text: "Confirmation must be collected by the calling agent.",
+          }],
+          structuredContent: { outcome: "interaction_required" },
+        });
+      }
+      return ask();
+    }
     const confirm = inputResponses?.confirm as { action?: string } | undefined;
     if (confirm === undefined) return ask(); // missing answer: ask again
     if (confirm.action !== "accept") {
@@ -353,6 +364,12 @@ gateway.handleMcpRequest(ctx, request, {
   mrtr: { secret: process.env.MCP_MRTR_SECRET! },
 });
 ```
+
+Here `protocol` is trusted gateway context and
+`clientSupportsFormElicitation` is a host helper; the gateway still validates
+every `inputRequired()` mode independently. Legacy requests carry their
+negotiated session version and initialization capabilities (or `{}` for an
+older session without them).
 
 The gateway HMAC-signs the opaque `requestState` with a five-minute default
 TTL, binding it to the tool name, original public arguments, authenticated
