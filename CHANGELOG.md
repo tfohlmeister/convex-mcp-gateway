@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.10.0...v0.11.0) (2026-08-17)
+
+
+### Features
+
+* add graceful MRTR capability fallback ([27e72c8](https://github.com/tfohlmeister/convex-mcp-gateway/commit/27e72c8f13a80d71f76bf088da2f7540d438bf20))
+* expose client capabilities to beforeCall hooks ([cef8844](https://github.com/tfohlmeister/convex-mcp-gateway/commit/cef8844dad8c4baa637a80aa3840c304228ed6bf))
+
+
+### Bug Fixes
+
+* keep the stored schema faithful where it decides enforcement ([2b8d0b5](https://github.com/tfohlmeister/convex-mcp-gateway/commit/2b8d0b57a413001afc49bd9caa10e05ef6c06bba))
+* preserve authored JSON Schema keywords through the registry ([05bb311](https://github.com/tfohlmeister/convex-mcp-gateway/commit/05bb311e0f0bb54363a6e43d2273a52df9862afa)), closes [#48](https://github.com/tfohlmeister/convex-mcp-gateway/issues/48) [#49](https://github.com/tfohlmeister/convex-mcp-gateway/issues/49)
+* treat a nullish MRTR fallback as no fallback ([c32ad3b](https://github.com/tfohlmeister/convex-mcp-gateway/commit/c32ad3b1d3fc6d8005a95768056cbd9ac09ef7e1))
+
 ## [0.10.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.9.0...v0.10.0) (2026-08-14)
 
 
