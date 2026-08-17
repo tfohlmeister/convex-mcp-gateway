@@ -3216,7 +3216,7 @@ describe("bounded $ref resolution (registration + advertisement)", () => {
     });
   });
 
-  test("the advertised catalog serves the resolved, self-contained schema", async () => {
+  test("the advertised catalog serves the authored schema, keywords intact", async () => {
     const t = newTest();
     const gateway = new McpGateway(components.mcpGateway);
     // Initialize FIRST so the mount's declarative sync has already run;
@@ -3229,12 +3229,13 @@ describe("bounded $ref resolution (registration + advertisement)", () => {
       } as unknown as Parameters<typeof gateway.registerTool>[1]);
     });
 
-    // tools/list advertises the self-contained schema: no $ref, no
-    // $defs, annotation inlined onto the properties chain. Runtime
-    // Mcp-Param-* enforcement walks this exact stored schema (the
+    // tools/list advertises what the host authored, references and all,
+    // per SEP-1613. Runtime Mcp-Param-* enforcement keeps walking the
+    // STORED schema, which the test above proves is the inlined one (the
     // header-mismatch -32020 path is covered by the modern contract
-    // tests), so a binding authored behind a $ref cannot silently
-    // vanish between registration and enforcement.
+    // tests), so a binding authored behind a $ref cannot silently vanish
+    // between registration and enforcement even though the client sees
+    // the reference.
     const list = await rpc(t, session, {
       jsonrpc: "2.0",
       id: 2,
@@ -3247,11 +3248,54 @@ describe("bounded $ref resolution (registration + advertisement)", () => {
       (tool) => tool.name === "regional_summary",
     );
     expect(advertised).toBeDefined();
-    expect(JSON.stringify(advertised!.inputSchema)).not.toContain("$ref");
-    expect(advertised!.inputSchema).toEqual({
-      type: "object",
-      properties: { region: { type: "string", "x-mcp-header": "region" } },
+    expect(advertised!.inputSchema).toEqual(authoredTool.inputSchema);
+  });
+
+  test("a tool declaring its JSON Schema dialect registers and advertises it", async () => {
+    // Issue #48: `$schema` reached the registry write verbatim, and
+    // Convex reserves field names starting with `$`, so registration
+    // threw from inside the write and every request to the mount 500'd.
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    const dialectTool = {
+      ...authoredTool,
+      inputSchema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: { region: { type: "string" } },
+      },
+      outputSchema: undefined,
+    };
+    const session = await initialize(t);
+    await t.run(async (ctx) => {
+      await gateway.registerTool(ctx, {
+        ...dialectTool,
+        fn: api.invoices.summary,
+      } as unknown as Parameters<typeof gateway.registerTool>[1]);
+      // Stored without the reserved keyword, which is what makes the
+      // write legal at all.
+      const stored = await ctx.runQuery(
+        components.mcpGateway.registry.getTool,
+        { name: "regional_summary" },
+      );
+      expect(stored!.inputSchema).toEqual({
+        type: "object",
+        properties: { region: { type: "string" } },
+      });
     });
+
+    const list = await rpc(t, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const listBody = (await list.json()) as {
+      result: { tools: Array<{ name: string; inputSchema: unknown }> };
+    };
+    expect(
+      listBody.result.tools.find((tool) => tool.name === "regional_summary")
+        ?.inputSchema,
+    ).toEqual(dialectTool.inputSchema);
   });
 
   test("a cyclic schema fails registration loudly with the tool named", async () => {

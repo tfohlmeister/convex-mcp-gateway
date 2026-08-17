@@ -620,6 +620,9 @@ type RegisteredTool = {
   functionHandle: string;
   inputSchema: unknown;
   outputSchema?: unknown;
+  /** See `advertisedSchema`: the wire form, when the row carries it. */
+  authoredInputSchemaJson?: string;
+  authoredOutputSchemaJson?: string;
   identityArg?: string;
   mrtrArgs?: {
     idempotencyKey: string;
@@ -1041,6 +1044,37 @@ function mayAdvertiseOutputSchema(
     isPlainObject(outputSchema) &&
     (outputSchema as { type?: unknown }).type === "object"
   );
+}
+
+/**
+ * The schema a client is shown for a registry row.
+ *
+ * The stored object is the RESOLVED one: `$ref` inlined, `$defs` gone,
+ * `$`-prefixed keywords stripped so Convex can store it at all. That is
+ * the right form for the gateway's own `Mcp-Param-*` walk and the wrong
+ * one for the wire, where SEP-1613 asks that those keywords survive. So
+ * the authored JSON wins whenever the row carries it.
+ *
+ * Rows written before that field fall back to the resolved object, which
+ * is exactly what they advertised before. A row whose JSON does not parse
+ * can only come from a caller writing to the component mutation directly;
+ * it falls back too rather than dropping the tool from the catalog.
+ */
+function advertisedSchema(
+  authoredJson: unknown,
+  stored: unknown,
+  toolName: string,
+): unknown {
+  if (typeof authoredJson !== "string") return stored;
+  try {
+    return JSON.parse(authoredJson);
+  } catch {
+    console.error(
+      "[mcp-gateway] tool has an unparsable authored schema, advertising the resolved one",
+      toolName,
+    );
+    return stored;
+  }
 }
 
 /**
@@ -4202,6 +4236,11 @@ async function handlePost(
           );
         }
         if (decision.allowed) {
+          const advertisedOutputSchema = advertisedSchema(
+            tool.authoredOutputSchemaJson,
+            tool.outputSchema,
+            tool.name,
+          );
           visible.push({
             // Spread first so the registry's own columns always win.
             // `protocolMetadata` is stored as `v.any()`, so a caller
@@ -4210,14 +4249,18 @@ async function handlePost(
             ...(tool.protocolMetadata ?? {}),
             name: tool.name,
             description: tool.description,
-            inputSchema: tool.inputSchema,
+            inputSchema: advertisedSchema(
+              tool.authoredInputSchemaJson,
+              tool.inputSchema,
+              tool.name,
+            ),
             // Only emit `outputSchema` when the tool actually declared
             // one, some MCP clients (Inspector older versions) are
             // strict about the field being absent vs null vs {}. A
             // non-object schema is withheld from legacy clients, which
             // would reject this entire response over it.
-            ...(mayAdvertiseOutputSchema(tool.outputSchema, isStateless)
-              ? { outputSchema: tool.outputSchema }
+            ...(mayAdvertiseOutputSchema(advertisedOutputSchema, isStateless)
+              ? { outputSchema: advertisedOutputSchema }
               : {}),
             // Advertise task support only when the host actually
             // configured task execution AND the caller speaks the

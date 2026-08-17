@@ -15,6 +15,7 @@ import type { ComponentApi } from "../component/_generated/component.js";
 import {
   buildResourceUrl,
   convexValidatorToJsonSchema,
+  prepareSchemaForStorage,
   resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
   SCHEMA_RESOLVER_VERSION,
@@ -1021,7 +1022,14 @@ function assertNoUngatedAlias(
   }
 }
 
-type ResolvedToolSchemas = { inputSchema: unknown; outputSchema: unknown };
+type ResolvedToolSchemas = {
+  /** Resolved and stripped of `$` keywords: the gateway's own view. */
+  inputSchema: unknown;
+  outputSchema: unknown;
+  /** Authored verbatim, JSON-encoded: what the client is shown. */
+  authoredInputSchemaJson: string | undefined;
+  authoredOutputSchemaJson: string | undefined;
+};
 
 /**
  * Per-tool-object memo of the resolved schemas. A declarative `tools`
@@ -1059,9 +1067,20 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
       `MCP tool "${tool.name}" has an unresolvable inputSchema: ${input.problem}.`,
     );
   }
+  const storableInput = prepareSchemaForStorage(input.resolved);
+  if (storableInput.problem !== undefined) {
+    throw new Error(
+      `MCP tool "${tool.name}" has an unstorable inputSchema: ${storableInput.problem}.`,
+    );
+  }
   let resolved: ResolvedToolSchemas;
   if (tool.outputSchema === undefined) {
-    resolved = { inputSchema: input.resolved, outputSchema: undefined };
+    resolved = {
+      inputSchema: storableInput.storable,
+      outputSchema: undefined,
+      authoredInputSchemaJson: JSON.stringify(tool.inputSchema),
+      authoredOutputSchemaJson: undefined,
+    };
   } else {
     const output = resolveJsonSchemaBounded(tool.outputSchema);
     if (output.problem !== undefined) {
@@ -1069,7 +1088,18 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
         `MCP tool "${tool.name}" has an unresolvable outputSchema: ${output.problem}.`,
       );
     }
-    resolved = { inputSchema: input.resolved, outputSchema: output.resolved };
+    const storableOutput = prepareSchemaForStorage(output.resolved);
+    if (storableOutput.problem !== undefined) {
+      throw new Error(
+        `MCP tool "${tool.name}" has an unstorable outputSchema: ${storableOutput.problem}.`,
+      );
+    }
+    resolved = {
+      inputSchema: storableInput.storable,
+      outputSchema: storableOutput.storable,
+      authoredInputSchemaJson: JSON.stringify(tool.inputSchema),
+      authoredOutputSchemaJson: JSON.stringify(tool.outputSchema),
+    };
   }
   resolvedSchemaCache.set(tool, resolved);
   return resolved;
@@ -1116,6 +1146,12 @@ async function resolveToolHandles(tools: McpToolRegistration[]) {
       inputSchema: schemas.inputSchema,
       ...(schemas.outputSchema !== undefined
         ? { outputSchema: schemas.outputSchema }
+        : {}),
+      ...(schemas.authoredInputSchemaJson !== undefined
+        ? { authoredInputSchemaJson: schemas.authoredInputSchemaJson }
+        : {}),
+      ...(schemas.authoredOutputSchemaJson !== undefined
+        ? { authoredOutputSchemaJson: schemas.authoredOutputSchemaJson }
         : {}),
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }
@@ -1316,6 +1352,12 @@ export class McpGateway {
       inputSchema: schemas.inputSchema,
       ...(schemas.outputSchema !== undefined
         ? { outputSchema: schemas.outputSchema }
+        : {}),
+      ...(schemas.authoredInputSchemaJson !== undefined
+        ? { authoredInputSchemaJson: schemas.authoredInputSchemaJson }
+        : {}),
+      ...(schemas.authoredOutputSchemaJson !== undefined
+        ? { authoredOutputSchemaJson: schemas.authoredOutputSchemaJson }
         : {}),
       ...(tool.identityArg !== undefined
         ? { identityArg: tool.identityArg }

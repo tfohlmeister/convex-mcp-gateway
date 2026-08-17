@@ -58,6 +58,8 @@ type RegisteredTool = {
   functionHandle: string;
   inputSchema: unknown;
   outputSchema?: unknown;
+  authoredInputSchemaJson?: string;
+  authoredOutputSchemaJson?: string;
   protocolMetadata?: Record<string, unknown>;
 };
 
@@ -4529,5 +4531,123 @@ describe("structuredContent shape on a dispatch", () => {
     expect(body.error).toBeUndefined();
     expect(body.result?.isError).toBe(true);
     expect(body.result?.content?.[0]?.text).toMatch(/cannot be represented/);
+  });
+});
+
+/**
+ * SEP-1613 keyword preservation. The registry stores the RESOLVED schema
+ * (refs inlined, `$defs` gone, `$`-prefixed keywords stripped so Convex
+ * can store it), which is the form the `Mcp-Param-*` walk needs and the
+ * wrong form for the client. `tools/list` therefore serves the authored
+ * JSON the row carries alongside it.
+ */
+describe("tools/list advertises the authored schema", () => {
+  const AUTHORED = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: { region: { $ref: "#/$defs/Region" } },
+    $defs: { Region: { type: "string", "x-mcp-header": "Region" } },
+  };
+  // What resolution leaves behind: inlined, no `$defs`, no `$schema`.
+  const RESOLVED = {
+    type: "object",
+    properties: { region: { type: "string", "x-mcp-header": "Region" } },
+  };
+
+  function preservingTool(): RegisteredTool {
+    return {
+      name: "regional_lookup",
+      description: "Looks up by region",
+      kind: "query",
+      functionHandle: "function://regional",
+      inputSchema: RESOLVED,
+      authoredInputSchemaJson: JSON.stringify(AUTHORED),
+    };
+  }
+
+  async function listedTool(state: ReturnType<typeof createCtx>, component: ComponentApi) {
+    const body = await readJson(
+      await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      ),
+    );
+    return (body.result?.tools as Array<Record<string, unknown>>)[0]!;
+  }
+
+  test("keeps $schema and $defs on the wire", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [preservingTool()]);
+    expect((await listedTool(state, component)).inputSchema).toEqual(AUTHORED);
+  });
+
+  test("the header walk still uses the resolved form", async () => {
+    // The point of advertising the authored schema is that it must not
+    // change what the gateway enforces: the annotation lives behind a
+    // `$ref` on the wire and is still required as a header.
+    const component = createComponent();
+    const state = createCtx(component, [preservingTool()]);
+    const requestBody = {
+      id: 1,
+      method: "tools/call",
+      params: { name: "regional_lookup", arguments: { region: "eu" } },
+    };
+
+    const rejected = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest(requestBody),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(rejected.status).toBe(400);
+    expect(await readJson(rejected)).toMatchObject({ error: { code: -32020 } });
+
+    const accepted = await handleMcpRequest(
+      state.ctx,
+      withHeaders(statelessJsonRpcRequest(requestBody), {
+        "mcp-param-region": "eu",
+      }),
+      component,
+      { authorize: async () => ({ allowed: false, reason: "Forbidden" }) },
+    );
+    expect(await readJson(accepted)).toMatchObject({ error: { code: -32003 } });
+  });
+
+  test("a row without the authored field advertises the resolved one", async () => {
+    // Rows written before the field exists keep behaving exactly as they
+    // did, rather than dropping out of the catalog.
+    const component = createComponent();
+    const { authoredInputSchemaJson: _dropped, ...legacyRow } = preservingTool();
+    const state = createCtx(component, [legacyRow]);
+    expect((await listedTool(state, component)).inputSchema).toEqual(RESOLVED);
+  });
+
+  test("an unparsable authored field falls back instead of failing the list", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      { ...preservingTool(), authoredInputSchemaJson: "{not json" },
+    ]);
+    expect((await listedTool(state, component)).inputSchema).toEqual(RESOLVED);
+  });
+
+  test("outputSchema is advertised from the authored form too", async () => {
+    const authoredOutput = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { total: { type: "number" } },
+    };
+    const component = createComponent();
+    const state = createCtx(component, [
+      {
+        ...preservingTool(),
+        outputSchema: { type: "object", properties: { total: { type: "number" } } },
+        authoredOutputSchemaJson: JSON.stringify(authoredOutput),
+      },
+    ]);
+    expect((await listedTool(state, component)).outputSchema).toEqual(
+      authoredOutput,
+    );
   });
 });
