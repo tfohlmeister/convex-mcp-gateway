@@ -475,7 +475,6 @@ describe("re-entrant beforeCall state machine", () => {
     // Dispatch used the client-sent arguments, not the hook's mutation.
     expect(dispatched[0]!.args).toMatchObject({ file: "report.txt" });
   });
-
 });
 
 describe("continuation replay protection", () => {
@@ -736,6 +735,80 @@ describe("gating and negotiation", () => {
 
       expect(body.result?.content?.[0]?.text).toBe("Handled by the agent.");
       expect(dispatched).toHaveLength(0);
+    }
+  });
+
+  test("a nullish fallback is no fallback, never a pass", async () => {
+    // `null` is the value that means "continue to the Convex function",
+    // so substituting it would silently drop the gate the hook asked
+    // for. TypeScript rejects it, an untyped host can still get here.
+    for (const onUnsupported of [null, undefined]) {
+      const { api, ctx, dispatched } = harness();
+      const tool = declarativeTool(async () =>
+        inputRequired(CONFIRM_REQUEST, undefined, {
+          onUnsupported: onUnsupported as never,
+        }),
+      );
+      const body = await json(
+        await handleMcpRequest(ctx, request(1, {}, {}), api, options(tool)),
+      );
+
+      expect(body.error?.code).toBe(-32021);
+      expect(body.error?.data?.requiredCapabilities).toEqual({
+        elicitation: { form: {} },
+      });
+      expect(dispatched).toHaveLength(0);
+    }
+  });
+
+  test("an unvouchable request stays a named hook bug, fallback or not", async () => {
+    // A typo'd method is a host bug on every era, so it must not be
+    // dressed up as the `-32601` "upgrade your protocol" answer a
+    // session-era client would otherwise get: an upgrade cannot fix it.
+    for (const onUnsupported of [
+      null,
+      completeCall({ content: [{ type: "text", text: "Ask the agent." }] }),
+    ]) {
+      const api = component();
+      let dispatched = false;
+      const tool = declarativeTool(async () =>
+        inputRequired(
+          { confirm: { method: "elicitaton/create" } },
+          undefined,
+          { onUnsupported: onUnsupported as never },
+        ),
+      );
+      const body = await json(
+        await handleMcpRequest(
+          {
+            runQuery: async (ref: unknown) => {
+              if (ref === api.sessions.getSession)
+                return {
+                  sessionId: "s".repeat(32),
+                  protocolVersion: "2025-06-18",
+                  identitySubject: "user-1",
+                  lastSeenAt: 0,
+                };
+              if (ref === api.registry.getTool) return registeredTool;
+              if (ref === api.registry.getOAuthConfig) return null;
+              throw new Error("unexpected query");
+            },
+            runMutation: async () => null,
+            runAction: async () => {
+              dispatched = true;
+              return { ok: true as const, data: {} };
+            },
+            auth: { getUserIdentity: async () => ({ subject: "user-1" }) },
+          } as never,
+          legacyRequest(1, "s".repeat(32)),
+          api,
+          options(tool),
+        ),
+      );
+
+      expect(body.error?.code).toBe(-32603);
+      expect(body.error?.message).toMatch(/unsupported input requests/);
+      expect(dispatched).toBe(false);
     }
   });
 
@@ -1001,6 +1074,27 @@ describe("legacy transport", () => {
     expect(dispatched).toBe(false);
   });
 
+  test("a nullish legacy fallback still fails closed", async () => {
+    const api = component();
+    let dispatched = false;
+    const tool = declarativeTool(async () =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: null as never,
+      }),
+    );
+    const body = await json(
+      await handleMcpRequest(
+        legacyCtx(api, () => (dispatched = true)),
+        legacyRequest(1, session.sessionId),
+        api,
+        options(tool),
+      ),
+    );
+
+    expect(body.error?.code).toBe(-32601);
+    expect(dispatched).toBe(false);
+  });
+
   test("a hook that passes (or completes) still works on legacy", async () => {
     const api = component();
     let dispatched = false;
@@ -1036,7 +1130,6 @@ describe("legacy transport", () => {
     );
     expect(dispatched).toBe(false);
   });
-
 });
 
 describe("continuation integrity", () => {
@@ -1763,6 +1856,23 @@ describe("MRTR on resources/read", () => {
 
     expect(body.result).toMatchObject({ contents: summary });
     expect(body.result?.requestState).toBeUndefined();
+    expect(reads).toHaveLength(0);
+  });
+
+  test("a nullish resource fallback does not serve the resource", async () => {
+    // The read path's equivalent of the tool path's nullish-fallback
+    // rule: `null` falls through to the providers, so it must not be
+    // usable as a fallback that quietly bypasses the gate.
+    const { api, ctx, options, reads } = readHarness(() =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: null as never,
+      }),
+    );
+    const body = await json(
+      await handleMcpRequest(ctx, readRequest(1, {}, {}), api, options),
+    );
+
+    expect(body.error?.code).toBe(-32021);
     expect(reads).toHaveLength(0);
   });
 

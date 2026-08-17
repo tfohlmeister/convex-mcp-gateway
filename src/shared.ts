@@ -419,9 +419,10 @@ export const mcpCallerValidator = v.object({
 export type McpCaller = Infer<typeof mcpCallerValidator>;
 
 /**
- * What a `beforeCall` hook receives. On a verified continuation the gateway
- * adds the decoded `state` the hook sealed in the previous round,
- * the client's untrusted `inputResponses` (validate every field before
+ * What a `beforeCall` hook receives. On the first call only `args` and
+ * `identity` are present. On a verified continuation the gateway adds
+ * the decoded `state` the hook sealed in the previous round, the
+ * client's untrusted `inputResponses` (validate every field before
  * acting on it), the chain's stable `idempotencyKey`, and the 1-based
  * `round` number of the continuation being answered.
  */

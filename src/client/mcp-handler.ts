@@ -3683,6 +3683,10 @@ async function handlePost(
             decision.inputRequests ?? {},
             isStateless ? statelessClientCapabilities : null,
           ) ?? undefined;
+          // Deliberately looser than the substitution below: a hook that
+          // supplied any fallback for requests the gateway cannot vouch
+          // for is a hook bug worth naming, and this branch only ever
+          // errors, so nothing can slip through it.
           if (!capabilityCheck && decision.onUnsupported !== undefined) {
             console.error(
               "[mcp-gateway] beforeResourceRead returned unsupported input requests",
@@ -3698,7 +3702,11 @@ async function handlePost(
           if (
             capabilityCheck &&
             !capabilityCheck.supported &&
-            decision.onUnsupported !== undefined
+            // Nullish means NO fallback, never a pass: `null` is the
+            // signal that falls through to the normal read path, so
+            // substituting it would drop the gate the hook just asked
+            // for and serve the resource unguarded.
+            decision.onUnsupported != null
           ) {
             decision = decision.onUnsupported;
           }
@@ -4717,6 +4725,10 @@ async function handlePost(
             requested.inputRequests ?? {},
             isStateless ? statelessClientCapabilities : null,
           ) ?? undefined;
+          // Deliberately looser than the substitution below: a hook that
+          // supplied any fallback for requests the gateway cannot vouch
+          // for is a hook bug worth naming, and this branch only ever
+          // errors, so nothing can slip through it.
           if (!capabilityCheck && requested.onUnsupported !== undefined) {
             console.error(
               "[mcp-gateway] MRTR beforeCall returned unsupported input requests",
@@ -4732,7 +4744,11 @@ async function handlePost(
           if (
             capabilityCheck &&
             !capabilityCheck.supported &&
-            requested.onUnsupported !== undefined
+            // Nullish means NO fallback, never a pass: `null` is the
+            // signal that falls through to the dispatch below, so
+            // substituting it would drop the gate the hook just asked
+            // for and run the tool unconfirmed.
+            requested.onUnsupported != null
           ) {
             requested = requested.onUnsupported;
           }
