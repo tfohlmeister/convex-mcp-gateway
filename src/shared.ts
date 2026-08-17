@@ -883,7 +883,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** UTF-8 byte length without `TextEncoder` (unavailable in some Convex runtimes). */
-function utf8ByteLength(value: string): number {
+export function utf8ByteLength(value: string): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -1177,11 +1177,44 @@ export function resolveJsonSchemaBounded(schema: unknown): ResolvedJsonSchema {
 }
 
 /**
- * Convex field names must be non-control ASCII. Everything else about a
- * JSON Schema property name is fine: leading `_`, spaces, dots, dashes
- * and the empty string all store.
+ * Why a field name is unstorable, or `null` when Convex takes it.
+ * Mirrors `validateObjectField` in `convex/values`, in its order: length
+ * first, then the reserved `$` prefix, then the character rule. A
+ * `__proto__` field is added because Convex's serialization silently
+ * drops it, so a schema carrying one would be advertised with a property
+ * the stored copy does not have.
  */
-const STORABLE_FIELD_NAME = /^[\x20-\x7e]*$/;
+function describeUnstorableFieldName(name: string): string | null {
+  if (name.length > 1024) return "field names are limited to 1024 characters";
+  if (name === "__proto__") return "Convex drops a __proto__ field";
+  if (name.startsWith("$")) return "a leading $ is reserved";
+  if (!/^[\x20-\x7e]*$/.test(name)) {
+    return "field names must be non-control ASCII";
+  }
+  return null;
+}
+
+/**
+ * Keywords whose OWN keys are property names rather than vocabulary.
+ * The distinction decides whether an unstorable key may be dropped: a
+ * keyword can be, a property name cannot, because dropping it would
+ * advertise a property the gateway then fails to find when it walks
+ * `x-mcp-header` annotations.
+ */
+const PROPERTY_NAME_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "dependentSchemas",
+  "dependentRequired",
+]);
+
+/**
+ * The walk descends per JSON level, so a schema level costs two (the
+ * keyword map, then the schema under it) where the resolver's own budget
+ * counts schema levels. Doubling keeps the two aligned: anything
+ * `resolveJsonSchemaBounded` accepts is storable.
+ */
+const STORAGE_MAX_JSON_DEPTH = SCHEMA_MAX_STRUCTURAL_DEPTH * 2;
 
 /**
  * Make a resolved schema storable as a Convex object.
@@ -1189,18 +1222,19 @@ const STORABLE_FIELD_NAME = /^[\x20-\x7e]*$/;
  * Convex reserves field names beginning with `$`, which is fatal for a
  * schema that declares its dialect: the write throws from inside Convex
  * and takes every request to the mount with it, `initialize` included.
- * `$`-prefixed names are JSON Schema vocabulary rather than anything the
- * gateway routes on, so the stored copy drops them and the authored copy
- * kept alongside it carries them to the client intact.
+ * In a keyword position a `$` name is JSON Schema vocabulary rather than
+ * anything the gateway routes on, so the stored copy drops it and the
+ * authored copy kept alongside it carries it to the client intact.
  *
- * The drop is unconditional, including inside data keywords (`const`,
- * `enum`) where `$ref` is plain data rather than a reference. That is a
- * deliberate narrowing of the INTERNAL copy, which is read only to walk
- * `x-mcp-header` annotations; the advertised schema is unaffected.
+ * That drop covers data keywords too (`const`, `enum`), where `$ref` is
+ * plain data rather than a reference. It is a deliberate narrowing of the
+ * INTERNAL copy, which is read only to walk `x-mcp-header` annotations;
+ * the advertised schema is unaffected.
  *
- * A field name that is unstorable for any other reason (non-ASCII, a
- * control character) is a `problem` instead: those are property names,
- * so dropping one would change what the schema means.
+ * A PROPERTY name is never dropped. It is a `problem` instead, because
+ * the advertised schema keeps it either way, and a property the runtime
+ * walk cannot see is an annotation declared to the client and enforced
+ * against nobody.
  */
 export function prepareSchemaForStorage(schema: unknown): {
   storable?: unknown;
@@ -1208,33 +1242,57 @@ export function prepareSchemaForStorage(schema: unknown): {
 } {
   let problem: string | null = null;
 
-  function walk(node: unknown, depth: number, path: string): unknown {
+  function fail(key: string, path: string, reason: string): undefined {
+    problem ??=
+      `field name ${JSON.stringify(key)} at ` +
+      `${path === "" ? "the schema root" : path} cannot be stored (${reason})`;
+    return undefined;
+  }
+
+  function walk(
+    node: unknown,
+    depth: number,
+    path: string,
+    keysAreNames: boolean,
+  ): unknown {
     if (problem !== null) return undefined;
-    if (depth > SCHEMA_MAX_STRUCTURAL_DEPTH) {
-      problem = `schema exceeds the structural depth budget (${SCHEMA_MAX_STRUCTURAL_DEPTH})`;
+    if (depth > STORAGE_MAX_JSON_DEPTH) {
+      problem = `schema exceeds the storage depth budget (${STORAGE_MAX_JSON_DEPTH})`;
       return undefined;
     }
     if (Array.isArray(node)) {
       return node.map((item, index) =>
-        walk(item, depth + 1, `${path}[${index}]`),
+        walk(item, depth + 1, `${path}[${index}]`, false),
       );
     }
     if (!isRecord(node)) return node;
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(node)) {
-      if (key.startsWith("$")) continue;
-      if (!STORABLE_FIELD_NAME.test(key)) {
-        problem =
-          `field name ${JSON.stringify(key)} at ` +
-          `${path === "" ? "the schema root" : path} cannot be stored ` +
-          `(Convex field names must be non-control ASCII)`;
-        return undefined;
+      const unstorable = describeUnstorableFieldName(key);
+      if (unstorable !== null) {
+        if (keysAreNames) return fail(key, path, unstorable);
+        // A keyword the gateway does not route on. Only the reserved
+        // prefix is droppable; the rest would still be a silent edit.
+        if (!key.startsWith("$")) return fail(key, path, unstorable);
+        continue;
       }
-      out[key] = walk(value, depth + 1, path === "" ? key : `${path}.${key}`);
+      setOwn(
+        out,
+        key,
+        walk(
+          value,
+          depth + 1,
+          path === "" ? key : `${path}.${key}`,
+          // Only from a keyword position: under `properties`, `key` is
+          // itself a property name, and a property named "properties"
+          // holds an ordinary schema.
+          !keysAreNames && PROPERTY_NAME_KEYWORDS.has(key),
+        ),
+      );
     }
     return out;
   }
 
-  const storable = walk(schema, 0, "");
+  const storable = walk(schema, 0, "", false);
   return problem !== null ? { problem } : { storable };
 }
