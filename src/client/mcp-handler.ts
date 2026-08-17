@@ -10,8 +10,8 @@ import {
   type McpCompleteReadResult,
   type McpDeclineReadResult,
   type McpIcon,
+  type McpInputRequiredFallback,
   type McpInputRequiredResult,
-  type McpProtocolContext,
   type McpServerInfo,
   type McpToolRegistration,
 } from "../shared.js";
@@ -503,6 +503,8 @@ export interface HandleMcpRequestOptions {
    *
    * Return `inputRequired()` to ask the client for input (per MCP
    * 2026-07-28, `resources/read` may answer with an `InputRequiredResult`),
+   * optionally with `onUnsupported` for clients that cannot satisfy the
+   * requested capabilities,
    * `completeRead(contents)` to serve content yourself, `declineRead(reason)`
    * to refuse after the answer, or `null` to fall through to the normal
    * read path.
@@ -555,6 +557,8 @@ export interface HandleMcpRequestOptions {
    * Opt-in support for stateless-era multi-round-trip requests (MRTR). A
    * declarative tool's host-side `beforeCall` hook is the state machine:
    * on the first call it can return `inputRequired(inputRequests, state)`
+   * or provide an `onUnsupported` fallback for clients that cannot satisfy
+   * the requested capabilities
    * before the underlying Convex function can run; on every verified
    * continuation it runs again with the decoded state, the client's
    * untrusted `inputResponses`, and the chain's stable idempotency key,
@@ -1385,7 +1389,7 @@ const MRTR_MAX_ROUNDS = 16;
 
 function isMcpInputRequiredResult(
   value: unknown,
-): value is McpInputRequiredResult {
+): value is McpInputRequiredResult<McpInputRequiredFallback> {
   return (
     isPlainObject(value) &&
     value.__mcpInputRequired === true &&
@@ -1528,6 +1532,29 @@ function missingMrtrCapabilities(
     }
   }
   return missing;
+}
+
+type MrtrCapabilityCheck = {
+  missingCapabilities: Record<string, unknown>;
+  supported: boolean;
+};
+
+function checkMrtrCapabilities(
+  inputRequests: Record<string, unknown>,
+  clientCapabilities: Record<string, unknown> | null,
+): MrtrCapabilityCheck | null {
+  const requiredCapabilities = mrtrRequiredCapabilities(inputRequests);
+  if (!requiredCapabilities) return null;
+  const missingCapabilities =
+    clientCapabilities === null
+      ? requiredCapabilities
+      : missingMrtrCapabilities(clientCapabilities, requiredCapabilities);
+  return {
+    missingCapabilities,
+    supported:
+      clientCapabilities !== null &&
+      Object.keys(missingCapabilities).length === 0,
+  };
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -1974,6 +2001,7 @@ async function askMrtrInput(
     clientCapabilities: Record<string, unknown>;
     inputRequests: Record<string, unknown>;
     state: unknown;
+    capabilityCheck?: MrtrCapabilityCheck;
   },
 ): Promise<{ body: string } | { response: Response }> {
   if (mrtrSecretTooShort(mrtr)) {
@@ -2003,8 +2031,10 @@ async function askMrtrInput(
       ),
     };
   }
-  const requiredCapabilities = mrtrRequiredCapabilities(input.inputRequests);
-  if (!requiredCapabilities) {
+  const capabilityCheck =
+    input.capabilityCheck ??
+    checkMrtrCapabilities(input.inputRequests, input.clientCapabilities);
+  if (!capabilityCheck) {
     // A host-side hook bug: a request method or shape the gateway cannot
     // vouch for (typo'd method, unknown elicitation mode). Name the
     // offending methods so the hook author can find it.
@@ -2025,10 +2055,7 @@ async function askMrtrInput(
       ),
     };
   }
-  const missingCapabilities = missingMrtrCapabilities(
-    input.clientCapabilities,
-    requiredCapabilities,
-  );
+  const missingCapabilities = capabilityCheck.missingCapabilities;
   if (Object.keys(missingCapabilities).length > 0) {
     return {
       response: statelessErrorResponse(
@@ -2845,7 +2872,6 @@ async function handlePost(
   // hoisted so MRTR and task-augmented `tools/call` can both negotiate
   // against it below.
   let statelessClientCapabilities: Record<string, unknown> | null = null;
-  let protocolContext: McpProtocolContext | null = null;
 
   // The 2026 protocol moves protocol negotiation to each request. Check the
   // mirrored routing metadata before identity resolution, catalog writes,
@@ -2887,12 +2913,6 @@ async function handlePost(
       );
     }
     statelessClientCapabilities = clientCapabilities;
-    protocolContext = {
-      version: metadataProtocolVersion,
-      clientCapabilities: JSON.parse(
-        JSON.stringify(clientCapabilities),
-      ) as Record<string, unknown>,
-    };
     if (request.headers.get("mcp-method") !== message.method) {
       return statelessErrorResponse(
         message.id,
@@ -3011,16 +3031,6 @@ async function handlePost(
     }
     sessionId = headerSessionId;
     sessionOwnerSubject = session.identitySubject;
-    const sessionCapabilities = session.clientCapabilities;
-    protocolContext = {
-      version: session.protocolVersion,
-      clientCapabilities: isPlainObject(sessionCapabilities)
-        ? (JSON.parse(JSON.stringify(sessionCapabilities)) as Record<
-            string,
-            unknown
-          >)
-        : {},
-    };
     try {
       await ctx.runMutation(component.sessions.touchSession, {
         sessionId: headerSessionId,
@@ -3070,18 +3080,6 @@ async function handlePost(
 
   switch (message.method) {
     case "initialize": {
-      const declaredCapabilities = message.params?.capabilities;
-      if (
-        declaredCapabilities !== undefined &&
-        !isPlainObject(declaredCapabilities)
-      ) {
-        body = jsonErrorEnvelope(
-          message.id,
-          INVALID_PARAMS,
-          "Invalid initialize client capabilities",
-        );
-        break;
-      }
       // Legacy clients reconcile their declarative catalog when they
       // initialize. Modern requests do the same work before dispatch above.
       try {
@@ -3110,10 +3108,6 @@ async function handlePost(
       await ctx.runMutation(component.sessions.createSession, {
         sessionId,
         protocolVersion: negotiated,
-        clientCapabilities: (declaredCapabilities ?? {}) as Record<
-          string,
-          unknown
-        >,
         identitySubject: auditIdentitySubject,
       });
       // Advertise the resources capability when any resource feature is
@@ -3666,7 +3660,6 @@ async function handlePost(
             uri,
             resourceMetadata: metadata as Record<string, unknown> | null,
             identity,
-            protocol: protocolContext!,
             ...(continuation
               ? {
                   state: continuation.state,
@@ -3683,6 +3676,32 @@ async function handlePost(
             "beforeResourceRead failed",
           );
           break;
+        }
+        let capabilityCheck: MrtrCapabilityCheck | undefined;
+        if (isMcpInputRequiredResult(decision)) {
+          capabilityCheck = checkMrtrCapabilities(
+            decision.inputRequests ?? {},
+            isStateless ? statelessClientCapabilities : null,
+          ) ?? undefined;
+          if (!capabilityCheck && decision.onUnsupported !== undefined) {
+            console.error(
+              "[mcp-gateway] beforeResourceRead returned unsupported input requests",
+              uri,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "beforeResourceRead returned unsupported input requests",
+            );
+            break;
+          }
+          if (
+            capabilityCheck &&
+            !capabilityCheck.supported &&
+            decision.onUnsupported !== undefined
+          ) {
+            decision = decision.onUnsupported;
+          }
         }
         // Validate a hook-supplied payload BEFORE anything is settled, the
         // same order the tool path validates `completeCall`'s result in: a
@@ -3869,6 +3888,7 @@ async function handlePost(
             clientCapabilities: statelessClientCapabilities ?? {},
             inputRequests: decision.inputRequests ?? {},
             state: decision.state,
+            capabilityCheck,
           });
           if ("response" in asked) return asked.response;
           body = asked.body;
@@ -4673,7 +4693,6 @@ async function handlePost(
             // the digest above and the dispatch below.
             args: JSON.parse(JSON.stringify(args)) as Record<string, unknown>,
             identity: identity!,
-            protocol: protocolContext!,
             ...(continuation
               ? {
                   state: continuation.state,
@@ -4691,6 +4710,32 @@ async function handlePost(
             "MRTR beforeCall failed",
           );
           break;
+        }
+        let capabilityCheck: MrtrCapabilityCheck | undefined;
+        if (isMcpInputRequiredResult(requested)) {
+          capabilityCheck = checkMrtrCapabilities(
+            requested.inputRequests ?? {},
+            isStateless ? statelessClientCapabilities : null,
+          ) ?? undefined;
+          if (!capabilityCheck && requested.onUnsupported !== undefined) {
+            console.error(
+              "[mcp-gateway] MRTR beforeCall returned unsupported input requests",
+              tool.name,
+            );
+            body = jsonErrorEnvelope(
+              message.id,
+              INTERNAL_ERROR,
+              "MRTR beforeCall returned unsupported input requests",
+            );
+            break;
+          }
+          if (
+            capabilityCheck &&
+            !capabilityCheck.supported &&
+            requested.onUnsupported !== undefined
+          ) {
+            requested = requested.onUnsupported;
+          }
         }
         if (isMcpCompleteCallResult(requested)) {
           // Terminal without dispatch, e.g. a declined confirmation.
@@ -4857,6 +4902,7 @@ async function handlePost(
             clientCapabilities: statelessClientCapabilities ?? {},
             inputRequests: requested.inputRequests ?? {},
             state: requested.state,
+            capabilityCheck,
           });
           if ("response" in asked) return asked.response;
           body = asked.body;

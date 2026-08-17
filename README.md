@@ -321,7 +321,7 @@ defineMcpMutation({
     continuationKey: v.optional(v.string()),
   },
   mrtrArgs: { idempotencyKey: "continuationKey" },
-  beforeCall: async (_ctx, { args, protocol, inputResponses, round }) => {
+  beforeCall: async (_ctx, { args, inputResponses, round }) => {
     const ask = () =>
       inputRequired(
         {
@@ -331,21 +331,19 @@ defineMcpMutation({
           },
         },
         { invoiceId: args.id },
+        {
+          onUnsupported: completeCall({
+            content: [{
+              type: "text",
+              text: "Confirmation must be collected by the calling agent.",
+            }],
+            structuredContent: { outcome: "interaction_required" },
+          }),
+        },
       );
     // Round one: ask before anything can run. Discriminate on `round`:
     // a state-only retry is a continuation, not a first call.
-    if (round === undefined) {
-      if (!clientSupportsFormElicitation(protocol.clientCapabilities)) {
-        return completeCall({
-          content: [{
-            type: "text",
-            text: "Confirmation must be collected by the calling agent.",
-          }],
-          structuredContent: { outcome: "interaction_required" },
-        });
-      }
-      return ask();
-    }
+    if (round === undefined) return ask();
     const confirm = inputResponses?.confirm as { action?: string } | undefined;
     if (confirm === undefined) return ask(); // missing answer: ask again
     if (confirm.action !== "accept") {
@@ -365,11 +363,12 @@ gateway.handleMcpRequest(ctx, request, {
 });
 ```
 
-Here `protocol` is trusted gateway context and
-`clientSupportsFormElicitation` is a host helper; the gateway still validates
-every `inputRequired()` mode independently. Legacy requests carry their
-negotiated session version and initialization capabilities (or `{}` for an
-older session without them).
+The hook declares the interaction it wants and an optional ordinary result for
+clients that cannot satisfy it. The gateway applies the MCP capability rules,
+including elicitation mode semantics, before choosing between `input_required`
+and that fallback. Without `onUnsupported`, the existing fail-closed protocol
+error is returned. A selected fallback completes the call before dispatch, so
+the Convex function is never run.
 
 The gateway HMAC-signs the opaque `requestState` with a five-minute default
 TTL, binding it to the tool name, original public arguments, authenticated
@@ -419,8 +418,9 @@ retries without `inputResponses`: such a retry decides nothing, so it is not
 redeemed and never burns the continuation for the answer that follows.
 Required input is never silently bypassed:
 the hook also runs for legacy 2025-era requests, and when it demands input
-there (or when `mrtr` is not configured), the call fails closed instead of
-dispatching. Note that rounds that end gateway-side (an `input_required`
+there it uses `onUnsupported` when supplied; otherwise (or when `mrtr` is not
+configured) the call fails closed instead of dispatching. Note that rounds
+that end gateway-side (an `input_required`
 response, a declined confirmation, a `-32021` rejection) write no audit rows;
 the audit log records authorization denials and dispatches. See the runnable
 [example](./example/convex/mcp.ts) and its durable idempotency record in

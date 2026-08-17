@@ -6,7 +6,6 @@ const sessionValidator = v.object({
   _creationTime: v.number(),
   sessionId: v.string(),
   protocolVersion: v.string(),
-  clientCapabilities: v.optional(v.record(v.string(), v.any())),
   createdAt: v.number(),
   lastSeenAt: v.number(),
   identitySubject: v.optional(v.union(v.string(), v.null())),
@@ -17,9 +16,6 @@ const sessionValidator = v.object({
  * from the HTTP handler after a successful `initialize`. The session ID
  * is generated server-side; never trust a client-supplied value.
  *
- * `clientCapabilities` is optional for callers and defaults to `{}` so
- * sessions created before this field existed remain compatible.
- *
  * `identitySubject` is the JWT subject the gateway resolved at
  * `initialize` time (or `null` if the caller was anonymous). It binds
  * the session to a specific user so DELETE can verify the teardown
@@ -29,7 +25,6 @@ export const createSession = mutation({
   args: {
     sessionId: v.string(),
     protocolVersion: v.string(),
-    clientCapabilities: v.optional(v.record(v.string(), v.any())),
     identitySubject: v.union(v.string(), v.null()),
   },
   returns: v.id("sessions"),
@@ -38,7 +33,6 @@ export const createSession = mutation({
     return await ctx.db.insert("sessions", {
       sessionId: args.sessionId,
       protocolVersion: args.protocolVersion,
-      clientCapabilities: args.clientCapabilities ?? {},
       identitySubject: args.identitySubject,
       createdAt: now,
       lastSeenAt: now,

@@ -427,7 +427,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
-          clientCapabilities?: Record<string, any>;
           identitySubject: string | null;
           protocolVersion: string;
           sessionId: string;
@@ -449,7 +448,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           _creationTime: number;
           _id: string;
-          clientCapabilities?: Record<string, any>;
           createdAt: number;
           identitySubject?: string | null;
           lastSeenAt: number;

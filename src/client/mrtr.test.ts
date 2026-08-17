@@ -289,10 +289,6 @@ describe("re-entrant beforeCall state machine", () => {
     expect(first.result?.inputRequests).toEqual(CONFIRM_REQUEST);
     expect(dispatched).toHaveLength(0);
     expect(hookCalls[0]).toMatchObject({ args: { file: "report.txt" } });
-    expect(hookCalls[0]!.protocol).toEqual({
-      version: "2026-07-28",
-      clientCapabilities: { elicitation: { form: {} } },
-    });
     expect(hookCalls[0]!.inputResponses).toBeUndefined();
 
     const retry = await json(
@@ -323,83 +319,6 @@ describe("re-entrant beforeCall state machine", () => {
       file: "report.txt",
       continuationKey: hookCalls[1]!.idempotencyKey,
     });
-    expect(dispatched[0]!.args).not.toHaveProperty("protocol");
-    expect(dispatched[0]!.args).not.toHaveProperty("clientCapabilities");
-  });
-
-  test("hook sees the exact current modern protocol declaration", async () => {
-    const seen: Array<Record<string, unknown>> = [];
-    const tool = declarativeTool(async (_ctx, hookArgs) => {
-      seen.push(hookArgs.protocol as unknown as Record<string, unknown>);
-      return hookArgs.inputResponses === undefined
-        ? inputRequired(CONFIRM_REQUEST)
-        : null;
-    });
-    const firstCaps = { elicitation: {} };
-    const secondCaps = { elicitation: { url: {} }, sampling: { models: true } };
-    const { api, ctx, dispatched } = harness();
-
-    const first = await json(
-      await handleMcpRequest(
-        ctx,
-        request(1, {}, firstCaps),
-        api,
-        options(tool),
-      ),
-    );
-    expect(first.result?.resultType).toBe("input_required");
-
-    const second = await json(
-      await handleMcpRequest(
-        ctx,
-        request(
-          2,
-          {
-            requestState: first.result!.requestState,
-            inputResponses: { confirm: { action: "accept" } },
-          },
-          secondCaps,
-        ),
-        api,
-        options(tool),
-      ),
-    );
-    expect(second.result?.isError).toBe(false);
-    expect(seen).toEqual([
-      { version: "2026-07-28", clientCapabilities: firstCaps },
-      { version: "2026-07-28", clientCapabilities: secondCaps },
-    ]);
-    expect(dispatched).toHaveLength(1);
-  });
-
-  test("hook sees modern capabilities without normalization", async () => {
-    const declarations = [
-      { elicitation: { form: {} } },
-      { elicitation: { url: {} } },
-      { elicitation: {} },
-      {},
-      { sampling: { models: true } },
-    ];
-
-    for (const clientCapabilities of declarations) {
-      const { api, ctx } = harness();
-      let seen: McpBeforeCallArgs["protocol"] | undefined;
-      const tool = declarativeTool(async (_ctx, hookArgs) => {
-        seen = hookArgs.protocol;
-        return null;
-      });
-      const body = await json(
-        await handleMcpRequest(
-          ctx,
-          request(1, {}, clientCapabilities),
-          api,
-          options(tool),
-        ),
-      );
-
-      expect(body.result?.isError).toBe(false);
-      expect(seen).toEqual({ version: "2026-07-28", clientCapabilities });
-    }
   });
 
   test("decline: hook completes the call and the function never runs", async () => {
@@ -557,40 +476,6 @@ describe("re-entrant beforeCall state machine", () => {
     expect(dispatched[0]!.args).toMatchObject({ file: "report.txt" });
   });
 
-  test("tool arguments cannot spoof the trusted protocol context", async () => {
-    const { api, ctx, dispatched } = harness();
-    const spoof = {
-      version: "1999-01-01",
-      clientCapabilities: { elicitation: { form: {} } },
-    };
-    let seen: McpBeforeCallArgs["protocol"] | undefined;
-    const tool = declarativeTool(async (_ctx, hookArgs) => {
-      seen = hookArgs.protocol;
-      expect(hookArgs.args.protocol).toEqual(spoof);
-      return null;
-    });
-    const body = await json(
-      await handleMcpRequest(
-        ctx,
-        request(
-          1,
-          {
-            arguments: { file: "report.txt", protocol: spoof },
-          },
-          {},
-        ),
-        api,
-        options(tool),
-      ),
-    );
-
-    expect(body.result?.isError).toBe(false);
-    expect(seen).toEqual({ version: "2026-07-28", clientCapabilities: {} });
-    expect(dispatched[0]!.args).toEqual({
-      file: "report.txt",
-      protocol: spoof,
-    });
-  });
 });
 
 describe("continuation replay protection", () => {
@@ -773,22 +658,102 @@ describe("gating and negotiation", () => {
     }
   });
 
-  test("hook mutation cannot weaken the gateway capability gate", async () => {
+  test("supported input uses the request even when a fallback is provided", async () => {
+    for (const clientCapabilities of [
+      { elicitation: { form: {} } },
+      { elicitation: {} },
+    ]) {
+      const { api, ctx, dispatched } = harness();
+      const tool = declarativeTool(async () =>
+        inputRequired(CONFIRM_REQUEST, undefined, {
+          onUnsupported: completeCall({
+            content: [{ type: "text", text: "Use the calling agent." }],
+          }),
+        }),
+      );
+      const body = await json(
+        await handleMcpRequest(
+          ctx,
+          request(1, {}, clientCapabilities),
+          api,
+          options(tool),
+        ),
+      );
+
+      expect(body.result?.resultType).toBe("input_required");
+      expect(body.result?.content).toBeUndefined();
+      expect(dispatched).toHaveLength(0);
+    }
+  });
+
+  test("unsupported input uses the fallback without dispatching", async () => {
+    for (const clientCapabilities of [
+      { elicitation: { url: {} } },
+      {},
+    ]) {
+      const { api, ctx, dispatched } = harness();
+      const tool = declarativeTool(async () =>
+        inputRequired(CONFIRM_REQUEST, undefined, {
+          onUnsupported: completeCall({
+            content: [{ type: "text", text: "Use the calling agent." }],
+            structuredContent: { outcome: "interaction_required" },
+          }),
+        }),
+      );
+      const body = await json(
+        await handleMcpRequest(
+          ctx,
+          request(1, {}, clientCapabilities),
+          api,
+          options(tool),
+        ),
+      );
+
+      expect(body.error).toBeUndefined();
+      expect(body.result?.content?.[0]?.text).toBe("Use the calling agent.");
+      expect(body.result?.requestState).toBeUndefined();
+      expect(dispatched).toHaveLength(0);
+    }
+  });
+
+  test("sampling and roots can use the same unsupported fallback", async () => {
+    for (const method of ["sampling/createMessage", "roots/list"]) {
+      const { api, ctx, dispatched } = harness();
+      const tool = declarativeTool(async () =>
+        inputRequired(
+          { request: { method } },
+          undefined,
+          {
+            onUnsupported: completeCall({
+              content: [{ type: "text", text: "Handled by the agent." }],
+            }),
+          },
+        ),
+      );
+      const body = await json(
+        await handleMcpRequest(ctx, request(1, {}, {}), api, options(tool)),
+      );
+
+      expect(body.result?.content?.[0]?.text).toBe("Handled by the agent.");
+      expect(dispatched).toHaveLength(0);
+    }
+  });
+
+  test("an invalid selected fallback is a gateway error", async () => {
     const { api, ctx, dispatched } = harness();
-    const tool = declarativeTool(async (_ctx, { protocol }) => {
-      protocol.clientCapabilities.elicitation = { form: {} };
-      return inputRequired(CONFIRM_REQUEST);
-    });
+    const tool = declarativeTool(async () =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: {
+          __mcpCompleteCall: true,
+          result: {},
+        } as never,
+      }),
+    );
     const body = await json(
-      await handleMcpRequest(
-        ctx,
-        request(1, {}, { elicitation: { url: {} } }),
-        api,
-        options(tool),
-      ),
+      await handleMcpRequest(ctx, request(1, {}, {}), api, options(tool)),
     );
 
-    expect(body.error?.code).toBe(-32021);
+    expect(body.error?.code).toBe(-32603);
     expect(dispatched).toHaveLength(0);
   });
 
@@ -965,7 +930,6 @@ describe("legacy transport", () => {
   const session = {
     sessionId: "legacy-session",
     protocolVersion: "2025-06-18",
-    clientCapabilities: { sampling: { models: true } },
     identitySubject: "user-1",
     createdAt: 0,
     lastSeenAt: 0,
@@ -974,9 +938,7 @@ describe("legacy transport", () => {
   function legacyCtx(
     api: ComponentApi,
     onDispatch: () => void,
-    sessionRow: Omit<typeof session, "clientCapabilities"> & {
-      clientCapabilities?: Record<string, unknown>;
-    } = session,
+    sessionRow: typeof session = session,
   ) {
     return {
       runQuery: async (ref: unknown) => {
@@ -1011,6 +973,31 @@ describe("legacy transport", () => {
     );
     expect(body.error?.code).toBe(-32601);
     expect(body.error?.message).toMatch(/multi-round-trip/);
+    expect(dispatched).toBe(false);
+  });
+
+  test("a legacy hook can use an unsupported fallback without dispatching", async () => {
+    const api = component();
+    let dispatched = false;
+    const tool = declarativeTool(async () =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: completeCall({
+          content: [{ type: "text", text: "Handled by the calling agent." }],
+        }),
+      }),
+    );
+    const body = await json(
+      await handleMcpRequest(
+        legacyCtx(api, () => (dispatched = true)),
+        legacyRequest(1, session.sessionId),
+        api,
+        options(tool),
+      ),
+    );
+
+    expect(body.result?.content?.[0]?.text).toBe(
+      "Handled by the calling agent.",
+    );
     expect(dispatched).toBe(false);
   });
 
@@ -1050,49 +1037,6 @@ describe("legacy transport", () => {
     expect(dispatched).toBe(false);
   });
 
-  test("legacy hooks receive the negotiated version and session capabilities", async () => {
-    const api = component();
-    let protocol: McpBeforeCallArgs["protocol"] | undefined;
-    const tool = declarativeTool(async (_ctx, hookArgs) => {
-      protocol = hookArgs.protocol;
-      return null;
-    });
-    const body = await json(
-      await handleMcpRequest(
-        legacyCtx(api, () => undefined),
-        legacyRequest(1, session.sessionId),
-        api,
-        options(tool),
-      ),
-    );
-
-    expect(body.result?.isError).toBe(false);
-    expect(protocol).toEqual({
-      version: "2025-06-18",
-      clientCapabilities: { sampling: { models: true } },
-    });
-  });
-
-  test("legacy pre-upgrade sessions expose no invented capabilities", async () => {
-    const api = component();
-    let protocol: McpBeforeCallArgs["protocol"] | undefined;
-    const tool = declarativeTool(async (_ctx, hookArgs) => {
-      protocol = hookArgs.protocol;
-      return null;
-    });
-    const { clientCapabilities: _ignored, ...oldSession } = session;
-    await handleMcpRequest(
-      legacyCtx(api, () => undefined, oldSession),
-      legacyRequest(1, session.sessionId),
-      api,
-      options(tool),
-    );
-
-    expect(protocol).toEqual({
-      version: "2025-06-18",
-      clientCapabilities: {},
-    });
-  });
 });
 
 describe("continuation integrity", () => {
@@ -1783,14 +1727,7 @@ describe("MRTR on resources/read", () => {
     // Nothing was read: the gate ran before any provider.
     expect(reads).toHaveLength(0);
     // The hook sees the resource identity, not tool arguments.
-    expect(hookCalls[0]).toMatchObject({
-      uri: URI,
-      resourceMetadata: null,
-      protocol: {
-        version: "2026-07-28",
-        clientCapabilities: { elicitation: { form: {} } },
-      },
-    });
+    expect(hookCalls[0]).toMatchObject({ uri: URI, resourceMetadata: null });
 
     const second = await json(
       await handleMcpRequest(
@@ -1811,6 +1748,22 @@ describe("MRTR on resources/read", () => {
       inputResponses: { confirm: { action: "accept" } },
       round: 1,
     });
+  });
+
+  test("an unsupported resource input uses completeRead before the provider", async () => {
+    const summary = [{ uri: URI, mimeType: "text/plain", text: "summary" }];
+    const { api, ctx, options, reads } = readHarness(() =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: completeRead(summary),
+      }),
+    );
+    const body = await json(
+      await handleMcpRequest(ctx, readRequest(1, {}, {}), api, options),
+    );
+
+    expect(body.result).toMatchObject({ contents: summary });
+    expect(body.result?.requestState).toBeUndefined();
+    expect(reads).toHaveLength(0);
   });
 
   test("declineRead refuses on the error channel, without reading", async () => {
@@ -2011,6 +1964,40 @@ describe("MRTR on resources/read", () => {
     );
     expect(legacy.error?.code).toBe(-32601);
     expect(legacy.error?.message).toMatch(/2026-07-28 or later/);
+    expect(reads).toHaveLength(0);
+  });
+
+  test("a legacy resource hook can use an unsupported fallback", async () => {
+    const summary = [{ uri: URI, mimeType: "text/plain", text: "summary" }];
+    const { api, ctx, options, reads } = readHarness(() =>
+      inputRequired(CONFIRM_REQUEST, undefined, {
+        onUnsupported: completeRead(summary),
+      }),
+    );
+    const body = await json(
+      await handleMcpRequest(
+        ctx,
+        new Request("https://gateway.example/mcp", {
+          method: "POST",
+          headers: {
+            accept: "application/json, text/event-stream",
+            "content-type": "application/json",
+            "mcp-protocol-version": "2025-06-18",
+            "mcp-session-id": "s".repeat(32),
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "resources/read",
+            params: { uri: URI },
+          }),
+        }),
+        api,
+        options,
+      ),
+    );
+
+    expect(body.result).toMatchObject({ contents: summary });
     expect(reads).toHaveLength(0);
   });
 

@@ -56,12 +56,12 @@ export type {
   McpBeforeResourceReadHandler,
   McpBeforeResourceReadResult,
   McpCaller,
-  McpProtocolContext,
   McpCompleteCallResult,
   McpCompleteReadResult,
   McpDeclineReadResult,
   McpHostCallbackCtx,
   McpIcon,
+  McpInputRequiredFallback,
   McpInputRequiredResult,
   McpServerInfo,
   McpToolAnnotations,
@@ -306,7 +306,8 @@ interface McpToolConfigBase<
    * function on the first call AND on every verified continuation
    * (which additionally carries the decoded `state`, the client's
    * untrusted `inputResponses`, the stable `idempotencyKey`, and the
-   * `round` number). Return `inputRequired()` for another round,
+   * `round` number). Return `inputRequired()` for another round, optionally
+   * with `onUnsupported` for clients that cannot satisfy its capabilities,
    * `completeCall()` to end the call without dispatching (e.g. a
    * declined confirmation), or `null`/`undefined` to continue to the
    * Convex function, which stays MCP-unaware.

@@ -181,14 +181,13 @@ abstract. It also means a hook can write, so keep in mind that a client
 may re-send an unresolved continuation and re-run it: anything with a
 side effect belongs behind the chain's idempotency key, not in the hook.
 
-The hook's `protocol` field is gateway-owned request context. On a stateless
-2026-07-28 request it contains that request's validated protocol version and
-an exact copy of its `_meta["io.modelcontextprotocol/clientCapabilities"]`.
-On a session-based request it contains the negotiated session version and
-the capabilities declaration saved during `initialize`; pre-existing session
-rows without that optional field expose `{}`. Continuations use the metadata
-on the current request, not a value stored in `requestState`, and the hook's
-copy cannot alter the gateway's separate capability-gating snapshot.
+When a hook returns `inputRequired()`, the gateway derives the required MCP
+capabilities and compares them with the current stateless request. Elicitation
+is matched by mode, with bare `elicitation: {}` meaning form support; sampling
+and roots use the same shared matcher. If any requirement is missing and the
+result has `onUnsupported`, that ordinary terminal result is validated and
+returned before dispatch. Without it, modern requests keep the existing
+`-32021` response and session-era requests keep `-32601`.
 
 The underlying function therefore stays MCP-unaware: it never parses
 input-response envelopes, and the only gateway-injected argument is the
@@ -344,13 +343,15 @@ handler that has no matching `beforeCall`, so imperative registrations
 and stale declarative catalogs can never dispatch without the promised
 confirmation. The hook runs on every transport, so required input is
 never silently bypassed: a legacy 2025-era request that reaches a hook
-demanding input is rejected with `-32601` (and a stateless request without
-the `mrtr` option fails closed with `-32603`). Tools with a hook reject
+demanding input uses `onUnsupported` when supplied; otherwise it is rejected
+with `-32601` (and a stateless request without the `mrtr` option fails closed
+with `-32603`). Tools with a hook reject
 anonymous callers through the same audited denial path as
 `identityArg` tools (real 401 + `WWW-Authenticate`). The gateway checks
 the current request's `clientCapabilities` before returning input
 requests (per elicitation mode, accumulated across all requests of the
-round) and reports `-32021` carrying only the missing capabilities. A
+round). A missing capability selects `onUnsupported` when supplied;
+otherwise it reports `-32021` carrying only the missing capabilities. A
 misconfigured signing secret surfaces as `-32603`, never as a client
 error. State-only continuations remain valid without `inputResponses`:
 carrying no answer decides nothing, so such a retry is not redeemed and

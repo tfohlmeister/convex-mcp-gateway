@@ -213,7 +213,6 @@ export default defineSchema({
   sessions: defineTable({
     sessionId: v.string(),
     protocolVersion: v.string(),
-    clientCapabilities: v.optional(v.record(v.string(), v.any())),
     createdAt: v.number(),
     lastSeenAt: v.number(),
     identitySubject: v.optional(v.union(v.string(), v.null())),
