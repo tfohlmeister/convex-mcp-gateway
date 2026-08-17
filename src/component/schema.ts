@@ -56,6 +56,24 @@ export default defineSchema({
      */
     outputSchema: v.optional(v.any()),
     /**
+     * The schemas exactly as the host authored them, JSON-encoded, and
+     * the form `tools/list` advertises. Two reasons they are strings
+     * rather than objects, and both are load-bearing:
+     *
+     * - Convex reserves field names beginning with `$`, so a
+     *   spec-conformant `$schema` or `$defs` cannot be stored as a
+     *   Convex object at all. Inside a string it is just characters.
+     * - Resolution inlines `$ref` and drops `$defs`, which is right for
+     *   the gateway's own `Mcp-Param-*` walk and wrong for the wire:
+     *   SEP-1613 asks that those keywords reach the client.
+     *
+     * So the resolved objects above stay the gateway's internal view and
+     * these carry the client's. Rows written before this field fall back
+     * to advertising the resolved form, which is what they did before.
+     */
+    authoredInputSchemaJson: v.optional(v.string()),
+    authoredOutputSchemaJson: v.optional(v.string()),
+    /**
      * Name of the tool-function argument the gateway fills with the
      * resolved caller identity before dispatch. Excluded from the
      * advertised inputSchema and stripped from caller args. Optional;

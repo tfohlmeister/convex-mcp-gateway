@@ -87,13 +87,9 @@ export const conformanceTools: McpToolRegistration[] = [
   // SEP-1613 keyword preservation. Written out by hand because
   // `defineMcpQuery` derives `inputSchema` from Convex validators, which
   // inline everything and never emit `$defs`. Whether these keywords
-  // reach the client unresolved is exactly what the scenario measures.
-  //
-  // `$schema` is deliberately absent: declaring the dialect, which is
-  // what the scenario asks for, crashes `initialize` outright, because
-  // the schema is persisted as a Convex value and Convex reserves field
-  // names beginning with `$`. Tracked separately; leaving it in here
-  // would take the whole mount down rather than fail one scenario.
+  // reach the client unresolved is exactly what the scenario measures,
+  // and the registry keeps the authored schema alongside the resolved
+  // one so that they do.
   {
     name: "json_schema_2020_12_tool",
     description: "Tool with JSON Schema 2020-12 features",
@@ -101,6 +97,7 @@ export const conformanceTools: McpToolRegistration[] = [
     fn: api.conformance.noop,
     functionReference: api.conformance.noop,
     inputSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
       $defs: {
         address: {

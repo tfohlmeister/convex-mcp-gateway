@@ -12,6 +12,8 @@ const toolReturnValidator = v.object({
   functionHandle: v.string(),
   inputSchema: v.any(),
   outputSchema: v.optional(v.any()),
+  authoredInputSchemaJson: v.optional(v.string()),
+  authoredOutputSchemaJson: v.optional(v.string()),
   identityArg: v.optional(v.string()),
   mrtrArgs: v.optional(
     v.object({
@@ -158,6 +160,8 @@ export const registerTool = mutation({
     functionHandle: v.string(),
     inputSchema: v.any(),
     outputSchema: v.optional(v.any()),
+    authoredInputSchemaJson: v.optional(v.string()),
+    authoredOutputSchemaJson: v.optional(v.string()),
     identityArg: v.optional(v.string()),
     mrtrArgs: v.optional(
       v.object({
@@ -479,6 +483,8 @@ export const replaceTools = mutation({
         functionHandle: v.string(),
         inputSchema: v.any(),
         outputSchema: v.optional(v.any()),
+        authoredInputSchemaJson: v.optional(v.string()),
+        authoredOutputSchemaJson: v.optional(v.string()),
         identityArg: v.optional(v.string()),
         mrtrArgs: v.optional(
           v.object({

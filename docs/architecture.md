@@ -426,13 +426,12 @@ the drift this API exists to prevent. It does mean one bad entry takes
 the endpoint down until the list is fixed.
 
 Schema `$ref` resolution happens once, at registration: the registry
-stores and `tools/list` advertises the inlined, self-contained schema
-(schemas with no schema-position reference pass through verbatim).
-Inlining rather than passing `$ref` through is a security decision as
-much as a compatibility one: the runtime `Mcp-Param-*` header walk does
-not follow references, so storing the resolved schema guarantees an
-annotation validated at registration is the same one enforced per call,
-and clients that do not resolve references still get a usable schema.
+stores the inlined, self-contained schema (schemas with no
+schema-position reference pass through verbatim). Inlining rather than
+passing `$ref` through is a security decision as much as a compatibility
+one: the runtime `Mcp-Param-*` header walk does not follow references,
+so storing the resolved schema guarantees an annotation validated at
+registration is the same one enforced per call.
 
 Two properties keep that honest. Resolution is reachability-driven:
 definition containers are consumed on demand and dropped from the
@@ -450,6 +449,38 @@ leaving them advertising stale resolutions.
 Hosts that prefer to register imperatively omit `tools` and call
 `gateway.register` from a mutation instead; the same validation runs
 there, failing the mutation with the tool named.
+
+### Two schemas per tool
+
+What the gateway walks and what the client is shown are not the same
+document, because the two have opposite requirements.
+
+The gateway needs the **resolved** schema: references inlined so the
+`Mcp-Param-*` walk sees what registration validated. It also has to be
+storable, and Convex reserves field names beginning with `$`, so the
+stored copy drops `$`-prefixed keywords entirely. Without that, a tool
+declaring its dialect with `$schema` fails the write from inside Convex
+and takes every request to that mount down, `initialize` included.
+
+The client needs the **authored** schema: SEP-1613 asks that `$schema`,
+`$defs` and `$ref` survive to the wire, and a `$defs` entry referenced
+from three places carries a name that three inlined copies do not. So
+registration also stores the authored document JSON-encoded, where a `$`
+is just a character, and `tools/list` serves that.
+
+```
+authored schema ─┬─ JSON string ──────────► tools/list (the client's view)
+                 │
+                 └─ resolve $ref ─► strip $ ─► Convex object ─► Mcp-Param-* walk
+```
+
+Rows written before the authored field exists advertise the resolved
+copy, exactly as they did before; bumping the resolver version re-syncs
+declarative catalogs on the next request. A field name that is
+unstorable for any other reason (non-ASCII, a control character) is a
+property name rather than a keyword, so dropping it would change what
+the schema means: those fail registration with the tool and the field
+named.
 
 ### MCP Tasks (poll-first)
 

@@ -1,8 +1,13 @@
+import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 import { v } from "convex/values";
 import type { FunctionReference } from "convex/server";
+import componentSchema from "../component/schema.js";
+import { modules as componentModules } from "../component/setup.test.js";
+import { api as componentApi } from "../component/_generated/api.js";
 import {
   convexValidatorToJsonSchema,
+  prepareSchemaForStorage,
   resolveJsonSchemaBounded,
   SCHEMA_MAX_REF_EXPANSIONS,
   SCHEMA_MAX_RESOLVED_BYTES,
@@ -438,5 +443,144 @@ describe("registration stores the resolved schema", () => {
     await expect(
       gateway.registerTool({ runMutation: async () => null } as never, cyclic),
     ).rejects.toThrow(/"regional_lookup" has an unresolvable inputSchema.*cyclic/);
+  });
+});
+
+/**
+ * Storage preparation. Convex reserves field names beginning with `$`,
+ * so a spec-conformant dialect declaration used to take the whole mount
+ * down on the write. The resolved copy loses those keywords; the
+ * authored copy kept beside it carries them to the client.
+ */
+describe("prepareSchemaForStorage", () => {
+  test("drops $-prefixed keywords at every depth", () => {
+    const result = prepareSchemaForStorage({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $id: "https://example.test/tool",
+      type: "object",
+      properties: {
+        region: { $comment: "internal", type: "string" },
+        nested: { type: "object", properties: { a: { $anchor: "x" } } },
+      },
+    });
+    expect(result.problem).toBeUndefined();
+    expect(result.storable).toEqual({
+      type: "object",
+      properties: {
+        region: { type: "string" },
+        nested: { type: "object", properties: { a: {} } },
+      },
+    });
+  });
+
+  test("keeps every field name Convex actually accepts", () => {
+    // Probed against convex-test: leading `_`, spaces, dots, dashes and
+    // the empty string all store. Only `$` and non-ASCII do not.
+    const schema = {
+      type: "object",
+      properties: {
+        _id: { type: "string" },
+        "a b": { type: "string" },
+        "a.b": { type: "string" },
+        "": { type: "string" },
+        "1a": { type: "string", "x-mcp-header": "One" },
+      },
+    };
+    expect(prepareSchemaForStorage(schema).storable).toEqual(schema);
+  });
+
+  test("walks arrays without losing entries", () => {
+    expect(
+      prepareSchemaForStorage({
+        type: "object",
+        allOf: [{ $comment: "x", type: "object" }, { required: ["a"] }],
+      }).storable,
+    ).toEqual({ type: "object", allOf: [{ type: "object" }, { required: ["a"] }] });
+  });
+
+  test("names an unstorable field name and its path", () => {
+    // A property name, not a keyword: dropping it would change what the
+    // schema means, so it is a problem rather than a silent strip.
+    const result = prepareSchemaForStorage({
+      type: "object",
+      properties: { "ünï": { type: "string" } },
+    });
+    expect(result.storable).toBeUndefined();
+    expect(result.problem).toMatch(/"ünï" at properties/);
+  });
+
+  test("bounds depth instead of overflowing the stack", () => {
+    let deep: Record<string, unknown> = {};
+    const root = deep;
+    for (let i = 0; i < 200; i++) {
+      const next: Record<string, unknown> = {};
+      deep.properties = next;
+      deep = next;
+    }
+    expect(prepareSchemaForStorage(root).problem).toMatch(/depth budget/);
+  });
+});
+
+describe("registration stores a schema Convex can hold", () => {
+  test("a $schema dialect declaration no longer breaks the write", async () => {
+    // Issue #48: the authored schema reached `ctx.runMutation` verbatim,
+    // and Convex rejected `$schema` as a field name from inside the
+    // write, so every request to the mount 500'd, `initialize` included.
+    const authored = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { name: { type: "string" } },
+    };
+    const row = {
+      name: "example",
+      description: "Example",
+      kind: "query" as const,
+      functionHandle: "function://example",
+      authoredInputSchemaJson: JSON.stringify(authored),
+    };
+    const t = convexTest(componentSchema, componentModules);
+
+    await expect(
+      t.run(async (ctx) =>
+        ctx.runMutation(componentApi.registry.registerTool, {
+          ...row,
+          inputSchema: authored,
+        }),
+      ),
+    ).rejects.toThrow(/\$schema starts with a '\$'/);
+
+    // What registration writes today: the prepared copy, plus the
+    // authored one as a string, where `$schema` is just characters.
+    const prepared = prepareSchemaForStorage(authored);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(componentApi.registry.registerTool, {
+        ...row,
+        inputSchema: prepared.storable,
+      });
+      const stored = await ctx.runQuery(componentApi.registry.getTool, {
+        name: "example",
+      });
+      expect(stored?.inputSchema).toEqual({
+        type: "object",
+        properties: { name: { type: "string" } },
+      });
+      expect(JSON.parse(stored!.authoredInputSchemaJson!)).toEqual(authored);
+    });
+  });
+
+  test("an unstorable field name fails registration with the tool named", async () => {
+    const gateway = new McpGateway({
+      registry: { registerTool: Symbol("registerTool") },
+    } as never);
+    await expect(
+      gateway.registerTool({ runMutation: async () => null } as never, {
+        name: "regional_lookup",
+        description: "x",
+        kind: "query",
+        fn: {},
+        functionReference: {},
+        inputSchema: { type: "object", properties: { "ünï": { type: "string" } } },
+      } as unknown as McpToolRegistration),
+    ).rejects.toThrow(/"regional_lookup" has an unstorable inputSchema.*"ünï"/);
   });
 });

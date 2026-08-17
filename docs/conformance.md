@@ -71,15 +71,19 @@ server-initiated messages the HTTP transport does not push.
 
 ## Known conformance gaps
 
-- **`$schema` cannot be advertised.** SEP-1613 asks a tool to declare
-  its JSON Schema dialect. A hand-written `inputSchema` carrying
-  `$schema` crashes `initialize` with an uncaught server error, because
-  the schema is persisted as a Convex value and Convex reserves field
-  names beginning with `$`. The failure takes down the whole mount, not
-  just that tool.
-- **`$defs` and `$ref` do not survive.** The gateway resolves them
-  before advertising, so a client never sees them. `additionalProperties`
-  and the rest of the schema pass through intact.
+- **A property name outside ASCII cannot be registered.** Convex field
+  names must be non-control ASCII, and a property name carries meaning,
+  so it cannot be dropped the way a `$`-prefixed keyword can. Such a
+  schema fails registration with the tool and the field named, rather
+  than failing the write from inside Convex.
+
+SEP-1613 keyword preservation used to sit here. The registry now keeps
+the authored schema beside the resolved one, so `$schema`, `$defs` and
+`$ref` reach the client intact while the gateway keeps walking the
+resolved form. See "Two schemas per tool" in
+[architecture.md](./architecture.md). That is covered by this repo's own
+tests, end to end through `tools/list`; the suite itself has not been
+re-run against a deployment since the change.
 
 ## What the suite does not cover
 

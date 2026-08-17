@@ -828,7 +828,7 @@ export const SCHEMA_MAX_RESOLVED_BYTES = 64 * 1024;
  * behavior change (new supported ref position, different budget
  * accounting, changed drop rules).
  */
-export const SCHEMA_RESOLVER_VERSION = 2;
+export const SCHEMA_RESOLVER_VERSION = 3;
 
 const LOCAL_DEFS_REF = /^#\/\$defs\/(.+)$/;
 
@@ -1174,4 +1174,67 @@ export function resolveJsonSchemaBounded(schema: unknown): ResolvedJsonSchema {
     };
   }
   return { resolved };
+}
+
+/**
+ * Convex field names must be non-control ASCII. Everything else about a
+ * JSON Schema property name is fine: leading `_`, spaces, dots, dashes
+ * and the empty string all store.
+ */
+const STORABLE_FIELD_NAME = /^[\x20-\x7e]*$/;
+
+/**
+ * Make a resolved schema storable as a Convex object.
+ *
+ * Convex reserves field names beginning with `$`, which is fatal for a
+ * schema that declares its dialect: the write throws from inside Convex
+ * and takes every request to the mount with it, `initialize` included.
+ * `$`-prefixed names are JSON Schema vocabulary rather than anything the
+ * gateway routes on, so the stored copy drops them and the authored copy
+ * kept alongside it carries them to the client intact.
+ *
+ * The drop is unconditional, including inside data keywords (`const`,
+ * `enum`) where `$ref` is plain data rather than a reference. That is a
+ * deliberate narrowing of the INTERNAL copy, which is read only to walk
+ * `x-mcp-header` annotations; the advertised schema is unaffected.
+ *
+ * A field name that is unstorable for any other reason (non-ASCII, a
+ * control character) is a `problem` instead: those are property names,
+ * so dropping one would change what the schema means.
+ */
+export function prepareSchemaForStorage(schema: unknown): {
+  storable?: unknown;
+  problem?: string;
+} {
+  let problem: string | null = null;
+
+  function walk(node: unknown, depth: number, path: string): unknown {
+    if (problem !== null) return undefined;
+    if (depth > SCHEMA_MAX_STRUCTURAL_DEPTH) {
+      problem = `schema exceeds the structural depth budget (${SCHEMA_MAX_STRUCTURAL_DEPTH})`;
+      return undefined;
+    }
+    if (Array.isArray(node)) {
+      return node.map((item, index) =>
+        walk(item, depth + 1, `${path}[${index}]`),
+      );
+    }
+    if (!isRecord(node)) return node;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (key.startsWith("$")) continue;
+      if (!STORABLE_FIELD_NAME.test(key)) {
+        problem =
+          `field name ${JSON.stringify(key)} at ` +
+          `${path === "" ? "the schema root" : path} cannot be stored ` +
+          `(Convex field names must be non-control ASCII)`;
+        return undefined;
+      }
+      out[key] = walk(value, depth + 1, path === "" ? key : `${path}.${key}`);
+    }
+    return out;
+  }
+
+  const storable = walk(schema, 0, "");
+  return problem !== null ? { problem } : { storable };
 }
