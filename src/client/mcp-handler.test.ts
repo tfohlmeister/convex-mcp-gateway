@@ -93,7 +93,6 @@ function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
     {
       sessionId: string;
       protocolVersion: string;
-      clientCapabilities?: Record<string, unknown>;
       identitySubject: string | null;
     }
   >();
@@ -133,9 +132,6 @@ function createCtx(component: ComponentApi, tools: RegisteredTool[] = []) {
           sessions.set(String(args.sessionId), {
             sessionId: String(args.sessionId),
             protocolVersion: String(args.protocolVersion),
-            clientCapabilities: args.clientCapabilities as
-              | Record<string, unknown>
-              | undefined,
             identitySubject:
               typeof args.identitySubject === "string"
                 ? args.identitySubject
@@ -785,50 +781,6 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(await rejected.text()).toContain(
       "2025-11-25, 2025-06-18, 2025-03-26",
     );
-  });
-
-  test("persists legacy initialize capabilities for later hook requests", async () => {
-    const component = createComponent();
-    const state = createCtx(component);
-    const capabilities = { sampling: { models: true } };
-    const response = await handleMcpRequest(
-      state.ctx,
-      jsonRpcRequest({
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-06-18",
-          capabilities,
-        },
-      }),
-      component,
-      { authorize: async () => ({ allowed: true }) },
-    );
-    const sessionId = response.headers.get("mcp-session-id")!;
-
-    expect(state.sessions.get(sessionId)?.clientCapabilities).toEqual(
-      capabilities,
-    );
-  });
-
-  test("rejects malformed legacy initialize capabilities before creating a session", async () => {
-    const component = createComponent();
-    const state = createCtx(component);
-    const response = await handleMcpRequest(
-      state.ctx,
-      jsonRpcRequest({
-        id: 1,
-        method: "initialize",
-        params: { protocolVersion: "2025-06-18", capabilities: [] },
-      }),
-      component,
-      { authorize: async () => ({ allowed: true }) },
-    );
-
-    expect(await readJson(response)).toMatchObject({
-      error: { code: -32602 },
-    });
-    expect(state.sessions.size).toBe(0);
   });
 
   test("rejects a modern request without client capabilities metadata", async () => {

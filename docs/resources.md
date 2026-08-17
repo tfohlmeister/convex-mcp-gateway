@@ -190,21 +190,29 @@ the same multi-round-trip mechanism tool calls use. Configure
 `beforeResourceRead` to use it:
 
 ```ts
-import { declineRead, inputRequired } from "convex-mcp-gateway";
+import { completeRead, declineRead, inputRequired } from "convex-mcp-gateway";
 
 gateway.handleMcpRequest(ctx, request, {
   authorizeResource,
   resources,
   mrtr: { secret: process.env.MCP_MRTR_SECRET! },
-  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity, protocol, inputResponses }) => {
+  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity, inputResponses }) => {
     if (uri !== "docs://confidential") return null;   // not gated
     if (!inputResponses) {
-      return inputRequired({
-        confirm: {
-          method: "elicitation/create",
-          params: { mode: "form", message: "Share the full document?" },
+      return inputRequired(
+        {
+          confirm: {
+            method: "elicitation/create",
+            params: { mode: "form", message: "Share the full document?" },
+          },
         },
-      });
+        undefined,
+        {
+          onUnsupported: completeRead([
+            { uri, mimeType: "text/plain", text: "Summary only." },
+          ]),
+        },
+      );
     }
     const confirm = inputResponses.confirm as { action?: string };
     if (confirm?.action !== "accept") {
@@ -220,7 +228,7 @@ Four decisions, mirroring `beforeCall` on the tool side:
 | Return | Result |
 |---|---|
 | `null` | Fall through to the normal read path (providers, then templates) |
-| `inputRequired(requests, state?)` | `resultType: "input_required"` with a sealed `requestState`; the client retries with `inputResponses` |
+| `inputRequired(requests, state?, { onUnsupported })` | `resultType: "input_required"` when supported; otherwise the optional fallback completes the read |
 | `completeRead(contents)` | Serve these contents instead, e.g. a redacted summary |
 | `declineRead(reason)` | Refuse with `-32003` and that reason; nothing is read |
 
@@ -229,11 +237,11 @@ a provider serves many URIs and the gateway cannot know which one owns a
 URI without calling it, so the gate has to sit where the URI is known and
 nothing has run yet. Branch on `uri` inside the hook.
 
-`beforeResourceRead` receives the same gateway-owned `protocol` context as
-`beforeCall`: the current validated protocol version and an open-ended copy of
-the client's declared capabilities. The context is useful for choosing an
-elicitation request, but the gateway still performs the final capability
-check for every `inputRequired()` result.
+The hook declares the requested interaction; the gateway owns capability
+matching. If the client cannot satisfy it, `onUnsupported` is returned before
+any provider or template runs. Without a fallback, the existing fail-closed
+protocol error remains. The same option works for `completeRead` and
+`declineRead` decisions on legacy/session-era requests.
 
 The guarantees are the tool path's, because it is the same machinery: the
 continuation is HMAC-sealed and bound to `resources/read:<uri>` plus the
