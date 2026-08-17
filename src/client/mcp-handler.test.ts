@@ -4479,6 +4479,38 @@ describe("structuredContent shape on a dispatch", () => {
     });
   });
 
+  test("both halves read the authored schema, not the stored one", async () => {
+    // The advertisement and the `structuredContent` decision have to
+    // agree, and they now judge the document the CLIENT was shown. A
+    // `$ref` root resolves to `type: "object"` in storage, so reading
+    // different copies would advertise nothing to a legacy client and
+    // then send it `structuredContent` anyway.
+    const authored = {
+      $ref: "#/$defs/Result",
+      $defs: { Result: { type: "object", properties: { n: { type: "number" } } } },
+    };
+    const withAuthored = (): RegisteredTool => ({
+      ...scalarTool({ type: "object", properties: { n: { type: "number" } } }),
+      authoredOutputSchemaJson: JSON.stringify(authored),
+    });
+
+    const listComponent = createComponent();
+    const listed = await legacyCall(
+      createCtx(listComponent, [withAuthored()]),
+      listComponent,
+      "tools/list",
+    );
+    expect(
+      listed.result?.tools?.find((t) => t.name === "scalar_tool"),
+    ).not.toHaveProperty("outputSchema");
+
+    const callComponent = createComponent();
+    const callState = createCtx(callComponent, [withAuthored()]);
+    callState.setDispatchResult({ ok: true, data: { n: 1 } });
+    const called = await legacyCall(callState, callComponent);
+    expect(called.result).not.toHaveProperty("structuredContent");
+  });
+
   test("a legacy client gets no structuredContent for a scalar", async () => {
     // Must track the advertisement exactly: that client was shown no
     // schema, and its own revision types `structuredContent` as an

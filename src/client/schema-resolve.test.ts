@@ -11,6 +11,7 @@ import {
   resolveJsonSchemaBounded,
   SCHEMA_MAX_REF_EXPANSIONS,
   SCHEMA_MAX_RESOLVED_BYTES,
+  SCHEMA_MAX_STRUCTURAL_DEPTH,
 } from "../shared.js";
 import { describeToolHeaderSchemaProblem } from "./mcp-handler.js";
 import { McpGateway, type McpToolRegistration } from "./index.js";
@@ -498,6 +499,65 @@ describe("prepareSchemaForStorage", () => {
     ).toEqual({ type: "object", allOf: [{ type: "object" }, { required: ["a"] }] });
   });
 
+  test("a $ PROPERTY name is a problem, not a silent drop", () => {
+    // Dropping it would advertise a property carrying an `x-mcp-header`
+    // annotation that the runtime walk then cannot find, so the header
+    // would be promised to the client and enforced against nobody.
+    const result = prepareSchemaForStorage({
+      type: "object",
+      properties: { $region: { type: "string", "x-mcp-header": "Region" } },
+    });
+    expect(result.storable).toBeUndefined();
+    expect(result.problem).toMatch(/"\$region" at properties.*leading \$/);
+  });
+
+  test("a __proto__ property name is a problem", () => {
+    // JSON.parse produces it as an own enumerable key, and Convex's
+    // serialization drops such a field, so storing it would create the
+    // same advertise-but-never-enforce gap.
+    const result = prepareSchemaForStorage(
+      JSON.parse(
+        '{"type":"object","properties":{"__proto__":{"type":"string"}}}',
+      ),
+    );
+    expect(result.storable).toBeUndefined();
+    expect(result.problem).toMatch(/__proto__/);
+  });
+
+  test("a field name past Convex's identifier limit is a problem", () => {
+    const result = prepareSchemaForStorage({
+      type: "object",
+      properties: { ["a".repeat(1025)]: { type: "string" } },
+    });
+    expect(result.problem).toMatch(/1024 characters/);
+  });
+
+  test("a property named after a keyword does not confuse the walk", () => {
+    // `properties.properties` is a property NAME; the schema under it
+    // has keywords again, so the map below THAT holds names once more.
+    expect(
+      prepareSchemaForStorage({
+        type: "object",
+        properties: { properties: { type: "object", $comment: "kept out" } },
+      }).storable,
+    ).toEqual({
+      type: "object",
+      properties: { properties: { type: "object" } },
+    });
+  });
+
+  test("anything the resolver accepts is storable", () => {
+    // The walk descends per JSON level and the resolver per schema
+    // level, so counting them the same way would reject catalogs that
+    // register fine, with a message quoting a budget they never hit.
+    let schema: Record<string, unknown> = { type: "string" };
+    for (let i = 0; i < SCHEMA_MAX_STRUCTURAL_DEPTH - 2; i++) {
+      schema = { type: "object", properties: { a: schema } };
+    }
+    expect(resolveJsonSchemaBounded(schema).problem).toBeUndefined();
+    expect(prepareSchemaForStorage(schema).problem).toBeUndefined();
+  });
+
   test("names an unstorable field name and its path", () => {
     // A property name, not a keyword: dropping it would change what the
     // schema means, so it is a problem rather than a silent strip.
@@ -507,6 +567,32 @@ describe("prepareSchemaForStorage", () => {
     });
     expect(result.storable).toBeUndefined();
     expect(result.problem).toMatch(/"ünï" at properties/);
+  });
+
+  test("an oversized authored schema fails registration, not the write", () => {
+    // The resolved copy has its own budget, but the two sizes are
+    // independent: unreferenced definitions resolve away and stay in the
+    // authored copy, which is what the row carries to the client.
+    const gateway = new McpGateway({
+      registry: { registerTool: Symbol("registerTool") },
+    } as never);
+    const bulky = {
+      type: "object",
+      properties: { a: { type: "string" } },
+      $defs: {
+        Unused: { type: "string", description: "x".repeat(SCHEMA_MAX_RESOLVED_BYTES) },
+      },
+    };
+    return expect(
+      gateway.registerTool({ runMutation: async () => null } as never, {
+        name: "bulky_tool",
+        description: "x",
+        kind: "query",
+        fn: {},
+        functionReference: {},
+        inputSchema: bulky,
+      } as unknown as McpToolRegistration),
+    ).rejects.toThrow(/"bulky_tool" has an oversized inputSchema/);
   });
 
   test("bounds depth instead of overflowing the stack", () => {

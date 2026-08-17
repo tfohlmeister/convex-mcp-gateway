@@ -18,7 +18,9 @@ import {
   prepareSchemaForStorage,
   resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
+  SCHEMA_MAX_RESOLVED_BYTES,
   SCHEMA_RESOLVER_VERSION,
+  utf8ByteLength,
   type McpBeforeCallHandler,
   type McpCaller,
   type McpIcon,
@@ -1057,6 +1059,32 @@ const resolvedSchemaCache = new WeakMap<object, ResolvedToolSchemas>();
  * end up declared-but-silently-unenforced. Schemas without `$ref`s are
  * returned verbatim. Memoized per tool object (see `resolvedSchemaCache`).
  */
+/**
+ * The authored schema as it is persisted: JSON, under the same byte
+ * budget the resolved copy answers to. The two sizes are independent,
+ * because a schema whose bulk sits in unreferenced `$defs` resolves
+ * small and stays large here. Without a budget of its own, a big enough
+ * one pushes the row past Convex's document limit and the write fails
+ * from inside Convex, which is the failure this whole split exists to
+ * keep at registration.
+ */
+function authoredSchemaJson(
+  tool: McpToolRegistration,
+  field: "inputSchema" | "outputSchema",
+): string | undefined {
+  const json = JSON.stringify(tool[field]);
+  if (json === undefined) return undefined;
+  const size = utf8ByteLength(json);
+  if (size > SCHEMA_MAX_RESOLVED_BYTES) {
+    throw new Error(
+      `MCP tool "${tool.name}" has an oversized ${field}: authored schema ` +
+        `exceeds the size budget (${size} > ${SCHEMA_MAX_RESOLVED_BYTES} ` +
+        `UTF-8 bytes).`,
+    );
+  }
+  return json;
+}
+
 function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
   const cached = resolvedSchemaCache.get(tool);
   if (cached !== undefined) return cached;
@@ -1073,12 +1101,13 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
       `MCP tool "${tool.name}" has an unstorable inputSchema: ${storableInput.problem}.`,
     );
   }
+  const authoredInputSchemaJson = authoredSchemaJson(tool, "inputSchema");
   let resolved: ResolvedToolSchemas;
   if (tool.outputSchema === undefined) {
     resolved = {
       inputSchema: storableInput.storable,
       outputSchema: undefined,
-      authoredInputSchemaJson: JSON.stringify(tool.inputSchema),
+      authoredInputSchemaJson,
       authoredOutputSchemaJson: undefined,
     };
   } else {
@@ -1097,8 +1126,8 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
     resolved = {
       inputSchema: storableInput.storable,
       outputSchema: storableOutput.storable,
-      authoredInputSchemaJson: JSON.stringify(tool.inputSchema),
-      authoredOutputSchemaJson: JSON.stringify(tool.outputSchema),
+      authoredInputSchemaJson,
+      authoredOutputSchemaJson: authoredSchemaJson(tool, "outputSchema"),
     };
   }
   resolvedSchemaCache.set(tool, resolved);

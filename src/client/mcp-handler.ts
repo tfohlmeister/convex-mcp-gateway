@@ -5351,7 +5351,14 @@ async function handlePost(
         // that was not shown a schema rejects a scalar block against its
         // own revision's type. Deciding both with one predicate is what
         // keeps the two halves from contradicting each other.
-        ...(mayAdvertiseOutputSchema(tool.outputSchema, isStateless)
+        ...(mayAdvertiseOutputSchema(
+          advertisedSchema(
+            tool.authoredOutputSchemaJson,
+            tool.outputSchema,
+            tool.name,
+          ),
+          isStateless,
+        )
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,

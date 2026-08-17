@@ -17,6 +17,10 @@ npx convex dev --once                    # redeploy with the switch on
 npx @modelcontextprotocol/conformance server --url <site-url>/mcp
 npx @modelcontextprotocol/conformance server --url <site-url>/mcp \
   --scenario tools-call-simple-text --verbose
+
+# The default "active" suite excludes pending scenarios, which is where
+# `json-schema-2020-12` lives:
+npx @modelcontextprotocol/conformance server --url <site-url>/mcp --suite all
 ```
 
 Turn it off again with `npx convex env remove MCP_CONFORMANCE` and
@@ -41,6 +45,17 @@ reasons are structural rather than a matter of unfinished fixtures.
 `server-sse-multiple-streams`, and `dns-rebinding-protection` once the
 host sets `allowedOrigins` (the example leaves it off, so that scenario
 fails by default, and passes 2/2 with it configured).
+
+`json-schema-2020-12` passes 4/4, including the two SEP-1613 keyword
+checks. It lives in the **pending** suite rather than the active one, so
+`--suite all` is needed to reach it at all:
+
+```
+[json-schema-2020-12-tool-found          ] SUCCESS Server advertises tool 'json_schema_2020_12_tool'
+[json-schema-2020-12-$schema             ] SUCCESS inputSchema.$schema field preserved
+[json-schema-2020-12-$defs               ] SUCCESS inputSchema.$defs field preserved with expected structure
+[json-schema-2020-12-additionalProperties] SUCCESS inputSchema.additionalProperties field preserved
+```
 
 ### Unreachable: non-text tool content
 
@@ -81,9 +96,8 @@ SEP-1613 keyword preservation used to sit here. The registry now keeps
 the authored schema beside the resolved one, so `$schema`, `$defs` and
 `$ref` reach the client intact while the gateway keeps walking the
 resolved form. See "Two schemas per tool" in
-[architecture.md](./architecture.md). That is covered by this repo's own
-tests, end to end through `tools/list`; the suite itself has not been
-re-run against a deployment since the change.
+[architecture.md](./architecture.md). Measured: `json-schema-2020-12`
+passes 4/4 against a local deployment, see above.
 
 ## What the suite does not cover
 
