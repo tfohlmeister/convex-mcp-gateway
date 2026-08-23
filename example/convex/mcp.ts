@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import {
   McpGateway,
   defineMcpMutation,
@@ -203,8 +203,10 @@ export const tools: McpToolRegistration[] = [
  * `invoices://summary` is a concrete resource declared with
  * `defineMcpResource`: a fixed URI whose read handler loads content (here
  * the invoice total) and stamps the authenticated caller. Resource reads
- * receive the resolved caller identity; anonymous reads are rejected by the
- * gateway before this handler runs.
+ * receive the resolved caller identity, which is nullable because a mount
+ * may set `anonymousResources`. This mount does not, so anonymous reads
+ * are rejected by the gateway before the handler runs, and the handler
+ * refuses a null caller anyway rather than rely on that.
  *
  * The `McpResourceRegistration[]` annotation mirrors the `tools` array: it
  * keeps Convex codegen from chasing the `api.*` references in the read
@@ -226,6 +228,12 @@ export const resources: McpResourceRegistration[] = [
       { src: "https://example.com/icons/invoices-dark.svg", mimeType: "image/svg+xml", sizes: ["any"], theme: "dark" },
     ],
     read: async (ctx, { uri, identity }) => {
+      // `identity` is nullable because a mount may set
+      // `anonymousResources`. This one does not, and this resource is
+      // per-caller anyway, so refuse rather than invent a caller.
+      // `ConvexError`, not `Error`: only the former survives
+      // `splitErrorText` and reaches the client as this message.
+      if (!identity) throw new ConvexError("Unauthorized");
       const summary = await ctx.runQuery(api.invoices.summary, {});
       return [
         {

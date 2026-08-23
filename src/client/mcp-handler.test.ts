@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { ConvexError } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
@@ -15,6 +15,7 @@ import {
   describeResourceTemplateProblem,
   describeServerInfoProblem,
   handleMcpRequest,
+  type McpResourceAuthorizerArgs,
   type McpResourceProvider,
   type McpResourceTemplateProvider,
 } from "./mcp-handler.js";
@@ -1596,7 +1597,9 @@ describe("handleMcpRequest metadata and resources", () => {
       name: "docs",
       list: async (_ctx, args) => [
         {
-          uri: `skill://${args.identity.subject}/overview`,
+          // This mount does not set `anonymousResources`, so a provider
+          // always has a caller here.
+          uri: `skill://${args.identity!.subject}/overview`,
           name: "Overview",
           description: "Tenant skill overview",
           mimeType: "application/json",
@@ -4681,5 +4684,1229 @@ describe("tools/list advertises the authored schema", () => {
     expect((await listedTool(state, component)).outputSchema).toEqual(
       authoredOutput,
     );
+  });
+});
+
+describe("anonymous resources", () => {
+  const publicDoc = defineMcpResource({
+    uri: "docs://public",
+    name: "Public",
+    metadata: { visibility: "public" },
+    read: async () => [{ uri: "docs://public", text: "public" }],
+  });
+  const privateDoc = defineMcpResource({
+    uri: "docs://private",
+    name: "Private",
+    metadata: { visibility: "private" },
+    read: async () => [{ uri: "docs://private", text: "private" }],
+  });
+
+  /** A caller with no identity at all, for the whole exchange. */
+  function anonymous(component: ReturnType<typeof createComponent>) {
+    const state = createCtx(component);
+    (
+      state.ctx.auth as { getUserIdentity: () => Promise<unknown> }
+    ).getUserIdentity = async () => null;
+    return state;
+  }
+
+  /** Serve `docs://public` anonymously, refuse everything else. */
+  const publicOnly = async (
+    _ctx: unknown,
+    args: McpResourceAuthorizerArgs,
+  ): Promise<{ allowed: boolean; reason?: string }> => {
+    if (args.mode !== "resource_anonymous") return { allowed: true };
+    return args.resourceUri === "docs://public"
+      ? { allowed: true }
+      : { allowed: false, reason: "Forbidden: not public" };
+  };
+
+  /**
+   * Initialize through the gateway rather than the bare handler: only the
+   * gateway syncs declared resources into the registry, and the registry
+   * row is where `resourceMetadata` comes from. Used with both anonymous
+   * and authenticated contexts, hence the neutral name.
+   */
+  async function openSession(
+    state: ReturnType<typeof createCtx>,
+    component: ReturnType<typeof createComponent>,
+    options: Record<string, unknown>,
+  ): Promise<string> {
+    const init = await new McpGateway(component).handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      { authorize: async () => ({ allowed: true }), ...options } as never,
+    );
+    return init.headers.get("mcp-session-id")!;
+  }
+
+  test.each([
+    ["resources/list", {}],
+    ["resources/templates/list", {}],
+    ["resources/read", { uri: "docs://public" }],
+  ])(
+    "without the option %s still refuses an anonymous caller, unaudited",
+    async (method, params) => {
+      const component = createComponent();
+      const state = anonymous(component);
+      const options = {
+        authorize: async () => ({ allowed: true }),
+        resources: [publicDoc],
+        resourceTemplates: [
+          defineMcpResourceTemplate({
+            uriTemplate: "docs://{id}/raw",
+            name: "Raw",
+            read: async () => null,
+          }),
+        ],
+        // An authorizer that would happily allow, to prove the refusal
+        // happens before it runs.
+        authorizeResource: async () => ({ allowed: true }),
+        auditResources: true as const,
+      };
+      const sessionId = await openSession(state, component, options);
+
+      const response = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id: 2, method, params }, sessionId),
+        component,
+        options,
+      );
+      expect(await readJson(response)).toMatchObject({
+        error: {
+          code: -32001,
+          message: "Unauthorized: authentication required",
+        },
+      });
+      expect(state.resourceAuditEntries).toEqual([]);
+    },
+  );
+
+  test("the authorizer sees resource_anonymous with the attempted operation", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const seen: Array<{
+      mode: string;
+      operation?: string;
+      uri: string;
+      metadata: unknown;
+      identity: unknown;
+    }> = [];
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      resourceTemplates: [
+        defineMcpResourceTemplate({
+          uriTemplate: "docs://{id}/raw",
+          name: "Raw",
+          read: async () => null,
+        }),
+      ],
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) => {
+        seen.push({
+          mode: args.mode,
+          ...(args.mode === "resource_anonymous"
+            ? { operation: args.operation }
+            : {}),
+          uri: args.resourceUri,
+          metadata: args.resourceMetadata,
+          identity: args.identity,
+        });
+        return { allowed: args.resourceUri === "docs://public" };
+      },
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const list = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+      component,
+      options,
+    );
+    // Filtered per resource, exactly as an authenticated list is.
+    expect(await readJson(list)).toMatchObject({
+      result: { resources: [{ uri: "docs://public", name: "Public" }] },
+    });
+
+    const templates = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 3, method: "resources/templates/list" }, sessionId),
+      component,
+      options,
+    );
+    expect(await readJson(templates)).toMatchObject({
+      result: { resourceTemplates: [] },
+    });
+
+    // Never an authenticated mode, always a null identity, and the host's
+    // metadata reaches the decision unchanged.
+    expect(seen).toEqual([
+      {
+        mode: "resource_anonymous",
+        operation: "list",
+        uri: "docs://public",
+        metadata: { visibility: "public" },
+        identity: null,
+      },
+      {
+        mode: "resource_anonymous",
+        operation: "list",
+        uri: "docs://private",
+        metadata: { visibility: "private" },
+        identity: null,
+      },
+      {
+        mode: "resource_anonymous",
+        operation: "templates_list",
+        // The template carries its `uriTemplate`, and templates have no
+        // metadata channel, so a public template is recognised by shape.
+        uri: "docs://{id}/raw",
+        metadata: null,
+        identity: null,
+      },
+    ]);
+  });
+
+  test("an anonymous read is served when allowed and refused when not", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      authorizeResource: publicOnly,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const allowed = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://public" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    expect(await readJson(allowed)).toMatchObject({
+      result: { contents: [{ uri: "docs://public", text: "public" }] },
+    });
+
+    const refused = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 3, method: "resources/read", params: { uri: "docs://private" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    // A host-authored refusal, so -32003 rather than the -32001 the gate
+    // returns when the option is off.
+    expect(await readJson(refused)).toMatchObject({
+      error: { code: -32003, message: "Forbidden: not public" },
+    });
+  });
+
+  test("an authorizer written before the option denies, as a host fault", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      // The shape a host wrote when `resource_anonymous` did not exist: it
+      // handles the three authenticated modes and returns nothing else.
+      // `parseAuthorizerDecision` reads that as a denial, so opting in
+      // fails closed until the host adds the branch.
+      authorizeResource: (async (_ctx: unknown, args: { mode: string }) => {
+        if (args.mode === "resource_read") return { allowed: true };
+        if (args.mode === "resource_list") return { allowed: true };
+        return undefined;
+      }) as never,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const errors: unknown[][] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        errors.push(args);
+      });
+    let body: Record<string, unknown>;
+    try {
+      const read = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest(
+          { id: 2, method: "resources/read", params: { uri: "docs://public" } },
+          sessionId,
+        ),
+        component,
+        options,
+      );
+      body = await readJson(read);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // A missing decision is a host BUG, not a policy denial, so it reads
+    // as one: an internal error rather than a Forbidden that would hide
+    // the misconfiguration behind a plausible-looking refusal.
+    expect(body.error).toMatchObject({ code: -32603 });
+    // The internal diagnostic stays server-side.
+    expect(JSON.stringify(body)).not.toContain("invalid shape");
+    expect(
+      errors.some(
+        (args) =>
+          String(args[0]).includes("resource authorizer failed") &&
+          args.some((arg) => String(arg).includes("invalid shape")),
+      ),
+    ).toBe(true);
+  });
+
+  test("an anonymous outcome is audited only when it is allowed", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      authorizeResource: publicOnly,
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const read = async (id: number, uri: string) =>
+      await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id, method: "resources/read", params: { uri } }, sessionId),
+        component,
+        options,
+      );
+
+    await read(2, "docs://public");
+    // Refused by the authorizer: outcome "denied", suppressed.
+    await read(3, "docs://private");
+
+    expect(
+      state.resourceAuditEntries.map((entry) => ({
+        outcome: entry.outcome,
+        uri: entry.resourceUri,
+        subject: entry.identitySubject,
+      })),
+    ).toEqual([
+      {
+        outcome: "allowed",
+        uri: "docs://public",
+        subject: null,
+      },
+    ]);
+  });
+
+  test("the anonymous not-found branch answers -32602 with data.uri and audits nothing", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      // Permissive on purpose: the authorizer has to let an unknown URI
+      // reach resolution, or the not-found branch is never the thing that
+      // answers. This is the branch the audit rule exists to close, and
+      // the previous test cannot reach it.
+      authorizeResource: async () => ({ allowed: true }),
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const missing = "docs://nothing-serves-this";
+    const response = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: missing } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    const body = await readJson(response);
+    expect(body.error).toMatchObject({ code: -32602, data: { uri: missing } });
+    // outcome "error" from a caller-controlled URI: never written.
+    expect(state.resourceAuditEntries).toEqual([]);
+  });
+
+  test("an anonymous template read gets a null identity and no metadata", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const seen: Array<{ mode: string; uri: string; metadata: unknown }> = [];
+    let handlerIdentity: unknown = "unset";
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resourceTemplates: [
+        defineMcpResourceTemplate({
+          uriTemplate: "docs://{id}/raw",
+          name: "Raw",
+          read: async (_ctx, { uri, params, identity }) => {
+            handlerIdentity = identity;
+            return [{ uri, text: `raw ${params.id}` }];
+          },
+        }),
+      ],
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) => {
+        seen.push({
+          mode: args.mode,
+          uri: args.resourceUri,
+          metadata: args.resourceMetadata,
+        });
+        return { allowed: /^docs:\/\/[^/]+\/raw$/.test(args.resourceUri) };
+      },
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://42/raw" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    // The path every conformance resource fixture depends on.
+    expect(await readJson(read)).toMatchObject({
+      result: { contents: [{ uri: "docs://42/raw", text: "raw 42" }] },
+    });
+    // Authorized on the CONCRETE expanded URI, with no metadata: a public
+    // template can only be recognised by its URI shape.
+    expect(seen).toEqual([
+      {
+        mode: "resource_anonymous",
+        uri: "docs://42/raw",
+        metadata: null,
+      },
+    ]);
+    expect(handlerIdentity).toBeNull();
+  });
+
+  test("a runtime provider is handed a null identity on list and read", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const listIdentities: unknown[] = [];
+    const readIdentities: unknown[] = [];
+    const provider: McpResourceProvider = {
+      name: "runtime",
+      list: async (_ctx, args) => {
+        listIdentities.push(args.identity);
+        return [{ uri: "runtime://doc", name: "Runtime doc" }];
+      },
+      read: async (_ctx, args) => {
+        readIdentities.push(args.identity);
+        return [{ uri: args.uri, text: "runtime" }];
+      },
+    };
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [provider],
+      authorizeResource: async () => ({ allowed: true }),
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const list = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+      component,
+      options,
+    );
+    expect(await readJson(list)).toMatchObject({
+      result: { resources: [{ uri: "runtime://doc" }] },
+    });
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 3, method: "resources/read", params: { uri: "runtime://doc" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    expect((await readJson(read)).result).toBeTruthy();
+
+    // The whole reason `McpResourceCaller` is nullable.
+    expect(listIdentities).toEqual([null]);
+    expect(readIdentities).toEqual([null]);
+  });
+
+  test("an anonymous denial with an unauth reason gets a 401 challenge", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      // The `/^unauth/i` convention the tools path already uses to mean
+      // "logging in would help", as opposed to a flat Forbidden.
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) =>
+        args.resourceUri === "docs://public"
+          ? { allowed: true }
+          : { allowed: false, reason: "Unauthorized: sign in to read this" },
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const denied = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://private" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    // HTTP status, not just a JSON-RPC code: a browser MCP client starts
+    // OAuth discovery off the 401 and off nothing else.
+    expect(denied.status).toBe(401);
+    expect(await readJson(denied)).toMatchObject({
+      error: { code: -32001, message: "Unauthorized: sign in to read this" },
+    });
+  });
+
+  test("an authenticated denial keeps the JSON-RPC body it always had", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      authorizeResource: async () => ({
+        allowed: false,
+        reason: "Unauthorized: token lacks the scope",
+      }),
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const denied = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://private" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    // The 401 upgrade is deliberately anonymous-only: an authenticated
+    // caller has a token already, and changing this shape is not the
+    // option's business.
+    expect(denied.status).toBe(200);
+    expect((await readJson(denied)).error).toMatchObject({ code: -32001 });
+  });
+
+  test("requireAuth wins over the option", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      requireAuth: true,
+      resources: [publicDoc],
+      authorizeResource: async () => ({ allowed: true }),
+    };
+    // No session: requireAuth answers before anything else, initialize
+    // included.
+    const response = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "resources/read",
+        params: { uri: "docs://public" },
+      }),
+      component,
+      options as never,
+    );
+    expect(response.status).toBe(401);
+    expect(await readJson(response)).toMatchObject({
+      error: { code: -32001 },
+    });
+  });
+
+  test("an authorizer that throws on the anonymous mode denies without leaking", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      // The shape a default-allow authorizer degrades into on a read: it
+      // reaches for `identity.claims` and finds null.
+      authorizeResource: (async (_ctx: unknown, args: { identity: null }) => ({
+        allowed: (args.identity as unknown as { claims: unknown }).claims
+          !== undefined,
+      })) as never,
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://public" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    const body = await readJson(read);
+    expect(body.error?.code).toBe(-32603);
+    // The exception text stays server-side.
+    expect(JSON.stringify(body)).not.toContain("Cannot read");
+  });
+
+  test("a malformed decision is logged on the list path, which cannot report it", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      // A host that forgot one `return` in its new branch. On a read this
+      // surfaces as -32603; a filtered list has nowhere to put it, so the
+      // log is the only diagnostic there is.
+      authorizeResource: (async () => undefined) as never,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const errors: unknown[][] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        errors.push(args);
+      });
+    let listed: Record<string, unknown>;
+    try {
+      const list = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+        component,
+        options,
+      );
+      listed = await readJson(list);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Per-item isolation is unchanged: an empty list, HTTP 200, no error.
+    expect(listed.result).toMatchObject({ resources: [] });
+    expect(
+      errors.some(
+        (args) =>
+          String(args[0]).includes(
+            "resource authorizer failed during resources/list",
+          ) && args.some((arg) => String(arg).includes("invalid shape")),
+      ),
+    ).toBe(true);
+
+    // The template list carries the same new branch, so pin it too.
+    errors.length = 0;
+    const templateSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        errors.push(args);
+      });
+    let templates: Record<string, unknown>;
+    try {
+      const response = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest(
+          { id: 3, method: "resources/templates/list" },
+          sessionId,
+        ),
+        component,
+        {
+          ...options,
+          resourceTemplates: [
+            defineMcpResourceTemplate({
+              uriTemplate: "docs://{id}/raw",
+              name: "Raw",
+              read: async () => null,
+            }),
+          ],
+        },
+      );
+      templates = await readJson(response);
+    } finally {
+      templateSpy.mockRestore();
+    }
+    expect(templates.result).toMatchObject({ resourceTemplates: [] });
+    expect(
+      errors.some((args) =>
+        String(args[0]).includes(
+          "resource authorizer failed during resources/templates/list",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  test("an anonymous resources/list still writes one allowed row per call", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const base = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      authorizeResource: publicOnly,
+    };
+    const sessionId = await openSession(state, component, {
+      ...base,
+      auditResources: true as const,
+    });
+
+    const list = async (id: number, options: Record<string, unknown>) =>
+      await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id, method: "resources/list" }, sessionId),
+        component,
+        options as never,
+      );
+
+    await list(2, { ...base, auditResources: true });
+    await list(3, { ...base, auditResources: true });
+    // The row count this rule does NOT bound, which the docs tell hosts
+    // about: one per request, even though the content is bounded. The
+    // outcome is the point, not just the count: a satisfied anonymous list
+    // must stay `allowed`, or the suppression would eat these rows too.
+    expect(state.resourceAuditEntries).toMatchObject([
+      { outcome: "allowed" },
+      { outcome: "allowed" },
+    ]);
+  });
+
+  test("a wildcard template read reaches the audit writer at full length", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resourceTemplates: [
+        defineMcpResourceTemplate({
+          uriTemplate: "docs://{id}/raw",
+          name: "Raw",
+          read: async (_ctx, { uri }) => [{ uri, text: "raw" }],
+        }),
+      ],
+      // The documented shape of a public template: recognised by URI
+      // shape, because a template carries no metadata.
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) => ({ allowed: /^docs:\/\/[^/]+\/raw$/.test(args.resourceUri) }),
+      auditResources: { read: true },
+    };
+    const sessionId = await openSession(state, component, options);
+
+    // `allowed` outcomes are kept, and a wildcard template accepts an
+    // expansion of any length, so this is how a caller-chosen string
+    // reaches a row at all. The gateway does not shorten it here: the cap
+    // lives in `recordResourceEntry`, so that it holds for every writer of
+    // that public mutation and not only for this call path. See
+    // `src/component/audit.test.ts`.
+    const huge = `docs://${"A".repeat(200_000)}/raw`;
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: huge } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    expect((await readJson(read)).result).toBeTruthy();
+    expect(state.resourceAuditEntries).toHaveLength(1);
+    expect(state.resourceAuditEntries[0]!.resourceUri).toBe(huge);
+  });
+
+  test("an authenticated caller on the same mount keeps the authenticated modes", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+    const modes: string[] = [];
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) => {
+        modes.push(args.mode);
+        return { allowed: true };
+      },
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const read = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        { id: 2, method: "resources/read", params: { uri: "docs://public" } },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    expect((await readJson(read)).result).toBeTruthy();
+    expect(modes).toEqual(["resource_read"]);
+    // And the identified path still audits every outcome.
+    expect(state.resourceAuditEntries).toHaveLength(1);
+    expect(state.resourceAuditEntries[0]).toMatchObject({
+      outcome: "allowed",
+      identitySubject: "user-1",
+    });
+  });
+
+  test("an opted-in mount does not advertise subscribe to an anonymous session", async () => {
+    const component = createComponent();
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      authorizeResource: publicOnly,
+      resourceSubscriptions: { subscribe: true, listChanged: true },
+    };
+
+    const anon = anonymous(component);
+    const anonInit = await new McpGateway(component).handleMcpRequest(
+      anon.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      options as never,
+    );
+    // The mount serves this caller's reads, so promising a subscription it
+    // will refuse with -32001 is a promise it cannot keep. `listChanged`
+    // survives: it names no method the caller invokes, it is a broadcast
+    // the host emits, and this caller CAN list, withholding it would make
+    // a spec-compliant client never re-list.
+    const anonCaps = (await readJson(anonInit)).result as {
+      capabilities?: { resources?: unknown };
+    };
+    expect(anonCaps.capabilities?.resources).toEqual({ listChanged: true });
+
+    // An authenticated session on the same mount is told the truth.
+    const authed = createCtx(component);
+    const authedInit = await new McpGateway(component).handleMcpRequest(
+      authed.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      options as never,
+    );
+    const authedCaps = (await readJson(authedInit)).result as {
+      capabilities?: { resources?: unknown };
+    };
+    expect(authedCaps.capabilities?.resources).toEqual({
+      subscribe: true,
+      listChanged: true,
+    });
+
+    // And a mount WITHOUT the option keeps advertising to an anonymous
+    // session, because there every resource method refuses it anyway and
+    // narrowing that is a separate change.
+    const untouched = anonymous(component);
+    const untouchedInit = await new McpGateway(component).handleMcpRequest(
+      untouched.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      {
+        authorize: async () => ({ allowed: true }),
+        resources: [publicDoc],
+        authorizeResource: publicOnly,
+        resourceSubscriptions: { subscribe: true, listChanged: true },
+      } as never,
+    );
+    const untouchedCaps = (await readJson(untouchedInit)).result as {
+      capabilities?: { resources?: unknown };
+    };
+    expect(untouchedCaps.capabilities?.resources).toEqual({
+      subscribe: true,
+      listChanged: true,
+    });
+  });
+
+  test("subscribe stays authenticated even with the option on", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc],
+      authorizeResource: async () => ({ allowed: true }),
+      resourceSubscriptions: { subscribe: true },
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const subscribe = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/subscribe",
+          params: { uri: "docs://public" },
+        },
+        sessionId,
+      ),
+      component,
+      options,
+    );
+    expect(await readJson(subscribe)).toMatchObject({
+      error: {
+        code: -32001,
+        message: "Unauthorized: authentication required",
+      },
+    });
+  });
+
+  test("the option is served on the stateless path too", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const response = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({
+        id: 1,
+        method: "resources/read",
+        params: { uri: "docs://public" },
+      }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        anonymousResources: true,
+        resources: [publicDoc],
+        authorizeResource: publicOnly,
+      },
+    );
+    expect(await readJson(response)).toMatchObject({
+      result: { contents: [{ uri: "docs://public", text: "public" }] },
+    });
+  });
+
+  test("the mount refuses the option without an authorizer, and with the read hook", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const request = () =>
+      jsonRpcRequest({ id: 1, method: "resources/list" });
+
+    // Without an authorizer `safeAuthorizeResource` allows everything, so
+    // opting in would publish the whole catalog rather than delegate.
+    await expect(
+      handleMcpRequest(state.ctx, request(), component, {
+        authorize: async () => ({ allowed: true }),
+        anonymousResources: true,
+        resources: [publicDoc],
+      }),
+    ).rejects.toThrow(/anonymousResources requires an authorizeResource/);
+
+    // The read hook's contract passes a non-null identity.
+    await expect(
+      handleMcpRequest(state.ctx, request(), component, {
+        authorize: async () => ({ allowed: true }),
+        anonymousResources: true,
+        resources: [publicDoc],
+        authorizeResource: async () => ({ allowed: true }),
+        beforeResourceRead: async () => null,
+      }),
+    ).rejects.toThrow(/cannot be combined with beforeResourceRead/);
+
+    // ...but a config-shaped `null` is "no hook", which is how the use
+    // site reads it, so it must not trip that guard.
+    const served = await handleMcpRequest(
+      state.ctx,
+      // Stateless, so no session handshake is needed just to reach the
+      // mount checks this test is about.
+      statelessJsonRpcRequest({ id: 1, method: "resources/list" }),
+      component,
+      {
+        authorize: async () => ({ allowed: true }),
+        anonymousResources: true,
+        resources: [publicDoc],
+        authorizeResource: publicOnly,
+        beforeResourceRead: null,
+      } as never,
+    );
+    expect((await readJson(served)).result).toBeTruthy();
+
+    // The option must be a boolean: `anonymousResources: process.env.X`
+    // is the shape that turns "off" into on.
+    for (const bad of ["false", "0", 1, {}]) {
+      await expect(
+        handleMcpRequest(state.ctx, request(), component, {
+          authorize: async () => ({ allowed: true }),
+          anonymousResources: bad,
+          resources: [publicDoc],
+          authorizeResource: async () => ({ allowed: true }),
+        } as never),
+      ).rejects.toThrow(/anonymousResources must be a boolean/);
+    }
+  });
+
+  test("an anonymous list that the host granted nothing is challenged", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [privateDoc],
+      resourceTemplates: [
+        defineMcpResourceTemplate({
+          uriTemplate: "docs://{id}/raw",
+          name: "Raw",
+          read: async () => null,
+        }),
+      ],
+      // The `unauth` convention `resources/read` already uses: the host
+      // says logging in would help.
+      authorizeResource: async () => ({
+        allowed: false,
+        reason: "Unauthorized: sign in to browse",
+      }),
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    for (const [id, method] of [
+      [2, "resources/list"],
+      [3, "resources/templates/list"],
+    ] as const) {
+      const response = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id, method }, sessionId),
+        component,
+        options,
+      );
+      // Before this option the same request answered -32001 and the client
+      // knew to re-authenticate; an empty 200 would have removed that.
+      expect(response.status).toBe(401);
+      // Generic, not the host's per-candidate reason: those are discarded
+      // on a list, and threading one in would leak a policy detail to an
+      // unauthenticated caller.
+      expect((await readJson(response)).error).toMatchObject({
+        code: -32001,
+        message: "Unauthorized: authentication required",
+      });
+    }
+    // Denied and anonymous, so the rows are suppressed: an unauthenticated
+    // client cannot grow the table by looping either method.
+    expect(state.resourceAuditEntries).toEqual([]);
+  });
+
+  test.each([
+    ["resources/list", "resources"],
+    ["resources/templates/list", "resourceTemplates"],
+  ])(
+    "a non-unauth denial empties %s without challenging",
+    async (method, key) => {
+      const component = createComponent();
+      const state = anonymous(component);
+      const options = {
+        authorize: async () => ({ allowed: true }),
+        anonymousResources: true,
+        resources: [privateDoc],
+        resourceTemplates: [
+          defineMcpResourceTemplate({
+            uriTemplate: "docs://{id}/raw",
+            name: "Raw",
+            read: async () => null,
+          }),
+        ],
+        // "This is not public and never will be", as opposed to "log in".
+        // The example app's own conformance policy is this shape, so the
+        // suite depends on this staying a 200.
+        authorizeResource: async () => ({
+          allowed: false,
+          reason: "Forbidden: resource is not public",
+        }),
+        auditResources: true as const,
+      };
+      const sessionId = await openSession(state, component, options);
+
+      const response = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id: 2, method }, sessionId),
+        component,
+        options,
+      );
+      expect(response.status).toBe(200);
+      expect((await readJson(response)).result).toMatchObject({ [key]: [] });
+      // And the row is still suppressed: `denied` is what the
+      // reclassification records, so an anonymous client looping a method
+      // that answers 200 cannot grow the table either.
+      expect(state.resourceAuditEntries).toEqual([]);
+    },
+  );
+
+  test("a throwing authorizer empties the list without challenging", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [privateDoc],
+      // `safeAuthorizeResource` prefixes a thrown reason, so it can never
+      // look `unauth`-shaped; `!threw` says the same thing directly.
+      authorizeResource: (async () => {
+        throw new Error("Unauthorized: boom");
+      }) as never,
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let response: Response;
+    try {
+      response = await handleMcpRequest(
+        state.ctx,
+        jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+        component,
+        options,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    // A throw is a host fault, never a request to authenticate, even when
+    // the exception text starts with the magic word.
+    expect(response.status).toBe(200);
+    expect((await readJson(response)).result).toMatchObject({ resources: [] });
+  });
+
+  test("a templates-only mount records an anonymous list as allowed", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      // No concrete resources at all, so `resources/list` reaches its
+      // audit write with zero candidates: nothing was denied, so nothing
+      // is being withheld, and the row must not read `denied`.
+      resourceTemplates: [
+        defineMcpResourceTemplate({
+          uriTemplate: "docs://{id}/raw",
+          name: "Raw",
+          read: async () => null,
+        }),
+      ],
+      authorizeResource: publicOnly,
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const list = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+      component,
+      options,
+    );
+    expect(list.status).toBe(200);
+    expect((await readJson(list)).result).toMatchObject({ resources: [] });
+    expect(state.resourceAuditEntries).toMatchObject([{ outcome: "allowed" }]);
+  });
+
+  test.each(["resources/list", "resources/templates/list"])(
+    "the %s challenge works on the stateless path",
+    async (method) => {
+      const component = createComponent();
+      const state = anonymous(component);
+      const response = await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({ id: 1, method }),
+        component,
+        {
+          authorize: async () => ({ allowed: true }),
+          anonymousResources: true,
+          resources: [privateDoc],
+          resourceTemplates: [
+            defineMcpResourceTemplate({
+              uriTemplate: "docs://{id}/raw",
+              name: "Raw",
+              read: async () => null,
+            }),
+          ],
+          authorizeResource: async () => ({
+            allowed: false,
+            reason: "Unauthorized: sign in to browse",
+          }),
+        },
+      );
+      expect(response.status).toBe(401);
+      // A challenge is an error envelope, so it carries none of the
+      // stateless result decoration, same as every other challenge site.
+      const body = await readJson(response);
+      expect(body.error).toMatchObject({ code: -32001 });
+      expect(body.result).toBeUndefined();
+    },
+  );
+
+  test("a mixed mount stays quiet when the anonymous caller got its subset", async () => {
+    const component = createComponent();
+    const state = anonymous(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [publicDoc, privateDoc],
+      authorizeResource: async (
+        _ctx: unknown,
+        args: McpResourceAuthorizerArgs,
+      ) =>
+        args.resourceUri === "docs://public"
+          ? { allowed: true }
+          : { allowed: false, reason: "Unauthorized: sign in for more" },
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const list = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+      component,
+      options,
+    );
+    // Got something, so no login prompt: that is the whole point of a
+    // mount that mixes public and private resources.
+    expect(list.status).toBe(200);
+    expect(await readJson(list)).toMatchObject({
+      result: { resources: [{ uri: "docs://public" }] },
+    });
+    expect(state.resourceAuditEntries).toMatchObject([{ outcome: "allowed" }]);
+  });
+
+  test("an authenticated empty list keeps the outcome it always recorded", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      anonymousResources: true,
+      resources: [privateDoc],
+      authorizeResource: async () => ({
+        allowed: false,
+        reason: "Unauthorized: sign in to browse",
+      }),
+      auditResources: true as const,
+    };
+    const sessionId = await openSession(state, component, options);
+
+    const list = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method: "resources/list" }, sessionId),
+      component,
+      options,
+    );
+    // No challenge and no outcome change: the `denied` reclassification
+    // exists to let the anonymous suppression fire, and rewriting an
+    // authenticated caller's rows is not this option's business.
+    expect(list.status).toBe(200);
+    expect(await readJson(list)).toMatchObject({ result: { resources: [] } });
+    expect(state.resourceAuditEntries).toMatchObject([
+      { outcome: "allowed", identitySubject: "user-1" },
+    ]);
   });
 });

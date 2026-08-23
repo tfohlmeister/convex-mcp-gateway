@@ -119,6 +119,75 @@ defineMcpQuery({
 }),
 ```
 
+### Public resources
+
+The resource counterpart of the recipe above, with one extra step: public
+resources are a mount option, not only a convention. Without
+`anonymousResources` the gateway refuses an anonymous `resources/list`,
+`resources/templates/list` or `resources/read` before `authorizeResource`
+runs, and setting the option without an `authorizeResource` throws on the first
+request, because a mount with no resource authorizer allows everything.
+
+```ts
+import { type McpResourceAuthorizerHandler } from "convex-mcp-gateway";
+
+const authorizeResource: McpResourceAuthorizerHandler = async (_ctx, args) => {
+  if (args.mode === "resource_anonymous") {
+    // `args.identity` is null here, and `args.operation` is "list",
+    // "templates_list" or "read" if you want to allow one but not another.
+    const meta = (args.resourceMetadata ?? {}) as { public?: boolean };
+    return meta.public
+      ? { allowed: true }
+      : { allowed: false, reason: "Forbidden: resource is not public" };
+  }
+  // Authenticated callers, unchanged.
+  return { allowed: true };
+};
+```
+
+Resource registration:
+
+```ts
+import { ConvexError } from "convex/values";
+
+const resources = [
+  defineMcpResource({
+    uri: "docs://changelog",
+    name: "changelog",
+    metadata: { public: true },
+    read: async (_ctx, { uri }) => [{ uri, text: await loadChangelog() }],
+  }),
+  defineMcpResource({
+    uri: "invoices://summary",
+    name: "invoice-summary",
+    read: async (ctx, { uri, identity }) => {
+      // Nullable now that a mount may opt in; this resource is per-caller.
+      // `ConvexError`, not `Error`: a plain throw collapses to a generic
+      // `-32603` and the message never reaches the client.
+      if (!identity) throw new ConvexError("Unauthorized");
+      return [{ uri, text: await summaryFor(ctx, identity.subject) }];
+    },
+  }),
+];
+```
+
+Note the asymmetry with `authorize`, which is deliberate. The tool
+authorizer has always taken a nullable `identity` and only two modes, so
+an anonymous tool call has never been a surprise to it. `authorizeResource`
+promised a non-null identity, so handing it an anonymous caller under a
+mode it already handles would silently apply a policy written for someone
+else. Hence the separate mode here and not there.
+
+Check your default branch before opting in. An authorizer that predates
+the option meets an unrecognised mode, and what happens next is whatever
+that branch does: one that returns nothing denies (a missing decision is
+read as a denial), while one ending in `return { allowed: true }` (the
+shape this repo's own example used) allows it, and publishes the catalog.
+The lock is `anonymousResources`, not the new mode. Subscriptions stay
+authenticated, and a failed anonymous outcome is not audited. See
+[Public resources](./resources.md#public-resources-opt-in-anonymous-access)
+for the full contract.
+
 ### Role-based access via JWT claims
 
 Most JWT issuers expose a `roles` (or `groups`) claim. Convex makes

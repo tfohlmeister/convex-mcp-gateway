@@ -71,11 +71,40 @@ combine:
    authenticated caller, and the suite cannot send an `Authorization`
    header.
 
-### Unreachable: every `resources/*` scenario
+### Reachable through the anonymous opt-in: `resources/*`
 
-Resource reads always require an identity. Tools have a public opt-out
-through `metadata.public` plus a permissive `authorize`; resources have
-no equivalent, so an anonymous client cannot read one.
+`resources-list`, `resources-read-text`, `resources-read-binary` and
+`resources-templates-read` all need an anonymous `resources/*` call,
+which is the only kind the suite can make: it cannot send an
+`Authorization` header.
+
+The three `sep-2164` not-found checks (`-no-empty-contents`,
+`-error-code`, `-data-uri`) need the same thing, but they ship only in
+`0.2.0-alpha.11`, not in the `latest` the command above installs, so
+reaching them needs an explicit version. They also need the authorizer to
+let an unknown `test://` URI through to resolution: SEP-2164 is about the
+answer a server gives for a resource it does not have, and an authorizer
+that denies unknown URIs replaces that `-32602` with a `-32003`. The
+example allows the whole `test://` scheme under the switch for exactly
+this reason, which is a fixture decision, not a model policy.
+
+Resource methods require an identity by default, so the example sets
+`anonymousResources` under the `MCP_CONFORMANCE` switch and its
+`authorizeResource` serves the fixtures marked `metadata: { public: true }`.
+Both halves are needed, and not symmetrically: `anonymousResources`
+without an `authorizeResource` is refused outright (it would publish the
+whole catalog), while an `authorizeResource` without the option is the
+ordinary configuration every other mount here uses.
+
+The fixtures are transcribed from what each scenario asks for, and the
+gateway side is covered by unit tests, but the suite itself has not been
+run against a live deployment for this change, so treat the entries above
+as reachable rather than as measured passes.
+
+`resources-subscribe` and `resources-unsubscribe` stay unreachable, and
+deliberately so. A subscription is server-side state an anonymous caller
+would accumulate, and this transport cannot push the
+`notifications/resources/updated` a subscription exists to receive.
 
 ### Not implemented
 

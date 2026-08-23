@@ -1,6 +1,10 @@
 import { v } from "convex/values";
 import {
   defineMcpQuery,
+  defineMcpResource,
+  defineMcpResourceTemplate,
+  type McpResourceRegistration,
+  type McpResourceTemplateProvider,
   type McpToolRegistration,
 } from "convex-mcp-gateway";
 import { api } from "./_generated/api.js";
@@ -39,9 +43,19 @@ import { query } from "./_generated/server.js";
  *     header.
  *
  * So the suite cannot reach the gateway's non-text content paths at all.
- * The same third constraint keeps every `resources/*` scenario out of
- * reach: resource reads always require an identity, with no public
- * opt-out of the kind tools have through `metadata.public`.
+ *
+ * ## What the resource fixtures below are for
+ *
+ * The `resources/*` scenarios used to be unreachable for constraint 3
+ * above, applied to resource methods: they always required an identity.
+ * `anonymousResources` is the opt-out that changes it, and `http.ts` sets
+ * it only under this switch. The fixtures are named exactly as the
+ * scenarios request them.
+ *
+ * `resources-subscribe` and `resources-unsubscribe` stay out of reach on
+ * purpose (see `anonymousResources`). `test://watched-resource` exists
+ * anyway, because the scenario subscribes to a URI the catalog is
+ * expected to list.
  */
 
 /** Exactly the string the `tools-call-simple-text` scenario expects. */
@@ -115,4 +129,87 @@ export const conformanceTools: McpToolRegistration[] = [
       additionalProperties: false,
     },
   },
+];
+
+/**
+ * A 1x1 PNG: RGBA, one 50%-opaque blue pixel. The smallest thing that is
+ * genuinely an image. `resources-read-binary` only requires `uri`,
+ * `mimeType` and a non-empty `blob`, so the bytes matter less than the
+ * shape, but a real PNG keeps the fixture honest for a client that tries
+ * to decode it.
+ */
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk" +
+  "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/**
+ * Concrete resources the suite reads by exact URI. `metadata.public`
+ * marks them for `authorizeResource` in `http.ts`, the same convention the
+ * example's tools use, so the anonymous decision is the host's rather than
+ * the gateway's.
+ */
+export const conformanceResources: McpResourceRegistration[] = [
+  defineMcpResource({
+    uri: "test://static-text",
+    name: "Static Text Resource",
+    description: "A static text resource for conformance testing",
+    mimeType: "text/plain",
+    metadata: { public: true },
+    read: async () => [
+      {
+        uri: "test://static-text",
+        mimeType: "text/plain",
+        text: "This is the content of the static text resource.",
+      },
+    ],
+  }),
+  defineMcpResource({
+    uri: "test://static-binary",
+    name: "Static Binary Resource",
+    description: "A static binary resource for conformance testing",
+    mimeType: "image/png",
+    metadata: { public: true },
+    read: async () => [
+      {
+        uri: "test://static-binary",
+        mimeType: "image/png",
+        blob: ONE_PIXEL_PNG,
+      },
+    ],
+  }),
+  defineMcpResource({
+    uri: "test://watched-resource",
+    name: "Watched Resource",
+    description: "A resource the subscribe scenarios watch",
+    mimeType: "text/plain",
+    metadata: { public: true },
+    read: async () => [
+      {
+        uri: "test://watched-resource",
+        mimeType: "text/plain",
+        text: "This resource can be watched for changes.",
+      },
+    ],
+  }),
+];
+
+/**
+ * `resources-templates-read` reads `test://template/123/data` and asserts
+ * the returned text contains the substituted parameter, so the handler has
+ * to echo `params.id` rather than return a fixed string.
+ */
+export const conformanceResourceTemplates: McpResourceTemplateProvider[] = [
+  defineMcpResourceTemplate({
+    uriTemplate: "test://template/{id}/data",
+    name: "Template Resource",
+    description: "A parameterized resource for conformance testing",
+    mimeType: "text/plain",
+    read: async (_ctx, { uri, params }) => [
+      {
+        uri,
+        mimeType: "text/plain",
+        text: `Data for template parameter ${params.id}.`,
+      },
+    ],
+  }),
 ];

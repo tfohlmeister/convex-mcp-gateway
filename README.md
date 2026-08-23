@@ -46,7 +46,8 @@ Built as a [Convex Component](https://www.convex.dev/components).
 - **MCP resources**: `defineMcpResource` / `defineMcpResourceTemplate`
   serve `resources/list`, `resources/read`, and `resources/templates/list`
   (RFC 6570). Central `authorizeResource` hook, opt-in resource audit,
-  runtime shape validation, and opt-in `resources/subscribe` capability.
+  runtime shape validation, opt-in `resources/subscribe` capability, and
+  opt-in anonymous access for public content.
   See [Resources & templates](./docs/resources.md)
 - **One authorize callback**: gates `tools/call` and filters `tools/list`
   with `mode: "list" | "call"`; uses your existing `ctx.auth.getUserIdentity()`
@@ -515,7 +516,9 @@ Supported methods: `resources/list`, `resources/read`,
 `defineMcpResourceTemplate`), and opt-in `resources/subscribe` /
 `resources/unsubscribe`. A central `authorizeResource` hook gates
 list/read, resource operations are auditable, and reads run only for
-authenticated callers. A complete, runnable example (concrete resource +
+authenticated callers unless the mount opts into `anonymousResources`,
+which hands that decision to the same hook. A complete, runnable example
+(concrete resource +
 template + per-resource auth + audit + subscription) is wired into
 [`example/convex`](./example/convex/mcp.ts); see
 [Resources & templates](./docs/resources.md) for the full guide.

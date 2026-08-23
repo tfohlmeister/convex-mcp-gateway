@@ -10,8 +10,11 @@ tools: a client lists them (`resources/list`) and reads them
   (`weather://{city}/current`), advertised via `resources/templates/list`.
   Declare with `defineMcpResourceTemplate`.
 
-Both run only for authenticated callers, flow through the same optional
-`authorizeResource` hook, and can be audited via `auditResources`. See
+Both run only for authenticated callers by default, flow through the same
+optional `authorizeResource` hook, and can be audited via
+`auditResources`. A mount that wants to serve public content can opt out
+of the identity requirement with `anonymousResources`, see
+[Public resources](#public-resources-opt-in-anonymous-access) below. See
 [Authorization](./authorization.md) and [Audit log](./audit-log.md).
 
 **Supported MCP methods:** `resources/list`, `resources/read`,
@@ -38,6 +41,7 @@ URI and reads it through the ordinary `resources/read`.
 ## Concrete resources
 
 ```ts
+import { ConvexError } from "convex/values";
 import { defineMcpResource } from "convex-mcp-gateway";
 
 const handbook = defineMcpResource({
@@ -45,9 +49,13 @@ const handbook = defineMcpResource({
   name: "Operator handbook",
   description: "Internal runbook",
   mimeType: "text/markdown",
-  read: async (ctx, { uri, identity }) => [
-    { uri, mimeType: "text/markdown", text: await loadHandbook(ctx, identity) },
-  ],
+  read: async (ctx, { uri, identity }) => {
+    // Nullable: `null` only on a mount that set `anonymousResources`.
+    if (!identity) throw new ConvexError("Unauthorized");
+    return [
+      { uri, mimeType: "text/markdown", text: await loadHandbook(ctx, identity) },
+    ];
+  },
 });
 
 // gateway.handleMcpRequest(ctx, req, { authorize, resources: [handbook] });
@@ -196,7 +204,8 @@ gateway.handleMcpRequest(ctx, request, {
   authorizeResource,
   resources,
   mrtr: { secret: process.env.MCP_MRTR_SECRET! },
-  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity, inputResponses }) => {
+  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity,
+  inputResponses }) => {
     if (uri !== "docs://confidential") return null;   // not gated
     if (!inputResponses) {
       return inputRequired(
@@ -322,7 +331,8 @@ but resolves no reads until a matching runtime provider is supplied.
 
 `resources/templates/list` behaves like `resources/list`:
 
-- It requires an authenticated identity.
+- It requires an authenticated identity, unless the mount set
+  `anonymousResources` (below).
 - Each template is filtered through `authorizeResource` with
   `mode: "resource_templates_list"` (the template's `uriTemplate` is passed
   as `resourceUri`).
@@ -340,6 +350,163 @@ null`, not under `resource_templates_list` with the `uriTemplate`. So
 > _visibility_; `resource_read` is the gate for every read. To deny reads of
 > a template's URIs, match the URI shape in your `resource_read` branch
 > and/or enforce the check inside the template's own `read` handler.
+
+### Public resources (opt-in anonymous access)
+
+By default `resources/list`, `resources/templates/list` and
+`resources/read` refuse an unauthenticated caller with `-32001` before
+`authorizeResource` runs, as a JSON-RPC error inside an HTTP `200`, so a
+browser client gets no signal it should log in. `requireAuth` is the
+existing remedy for an all-private mount; the option below is what lets a
+mixed mount challenge on the gated resources while serving the public
+ones. Set `anonymousResources: true` to hand that
+decision to the host instead:
+
+```ts
+gateway.handleMcpRequest(ctx, request, {
+  anonymousResources: true,
+  authorizeResource: async (_ctx, args) => {
+    if (args.mode === "resource_anonymous") {
+      const meta = (args.resourceMetadata ?? {}) as { public?: boolean };
+      return { allowed: meta.public === true };
+    }
+    // ...the authenticated policy, unchanged
+    return { allowed: true };
+  },
+  resources: [
+    defineMcpResource({
+      uri: "docs://changelog",
+      name: "changelog",
+      metadata: { public: true },
+      read: async (_ctx, { uri }) => [{ uri, text: await loadChangelog() }],
+    }),
+  ],
+});
+```
+
+This is the resource counterpart of a public tool, with one difference
+that matters. A public tool is pure host convention: the gateway always
+calls `authorize` and `metadata.public` means whatever the callback says
+it means. Resources cannot work that way, because a mount with no
+`authorizeResource` allows every resource, so "let the authorizer decide"
+would publish the whole catalog. Hence the explicit option, and hence the
+gateway throws on the first request through a mount that sets it without
+an `authorizeResource`.
+
+The contract:
+
+- **An anonymous caller arrives under `mode: "resource_anonymous"`**, never
+  under the three authenticated modes, with `identity: null` and an
+  `operation` of `"list"`, `"templates_list"` or `"read"`. That keeps a
+  policy written for authenticated callers from being applied to one it
+  was not written for, but **it does not decide the outcome for you**.
+  What an existing authorizer does with an unrecognised mode is whatever
+  its default branch does:
+
+  ```ts
+  // Denies: a missing decision is read as a denial.
+  if (args.mode === "resource_read") return { allowed: await mayRead(args) };
+  // ...no default return
+
+  // ALLOWS, and publishes whatever was asked for.
+  if (args.mode !== "resource_read") return { allowed: true };
+  ```
+
+  The lock is `anonymousResources` itself, which no existing mount has
+  set. Read your default branch before you set it.
+- **`resourceMetadata` is `null` for templates and for template-derived
+  reads**, exactly as on an authenticated call. A public template is
+  recognised by its URI shape, not by metadata.
+- **A provider's `identity` is nullable.** `McpResourceReadHandler`, and
+  the `list` / `read` of a `McpResourceProvider`, receive
+  `McpResourceCaller`, which is `null` only on a mount that opted in.
+
+  This and the authorizer union are **compile-time breaks for existing
+  code**, whether or not you use the option:
+
+  ```ts
+  // Before: identity was non-null.
+  read: async (ctx, { uri, identity }) => [
+    { uri, text: await load(ctx, identity.subject) },   // now TS2532
+  ],
+  // After: narrow once. On a mount without `anonymousResources` the
+  // branch is unreachable, so throwing is fine, use ConvexError if you
+  // want the message to reach the client.
+  read: async (ctx, { uri, identity }) => {
+    if (!identity) throw new ConvexError("Unauthorized");
+    return [{ uri, text: await load(ctx, identity.subject) }];
+  },
+  ```
+
+  An `authorizeResource` that switched exhaustively over the old
+  three-member `mode` union also stops compiling, since the union gained
+  a member. Adding the `"resource_anonymous"` branch is the fix, and it
+  is the branch you want to write deliberately anyway.
+- **A provider's `list` runs before the authorizer**, for anonymous
+  callers as for authenticated ones: the gateway collects candidates and
+  then filters them through `authorizeResource`. Nothing leaks, since the
+  filter decides what ships, but any work a `list` implementation does
+  becomes anonymously triggerable on an opted-in mount. `read` is the
+  other way round: the authorizer runs first, and no provider is
+  consulted until it allows.
+- **The `401` challenge is per method, and the host triggers it.** A
+  reason starting `unauth` (case-insensitive) means "logging in would
+  help". On `resources/read` that answers HTTP `401` instead of `200`. On
+  `resources/list` and `resources/templates/list`, where per-candidate
+  reasons are otherwise discarded, it answers `401` only when the caller
+  got **nothing**: a mixed mount that served the public subset stays
+  quiet, since telling a caller to log in when it already has what is
+  public would be a false prompt. Any other reason answers `200` with the
+  subset, or with `-32003` on a read. This restores a signal the gate used to
+  give, and a stronger one: the gate answered `-32001` inside an HTTP
+  `200`, which a browser client cannot act on, where this answers `401`.
+  Without it a client whose Bearer merely expired would get an empty `200`
+  and no signal at all. Capabilities are fixed at `initialize`, so it
+  could stay that way for the life of the connection.
+- **A `read` denial reaches an unauthenticated caller verbatim.** On
+  `resources/read` the `reason` you return is host-authored and goes on
+  the wire, exactly as on the authenticated path, so do not put anything
+  in it an anonymous caller may not see. (List denials do not: a rejected
+  candidate is simply omitted, and its reason never leaves the server.)
+  A read reason that starts with `unauth` (case-insensitive) means
+  "logging in would help": the gateway answers an anonymous caller with
+  HTTP `401`, carrying the same JSON-RPC `-32001` body, plus a
+  `WWW-Authenticate` header when an OAuth config is set. The status is
+  the part that matters, because it is the only thing a browser MCP
+  client reacts to, and, for a cross-origin browser, the only part it
+  can read: `access-control-expose-headers` does not list
+  `WWW-Authenticate`, so the RFC 9728 hint reaches non-browser clients
+  only. That predates this option and applies to `requireAuth` too. Any
+  other reason answers HTTP `200` + `-32003`, which
+  is what to use for "this is not public and never will be". A thrown or
+  malformed reason never reaches the wire: it goes to the deployment log,
+  and to the audit row only for an authenticated caller. Authenticated
+  denials keep the HTTP `200` body they have always returned.
+- **`resources/subscribe` and `resources/unsubscribe` stay
+  authenticated.** A subscription is server-side state an anonymous caller
+  would accumulate, and it delivers nothing on a transport that cannot
+  push.
+- **It cannot be combined with `beforeResourceRead`**, which throws on the
+  first request through the mount: that hook's contract passes a non-null
+  identity and an MRTR
+  continuation must bind to a principal.
+- **It does not override `requireAuth`**, which answers anonymous POSTs
+  with `401` before the method switch. A mount setting both serves no
+  anonymous resource, the same as `requireAuth` with a public tool.
+
+> **A failed anonymous outcome is not audited.** An anonymous `denied` or
+> `error` row is never written, which bounds what a *failing* request can
+> put in the table. `resources/read` carries a caller-controlled `uri`,
+> and every miss lands on the not-found branch, which does write a row; a
+> list the authorizer emptied is recorded as `denied` for the same reason.
+> An authenticated caller's rows are untouched.
+>
+> It does **not** bound successful ones. An allowed anonymous read through
+> a permissive template writes one row per request carrying the URI the
+> caller chose, capped at 1024 UTF-16 code units but still content it picked. So
+> wire up `gateway.pruneAuditEntries` on a cron before opening a mount:
+> that is the bound, not this rule. Sizes and scope are in
+> [Audit log](./audit-log.md#privacy-considerations).
 
 ## Subscriptions & change notifications
 
@@ -375,7 +542,12 @@ gateway.handleMcpRequest(ctx, req, {
 ```
 
 This makes `initialize` advertise `resources: { subscribe: true, listChanged:
-true }` and the gateway then **tracks subscription state per session**:
+true }`, except that `subscribe` is withheld from an anonymous session on a
+mount that set [`anonymousResources`](#public-resources-opt-in-anonymous-access),
+where resource methods do serve that caller but `resources/subscribe` still
+refuses it. `listChanged` is advertised to an anonymous session and an
+authenticated one alike, whenever you set it: it names no method the
+caller invokes. The gateway then **tracks subscription state per session**:
 `resources/subscribe` records `(session, uri)` (identity required, idempotent,
 capped per session), `resources/unsubscribe` removes it, and an explicit
 session `DELETE` cascades its subscriptions.
@@ -387,7 +559,8 @@ tracks plus the payload builders:
 // When the data behind a resource changes:
 const sessionIds = await gateway.listResourceSubscribers(ctx, uri);
 const note = gateway.buildResourceUpdatedNotification(uri);
-// → { jsonrpc: "2.0", method: "notifications/resources/updated", params: { uri } }
+// → { jsonrpc: "2.0", method: "notifications/resources/updated", params: {
+uri } }
 for (const sessionId of sessionIds) yourTransport.send(sessionId, note);
 
 // When the catalog changes:

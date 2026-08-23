@@ -6,7 +6,11 @@ import {
 } from "convex-mcp-gateway";
 import { components, internal } from "./_generated/api.js";
 import { httpAction } from "./_generated/server.js";
-import { conformanceTools } from "./conformance.js";
+import {
+  conformanceResources,
+  conformanceResourceTemplates,
+  conformanceTools,
+} from "./conformance.js";
 import { resources, resourceTemplates, tools } from "./mcp.js";
 
 const gateway = new McpGateway(components.mcpGateway);
@@ -46,8 +50,15 @@ export const authorize: McpAuthorizerHandler = async (ctx, args) => {
 
 /**
  * Per-resource authorization, the resource counterpart of `authorize`.
- * The gateway has already rejected anonymous callers before this runs, so
- * `args.identity` is non-null. Policy:
+ * Policy:
+ *
+ * - `resource_anonymous`: reachable only under the conformance switch
+ *   below, the one mount that sets `anonymousResources`. It serves the
+ *   fixtures marked `metadata: { public: true }`, the same convention
+ *   `authorize` uses for public tools. A template read carries no
+ *   metadata, so it is matched by URI shape instead.
+ *
+ * For the three authenticated modes (`args.identity` is non-null there):
  * - `resource_list` / `resource_templates_list`: visible to any
  *   authenticated caller.
  * - `resource_read` of `invoices://summary`: any authenticated caller.
@@ -62,6 +73,24 @@ export const authorizeResource: McpResourceAuthorizerHandler = async (
   _ctx,
   args,
 ) => {
+  if (args.mode === "resource_anonymous") {
+    // Written first and explicitly, before the default-allow below. That
+    // ordering is the point: the branch under it ends in
+    // `{ allowed: true }`, so without this one an anonymous list would be
+    // allowed by the policy written for authenticated callers. The new
+    // mode makes the case visible; it does not decide it.
+    const meta = (args.resourceMetadata ?? {}) as { public?: boolean };
+    if (meta.public) return { allowed: true };
+    // Everything under `test://` is a conformance fixture, and this
+    // branch only runs under that switch. Allowing the whole scheme
+    // rather than an allow-list of known URIs is deliberate: SEP-2164
+    // asks a server to answer an unknown resource with `-32602` and
+    // `data.uri`, which the caller only sees if the authorizer lets the
+    // read reach resolution. An authorizer strict enough to be a good
+    // public-resource example would mask that behind a `403`.
+    if (args.resourceUri.startsWith("test://")) return { allowed: true };
+    return { allowed: false, reason: "Forbidden: resource is not public" };
+  }
   if (args.mode !== "resource_read") return { allowed: true };
   if (args.resourceUri === "invoices://summary") return { allowed: true };
 
@@ -153,10 +182,18 @@ const mcpHandler = httpAction(async (ctx, request) =>
     // each initialize, so no separate registerDefaults mutation is
     // needed for the HTTP path.
     tools: CONFORMANCE ? conformanceTools : tools,
-    // MCP resources: a concrete resource plus an RFC 6570 template. Reads
+    // MCP resources: one concrete resource plus an RFC 6570 template
+    // normally, or the conformance fixtures under the switch below. Reads
     // run through `authorizeResource` and are recorded in the audit log.
-    resources,
-    resourceTemplates,
+    //
+    // The conformance suite cannot send an Authorization header, so every
+    // `resources/*` scenario is unreachable without the anonymous opt-in.
+    // Off for the ordinary catalog, whose resources are per-caller.
+    anonymousResources: CONFORMANCE,
+    resources: CONFORMANCE ? conformanceResources : resources,
+    resourceTemplates: CONFORMANCE
+      ? conformanceResourceTemplates
+      : resourceTemplates,
     authorizeResource,
     auditResources: { read: true },
     // Advertise subscription capability. The gateway tracks per-session
