@@ -204,8 +204,10 @@ gateway.handleMcpRequest(ctx, request, {
   authorizeResource,
   resources,
   mrtr: { secret: process.env.MCP_MRTR_SECRET! },
-  beforeResourceRead: async (ctx, { uri, resourceMetadata, identity,
-  inputResponses }) => {
+  beforeResourceRead: async (
+    ctx,
+    { uri, resourceMetadata, identity, inputResponses },
+  ) => {
     if (uri !== "docs://confidential") return null;   // not gated
     if (!inputResponses) {
       return inputRequired(
@@ -559,8 +561,8 @@ tracks plus the payload builders:
 // When the data behind a resource changes:
 const sessionIds = await gateway.listResourceSubscribers(ctx, uri);
 const note = gateway.buildResourceUpdatedNotification(uri);
-// → { jsonrpc: "2.0", method: "notifications/resources/updated", params: {
-uri } }
+// → { jsonrpc: "2.0", method: "notifications/resources/updated",
+//     params: { uri } }
 for (const sessionId of sessionIds) yourTransport.send(sessionId, note);
 
 // When the catalog changes:

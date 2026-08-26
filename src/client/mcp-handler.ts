@@ -3465,9 +3465,13 @@ async function handlePost(
                   // `subscribe` is withheld from an anonymous session on
                   // an opted-in mount: there, resource methods DO serve
                   // it, so advertising a method it will be refused with
-                  // -32001 is a promise the mount cannot keep. A
-                  // session's identity is fixed at `initialize`, so this
-                  // is decidable here.
+                  // -32001 is a promise the mount cannot keep. The
+                  // refusal is permanent, not merely current: the session
+                  // row binds `identitySubject` here, and
+                  // `resources/subscribe` requires both an identity and a
+                  // match against that owner, so a session that
+                  // initialized anonymously is refused for its whole life
+                  // even if the client starts sending a valid token.
                   //
                   // `listChanged` is NOT withheld, because it names no
                   // method the caller invokes. It is a broadcast the host
