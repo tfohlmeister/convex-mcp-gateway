@@ -41,6 +41,7 @@ import {
   type McpHandlerCtx,
   type McpResource,
   type McpResourceContent,
+  type McpResourceCaller,
   type McpResourceProvider,
   type McpResourceTemplate,
   type McpResourceTemplateProvider,
@@ -82,12 +83,17 @@ export type {
   McpHandlerCtx,
   McpMrtrOptions,
   McpIdentityResolver,
+  McpAnonymousResourceAuthorizerArgs,
+  McpCallerIdentity,
+  McpIdentifiedResourceAuthorizerArgs,
   McpResourceAuditOption,
   McpResourceAuthorizerArgs,
   McpResourceAuthorizerHandler,
   McpResource,
   McpResourceAnnotations,
+  McpResourceCaller,
   McpResourceContent,
+  McpResourceOperation,
   McpResourceProvider,
   McpResourceTemplate,
   McpResourceTemplateProvider,
@@ -130,7 +136,12 @@ export type McpResourceReadHandler = (
   ctx: McpHandlerCtx,
   args: {
     uri: string;
-    identity: { subject: string; claims?: Record<string, unknown> };
+    /**
+     * `null` only on a mount that set `anonymousResources`, and only for a
+     * resource its `authorizeResource` allowed anonymously. Every other
+     * mount calls this with a principal, as before the option existed.
+     */
+    identity: McpResourceCaller;
   },
 ) => Promise<McpResourceContent[]>;
 

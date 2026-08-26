@@ -27,7 +27,7 @@ apply depend on it:
 | `entryType` | `"tool" \| "resource" \| "task"` | (indexed) Optional only for rows written before it existed |
 | `toolName` | `string` (optional) | Registered tool name (indexed). Also set on task rows, naming the tool the task runs |
 | `toolKind` | `"query" \| "mutation" \| "action"` (optional) | Tool rows |
-| `resourceUri` | `string` (optional) | Resource rows (indexed) |
+| `resourceUri` | `string` (optional) | Resource rows (indexed). Truncated to 1024 UTF-16 code units, at most ~3 KiB of UTF-8, plus a `…(truncated)` suffix, see below |
 | `resourceOperation` | `"list" \| "read" \| "templates_list"` (optional) | Resource rows |
 | `taskId` | `string` (optional) | Task rows (indexed) |
 | `taskOperation` | `"create" \| "input" \| "cancel" \| "complete" \| "fail"` (optional) | Task rows |
@@ -273,6 +273,38 @@ often is the right knob.
 - **Anonymous calls**: stored as `identitySubject: null`. There is no
   IP, user-agent, or request fingerprint. If you need those, log them
   in front of the gateway.
+- **Two strings on a resource row are capped at 1024 UTF-16 code units**: `resourceUri`,
+  and `errorMessage`, which embeds the URI on the not-found branch. A read
+  URI is chosen by the caller and unbounded, so without a cap one read of
+  a megabyte-long URI stores a megabyte, and a long enough one pushes the
+  document past Convex's limit, making the insert throw and losing the row
+  for a served read. The cap lives in the component's
+  `recordResourceEntry`, not in the HTTP handler, because that mutation is
+  public: a handler-side cap would be a convention any other writer could
+  skip. Two consequences worth knowing: a truncated value can no longer be
+  found by an exact `listAuditEntries({ resourceUri })` lookup, since that
+  walks the `by_resourceUri` index; and the marker sits inside the value,
+  so a URI that genuinely ends in that literal is indistinguishable from a
+  truncated one. **Scope**: this covers those two columns on resource rows
+  only. Tool `args` are stored verbatim, so a public tool accepting a large
+  string is an uncapped path; use `metadata.auditArgs` to redact it.
+- **A failed anonymous resource outcome is not recorded.** A
+  resource denial has never been audited for an unauthenticated caller,
+  because `resources/read` carries a caller-controlled `uri` and every
+  miss lands on the not-found branch, so auditing them would let one
+  client grow this table without bound. A mount that opts into
+  `anonymousResources` keeps that property: an anonymous `denied` or
+  `error` outcome is still not written. The rule keys on the request
+  having carried no caller, not on the row's `identitySubject`, so a host
+  whose identity resolver returns an object with no `subject` does not
+  quietly lose its denial trail. It does not bound how MANY rows: an
+  anonymous `resources/list` the authorizer *satisfied* writes one per
+  request, so the prune cron is the real bound. (A list it emptied is
+  recorded as `denied` instead, and therefore dropped. A list with no
+  candidates at all is `allowed`, since nothing was withheld, so an
+  opted-in mount with an empty catalog still writes one row per request.) Anonymous *tool* calls
+  are audited as usual, denials included; redact large or sensitive
+  arguments with `metadata.auditArgs` rather than expecting a cap.
 - **Read access**: `gateway.listAuditEntries` is exposed only through
   whatever query you wrap it in. Hide it from public Convex queries
   (use `internalQuery` or a query that gates on `ctx.auth`) before

@@ -542,9 +542,13 @@ export const resources = [
 //   gateway.handleMcpRequest(ctx, req, { authorize, tools, resources });
 ```
 
-Reads run only for authenticated callers. Add `defineMcpResourceTemplate`
-for parameterized URIs, `authorizeResource` for per-resource policy, and
-`auditResources` to log reads. A complete runnable wiring is in
+Reads run only for authenticated callers unless the mount sets
+`anonymousResources`, which hands the decision to `authorizeResource`
+instead (see
+[Public resources](./resources.md#public-resources-opt-in-anonymous-access)).
+Add `defineMcpResourceTemplate` for parameterized URIs,
+`authorizeResource` for per-resource policy, and `auditResources` to log
+reads. A complete runnable wiring is in
 [`example/convex`](../example/convex/mcp.ts). Full guide:
 [resources.md](./resources.md).
 

@@ -2,6 +2,7 @@ import type { ComponentApi } from "../component/_generated/component.js";
 import {
   buildProtectedResourceMetadataUrl,
   isDeliberateConvexError,
+  AUTHORIZER_INVALID_SHAPE_REASON,
   parseAuthorizerDecision,
   type McpAuthorizerArgs,
   type McpAuthorizerDecision,
@@ -118,17 +119,42 @@ export type McpResourceContent = {
   blob?: string;
 };
 
+/**
+ * The caller a resource provider or template read handler sees.
+ *
+ * `null` only on a mount that set `anonymousResources`. Without that
+ * option every one of these calls carries a principal, exactly as before
+ * the option existed, so a provider that does not serve anonymous callers
+ * can narrow once and carry on.
+ */
+export type McpCallerIdentity = {
+  subject: string;
+  claims?: Record<string, unknown>;
+};
+
+export type McpResourceCaller = McpCallerIdentity | null;
+
+/**
+ * The three resource methods, in the vocabulary the audit log already
+ * uses. Named because it appears in three places: the `operation` an
+ * anonymous authorizer decision carries, the `resourceOperation` on an
+ * audit row, and the helper that builds the authorizer input. (The
+ * `auditResources` OPTION spells the middle one `templatesList`; that is
+ * a host-facing config key rather than this vocabulary, and it stays.)
+ */
+export type McpResourceOperation = "list" | "templates_list" | "read";
+
 export type McpResourceProvider = {
   name: string;
   list: (
     ctx: McpHandlerCtx,
-    args: { identity: { subject: string; claims?: Record<string, unknown> } },
+    args: { identity: McpResourceCaller },
   ) => Promise<McpResource[]>;
   read: (
     ctx: McpHandlerCtx,
     args: {
       uri: string;
-      identity: { subject: string; claims?: Record<string, unknown> };
+      identity: McpResourceCaller;
     },
   ) => Promise<McpResourceContent[] | null>;
 };
@@ -161,7 +187,7 @@ export type McpResourceTemplateReadHandler = (
   args: {
     uri: string;
     params: Record<string, string>;
-    identity: { subject: string; claims?: Record<string, unknown> };
+    identity: McpResourceCaller;
   },
 ) => Promise<McpResourceContent[] | null>;
 
@@ -179,7 +205,12 @@ export type McpResourceTemplateProvider = {
   read?: McpResourceTemplateReadHandler;
 };
 
-export interface McpResourceAuthorizerArgs {
+/**
+ * The authorizer input for a caller the gateway has authenticated. Every
+ * resource method resolves to one of these unless the mount opted into
+ * `anonymousResources`.
+ */
+export interface McpIdentifiedResourceAuthorizerArgs {
   /**
    * `"resource_list"` when filtering `resources/list`,
    * `"resource_read"` before a `resources/read` handler runs,
@@ -203,12 +234,68 @@ export interface McpResourceAuthorizerArgs {
    */
   resourceMetadata: unknown;
   /**
-   * The caller's identity resolved once at the gateway boundary. Resource
-   * methods currently require an authenticated caller, so this is non-null
-   * when the callback runs.
+   * The caller's identity resolved once at the gateway boundary. These
+   * three modes run only for an authenticated caller, so this is non-null
+   * when the callback runs, and the union enforces that: a null identity
+   * on one of these modes does not typecheck.
    */
-  identity: { subject: string; claims?: Record<string, unknown> };
+  identity: McpCallerIdentity;
 }
+
+/**
+ * The authorizer input for an UNAUTHENTICATED caller. Only reachable on a
+ * mount that set `anonymousResources: true`; without it the gateway
+ * refuses anonymous resource requests before the authorizer runs and this
+ * variant never occurs.
+ *
+ * It is a mode of its own rather than the three above with a null
+ * `identity` so that an existing authorizer meets an unrecognised mode
+ * rather than a familiar one with a surprising argument. What happens
+ * next is that authorizer's default branch, and the two common shapes
+ * differ:
+ *
+ *   - one that returns nothing for an unknown mode denies, because
+ *     `parseAuthorizerDecision` reads a missing decision as a denial
+ *   - one that ends in `return { allowed: true }` ALLOWS, and publishes
+ *     whatever the anonymous caller asked for
+ *
+ * So this is a smaller guarantee than "cannot accept one by accident":
+ * the lock is `anonymousResources` itself, which no existing mount has
+ * set. Read your default branch before setting it.
+ */
+export interface McpAnonymousResourceAuthorizerArgs {
+  mode: "resource_anonymous";
+  /**
+   * Which resource method the anonymous caller is attempting. One mode
+   * keeps the "do I serve anonymous callers at all" decision in a single
+   * branch; this field is there for a host that wants to allow anonymous
+   * listing without allowing anonymous reads, or the reverse.
+   *
+   * `"list"` and `"read"` carry a concrete resource URI, `"templates_list"`
+   * carries the template's `uriTemplate`.
+   */
+  operation: McpResourceOperation;
+  resourceUri: string;
+  /**
+   * Free-form metadata attached to a registered resource, exactly as on an
+   * authenticated call. `null` for a runtime-only provider resource, for
+   * every template, and for a read whose URI matched a template rather
+   * than a registered resource, so a public template must be recognised by
+   * its URI shape rather than by metadata.
+   */
+  resourceMetadata: unknown;
+  /** Always `null`. The discriminant is `mode`; this documents the fact. */
+  identity: null;
+}
+
+/**
+ * What `authorizeResource` receives. Narrow on `mode` before reading
+ * `identity`: it is non-null for the three authenticated modes and null
+ * for `"resource_anonymous"`.
+ */
+export type McpResourceAuthorizerArgs =
+  | McpIdentifiedResourceAuthorizerArgs
+  | McpAnonymousResourceAuthorizerArgs;
 
 export type McpResourceAuthorizerHandler = (
   ctx: McpHandlerCtx,
@@ -474,8 +561,10 @@ export interface HandleMcpRequestOptions {
   /**
    * Optional MCP resources exposed by this gateway. Resources are listed
    * in `initialize.capabilities.resources`, served via `resources/list`,
-   * and read via `resources/read`. Resource providers receive the resolved
-   * caller identity; anonymous resource requests are rejected.
+   * and read via `resources/read`. A provider receives the resolved
+   * caller identity, or `null` on a mount that set `anonymousResources`,
+   * which is also the only mount where an anonymous resource request is
+   * served rather than refused.
    */
   resources?: McpResourceProvider[];
   /**
@@ -493,6 +582,52 @@ export interface HandleMcpRequestOptions {
    * `resources/read` checks `resource_read` before invoking the provider.
    */
   authorizeResource?: McpResourceAuthorizerHandler;
+  /**
+   * Serve `resources/list`, `resources/templates/list` and
+   * `resources/read` to unauthenticated callers, subject to
+   * `authorizeResource`. Default `false`, and with it off the three
+   * methods refuse an anonymous caller with `-32001` before the
+   * authorizer runs, which is the behaviour every mount had before this
+   * option existed.
+   *
+   * This is the resource counterpart of a public tool, but it is a
+   * gateway option rather than the host-side `metadata.public`
+   * convention tools use, because `authorizeResource` cannot be the only
+   * lock: a mount that never configured one authorizes every resource by
+   * default, so "let the authorizer decide" would silently publish the
+   * whole catalog. Setting this without an `authorizeResource` therefore
+   * throws on the first request through the mount; there is no
+   * deploy-time hook to fail at.
+   *
+   * An anonymous caller reaches the authorizer under
+   * `mode: "resource_anonymous"`, never under the three authenticated
+   * modes. That keeps an existing policy from being applied to a caller
+   * it was not written for, but it does not decide the outcome: an
+   * authorizer whose default branch returns `{ allowed: true }` allows
+   * the anonymous caller too. Audit that branch before opting in.
+   *
+   * Three things it deliberately does not do:
+   *
+   *   - `resources/subscribe` and `resources/unsubscribe` stay
+   *     authenticated. A subscription is server-side state an anonymous
+   *     caller could accumulate, and it buys a client nothing here: this
+   *     transport does not push, so the host delivers
+   *     `notifications/resources/updated` over its own channel.
+   *   - It cannot be combined with `beforeResourceRead`, which throws on
+   *     the first request. That hook's contract passes a non-null identity and an
+   *     MRTR continuation must bind to a principal, the same reason a
+   *     tool's `beforeCall` requires an authenticated caller.
+   *   - It does not override `requireAuth`. That gate answers anonymous
+   *     POSTs with `401` before the method switch, so a mount setting
+   *     both serves no anonymous resource. Same as `requireAuth` with a
+   *     public tool.
+   *
+   * Auditing a mount that serves anonymous callers wants a retention
+   * cron. A failing anonymous outcome is never recorded, but a SUCCEEDING
+   * one is, one row per request, so `gateway.pruneAuditEntries` is what
+   * bounds the table. See `docs/audit-log.md`.
+   */
+  anonymousResources?: boolean;
   /**
    * Optional MRTR hook for `resources/read`: the read counterpart of a
    * tool's `beforeCall`. Runs after `authorizeResource` allowed the read
@@ -517,6 +652,11 @@ export interface HandleMcpRequestOptions {
    * Requires the `mrtr` option (the continuation is sealed with its
    * secret) and the modern protocol; a read that demands input on a legacy
    * request fails closed rather than silently serving the resource.
+   *
+   * Incompatible with `anonymousResources`: the two together throw on the
+   * first request through the mount, because this hook's contract passes
+   * a non-null identity and the MRTR chain it can open must bind to a
+   * principal.
    */
   beforeResourceRead?: McpBeforeResourceReadHandler;
   /**
@@ -2272,18 +2412,24 @@ async function readMrtrChain(
 let warnedRequireAuthWithoutOAuth = false;
 
 /**
- * Build the `requireAuth` 401 challenge for an anonymous POST. Mirrors
- * the `tools/call` UNAUTHORIZED branch: 401 + `WWW-Authenticate` when
- * an OAuth server is configured (so the client begins RFC 9728
- * discovery), or a bare 401 (plus a one-time warning) when it isn't.
+ * Build a 401 challenge for an anonymous POST: `401` +
+ * `WWW-Authenticate` when an OAuth server is configured (so the client
+ * begins RFC 9728 discovery), or a bare 401 (plus a one-time warning)
+ * when it isn't. Mirrors the `tools/call` UNAUTHORIZED branch.
+ *
+ * Called from the `requireAuth` gate, from the anonymous task-augmented
+ * `tools/call` and `tasks/*` paths, and from the three resource methods
+ * when the host's authorizer denies an anonymous caller with an
+ * `unauth`-shaped reason. Only the read path passes a reason through; a
+ * list discards its per-candidate reasons, so it takes the generic one.
  */
 async function requireAuthChallenge(
   ctx: HandlerCtx,
   request: Request,
   component: ComponentApi,
   id: JsonRpcMessage["id"],
+  reason = "Unauthorized: authentication required",
 ): Promise<Response> {
-  const reason = "Unauthorized: authentication required";
   const oauthConfig = await ctx.runQuery(component.registry.getOAuthConfig, {});
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -2299,9 +2445,9 @@ async function requireAuthChallenge(
   } else if (!warnedRequireAuthWithoutOAuth) {
     warnedRequireAuthWithoutOAuth = true;
     console.warn(
-      "[mcp-gateway] requireAuth is set but no OAuth config exists; " +
-        "returning 401 without WWW-Authenticate. Browser clients can't " +
-        "begin OAuth discovery until setOAuthConfig is called.",
+      "[mcp-gateway] a 401 challenge was issued but no OAuth config " +
+        "exists; returning 401 without WWW-Authenticate. Browser clients " +
+        "can't begin OAuth discovery until setOAuthConfig is called.",
     );
   }
   return new Response(jsonErrorEnvelope(id, UNAUTHORIZED, reason), {
@@ -2325,6 +2471,51 @@ async function safeAuthorize(
       threw: true,
     };
   }
+}
+
+/**
+ * Build the `authorizeResource` input for one candidate.
+ *
+ * An anonymous caller only reaches here on a mount that set
+ * `anonymousResources`, and is presented under `"resource_anonymous"`
+ * rather than the mode its operation would otherwise use.
+ *
+ * The union is what makes an authenticated mode with a null identity
+ * unrepresentable; this function is not load-bearing for that. What it
+ * adds is the `undefined` case, which the types say cannot happen and an
+ * untyped host's `resolveIdentity` can still produce.
+ */
+function resourceAuthorizerArgs(
+  operation: McpResourceOperation,
+  resourceUri: string,
+  resourceMetadata: unknown,
+  identity: McpResourceCaller,
+): McpResourceAuthorizerArgs {
+  // `== null`. `resolveCallerIdentity` normalizes an untyped host's
+  // `undefined` away, so this is defence rather than a live case, but the
+  // three method gates classify with `!identity`: were `undefined` ever to
+  // reach here, `=== null` would build an AUTHENTICATED mode for a caller
+  // the gates called anonymous.
+  if (identity == null) {
+    return {
+      mode: "resource_anonymous",
+      operation,
+      resourceUri,
+      resourceMetadata,
+      identity: null,
+    };
+  }
+  return {
+    mode:
+      operation === "read"
+        ? "resource_read"
+        : operation === "list"
+          ? "resource_list"
+          : "resource_templates_list",
+    resourceUri,
+    resourceMetadata,
+    identity,
+  };
 }
 
 async function safeAuthorizeResource(
@@ -2683,22 +2874,54 @@ function shouldAuditResource(
   return auditResources[operation] === true;
 }
 
+/**
+ * The caller half of a resource audit row. A union rather than two loose
+ * fields, because `anonymous: true` always means a null subject: the two
+ * are built together at the one place identity is resolved, so making
+ * them disagree is not expressible.
+ *
+ * They are still two facts. `anonymous` routes the write, and is stripped
+ * before the row crosses into the component; `identitySubject` is data on
+ * the row. An authenticated request CAN carry a null subject, when a host
+ * `resolveIdentity` returns an object without one, and its rows must be
+ * kept: they are the signal that the resolver is misconfigured.
+ */
+type ResourceAuditCaller =
+  | { anonymous: true; identitySubject: null }
+  | { anonymous: false; identitySubject: string | null };
+
 async function safeRecordResourceAudit(
   ctx: HandlerCtx,
   component: ComponentApi,
-  entry: {
+  entry: ResourceAuditCaller & {
     resourceUri?: string;
-    resourceOperation: "list" | "read" | "templates_list";
+    resourceOperation: McpResourceOperation;
     args: unknown;
     outcome: "allowed" | "denied" | "error";
-    identitySubject: string | null;
     durationMs: number;
     errorCode?: number;
     errorMessage?: string;
   },
 ): Promise<void> {
+  // An anonymous outcome is recorded only when it is `allowed`.
+  //
+  // The reason resource denials went unaudited was that an unauthenticated
+  // caller could grow the table without bound, and `resources/read` carries
+  // a caller-controlled `uri`. `anonymousResources` would reopen exactly
+  // that through the allow door: a public template accepts any expansion,
+  // and every miss lands on the not-found branch, which does write a row.
+  //
+  // What this bounds is the number of rows an anonymous caller can cause
+  // through a FAILING request, which is the unbounded part. It does not
+  // bound successful ones: an allowed anonymous `resources/list` writes
+  // one row per request like any other allowed outcome, which is what the
+  // prune cron is for. The SIZE of a row is bounded separately, and lower
+  // down, by `recordResourceEntry` in the component, so that it holds for
+  // every writer of that public mutation rather than only for this one.
+  if (entry.anonymous && entry.outcome !== "allowed") return;
   try {
-    await ctx.runMutation(component.audit.recordResourceEntry, entry);
+    const { anonymous: _anonymous, ...row } = entry;
+    await ctx.runMutation(component.audit.recordResourceEntry, row);
   } catch (err) {
     console.error(
       "[mcp-gateway] failed to record resource audit entry",
@@ -2733,6 +2956,51 @@ export async function handleMcpRequest(
   // error on the other side of the wire instead of a named field here.
   const serverInfoProblem = describeServerInfoProblem(options.serverInfo);
   if (serverInfoProblem) throw new Error(serverInfoProblem);
+  // Before the truthiness check below: `anonymousResources: process.env.X`
+  // is the shape that turns "off" into on, and this option decides whether
+  // unauthenticated callers are served at all. Same reasoning as the
+  // `tasks.scope` check above, higher stakes.
+  if (
+    options.anonymousResources !== undefined &&
+    typeof options.anonymousResources !== "boolean"
+  ) {
+    throw new Error("anonymousResources must be a boolean.");
+  }
+  if (options.anonymousResources) {
+    // `safeAuthorizeResource` allows everything when no authorizer is
+    // configured, so opting in without one would publish the entire
+    // catalog rather than delegating the decision. Throw on the first
+    // request rather than serve that; Convex offers no deploy-time hook,
+    // so this is as early as the gateway can object. `!`, not
+    // `=== undefined`, so the guard tests exactly what
+    // `safeAuthorizeResource` tests and a config-shaped `null` cannot
+    // slip through it.
+    if (!options.authorizeResource) {
+      throw new Error(
+        "anonymousResources requires an authorizeResource callback; " +
+          "without one every resource is allowed, so anonymous callers " +
+          "would read the whole catalog.",
+      );
+    }
+    // The hook's contract passes a non-null identity, and the read-side
+    // MRTR chain it can open must bind to a principal. Rather than run it
+    // with a null identity, or skip a hook the host installed as a gate,
+    // refuse the combination on the first request through the mount.
+    // `!= null`, so `null` is "no hook" here and at every other site that
+    // reads this option: the two capability advertisements, the two
+    // `-32601` branches, and the read case's own local. They used to test
+    // `undefined` strictly, which meant a config-shaped `null` was absent
+    // for this guard and installed for them, so such a mount advertised
+    // and served a resources capability with no hook behind it. Treating
+    // it as installed here would instead fail every request, preflight
+    // included, over a hook the host never wrote.
+    if (options.beforeResourceRead != null) {
+      throw new Error(
+        "anonymousResources cannot be combined with beforeResourceRead; " +
+          "the hook requires an authenticated caller.",
+      );
+    }
+  }
   // Before the preflight branch: telling a browser via CORS that a
   // cross-origin POST is permitted, only to 403 the POST itself, defeats
   // the point of preflight. A disallowed origin gets a bare 403 with no
@@ -2790,7 +3058,13 @@ async function resolveCallerIdentity(
       : null;
     if (token) {
       try {
-        return await options.resolveIdentity(token);
+        // `?? null` normalizes here so every downstream check can be
+        // strict. The signature says the resolver returns a caller or
+        // null, but an untyped host can return `undefined`, and that
+        // value used to reach two consumers that disagreed about it: the
+        // authorizer treated it as anonymous, the audit rule as
+        // authenticated. One shape at the boundary instead.
+        return (await options.resolveIdentity(token)) ?? null;
       } catch (err) {
         console.warn(
           `[mcp-gateway] resolveIdentity threw; treating as anonymous. ` +
@@ -2969,6 +3243,19 @@ async function handlePost(
   // resolution avoids a duplicate resolveIdentity/userinfo round-trip.
   const identity = await resolveCallerIdentity(ctx, request, options);
   const auditIdentitySubject = identity?.subject ?? null;
+  /**
+   * The caller half of every resource audit row, built once so the two
+   * fields cannot disagree. They are not the same fact: `anonymous`
+   * routes the write (a failing anonymous outcome is dropped), while
+   * `identitySubject` is data on the row. A host `resolveIdentity` that
+   * returns an object with no `subject` produces an AUTHENTICATED request
+   * with a null subject, so deriving one from the other would delete that
+   * host's denial trail.
+   */
+  const auditCaller =
+    identity == null
+      ? ({ anonymous: true, identitySubject: null } as const)
+      : { anonymous: false as const, identitySubject: auditIdentitySubject };
 
   // requireAuth gate: challenge anonymous POSTs with 401 before session
   // handling / the method switch, so browser MCP clients (claude.ai)
@@ -3156,9 +3443,11 @@ async function handlePost(
         // A hook-only mount serves reads with no provider and no template
         // (ask, then answer with `completeRead`), so it has the capability
         // even with an empty catalog.
-        options.beforeResourceRead !== undefined ||
+        options.beforeResourceRead != null ||
         Boolean(options.resourceSubscriptions?.subscribe) ||
         Boolean(options.resourceSubscriptions?.listChanged);
+      const anonymousOnOptedInMount =
+        identity === null && Boolean(options.anonymousResources);
       body = jsonResultEnvelope(message.id, {
         protocolVersion: negotiated,
         serverInfo: options.serverInfo ?? {
@@ -3173,7 +3462,28 @@ async function handlePost(
           ...(advertiseResources
             ? {
                 resources: {
-                  ...(options.resourceSubscriptions?.subscribe
+                  // `subscribe` is withheld from an anonymous session on
+                  // an opted-in mount: there, resource methods DO serve
+                  // it, so advertising a method it will be refused with
+                  // -32001 is a promise the mount cannot keep. A
+                  // session's identity is fixed at `initialize`, so this
+                  // is decidable here.
+                  //
+                  // `listChanged` is NOT withheld, because it names no
+                  // method the caller invokes. It is a broadcast the host
+                  // emits, and an anonymous session on an opted-in mount
+                  // can list, so it is exactly the flag still worth
+                  // having: withhold it and a spec-compliant client never
+                  // re-lists and serves a stale catalog for the life of
+                  // the connection.
+                  //
+                  // Neither is withheld on a mount WITHOUT the option.
+                  // There every resource method already refuses this
+                  // caller, so the block is moot for it, and the
+                  // advertisement is what every release so far sent.
+                  // Narrowing that is a separate change.
+                  ...(options.resourceSubscriptions?.subscribe &&
+                  !anonymousOnOptedInMount
                     ? { subscribe: true }
                     : {}),
                   ...(options.resourceSubscriptions?.listChanged
@@ -3210,7 +3520,7 @@ async function handlePost(
         (options.resources ?? []).length > 0 ||
         (options.resourceTemplates ?? []).length > 0 ||
         // As on `initialize`: a hook-only mount can serve a read.
-        options.beforeResourceRead !== undefined;
+        options.beforeResourceRead != null;
       body = jsonResultEnvelope(message.id, {
         resultType: "complete",
         supportedVersions: [
@@ -3255,7 +3565,7 @@ async function handlePost(
         // would leave a client that lists on connect with an error for a
         // feature the handshake just promised. Its catalog is genuinely
         // empty, so it lists as empty rather than as unsupported.
-        options.beforeResourceRead === undefined
+        options.beforeResourceRead == null
       ) {
         if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(
@@ -3265,13 +3575,18 @@ async function handlePost(
         );
         break;
       }
-      if (!identity) {
+      if (!identity && !options.anonymousResources) {
         // Intentionally NOT audited on the anonymous deny path. An
         // unauthenticated caller can `initialize` once then spam resource
         // requests with no Bearer; auditing the denials would let them grow
         // the audit table without bound (and `resources/read` carries a
         // caller-controlled `uri`). Mirrors the unknown-tool path in
         // dispatch.ts: only authenticated outcomes are audited.
+        //
+        // With `anonymousResources` set the caller falls through to the
+        // authorizer instead, under `"resource_anonymous"`. The audit rule
+        // survives that: `safeRecordResourceAudit` still writes nothing for
+        // an anonymous outcome that is not `allowed`.
         body = jsonErrorEnvelope(
           message.id,
           UNAUTHORIZED,
@@ -3326,36 +3641,83 @@ async function handlePost(
           })),
         ]);
         const resources = [];
+        // Whether the host asked, on any denial, for the caller to
+        // authenticate. Same `unauth`-shaped convention `resources/read`
+        // uses; on a list the per-candidate reasons are otherwise
+        // discarded, so this is the only thing carried out of the loop.
+        let authWouldHelp = false;
         for (const candidate of candidates) {
           const { decision, threw } = await safeAuthorizeResource(
             options.authorizeResource,
             ctx,
-            {
-              mode: "resource_list",
-              resourceUri: candidate.resource.uri,
-              resourceMetadata: candidate.metadata,
+            resourceAuthorizerArgs(
+              "list",
+              candidate.resource.uri,
+              candidate.metadata,
               identity,
-            },
+            ),
           );
-          if (threw) {
+          // A malformed return is logged alongside a throw, not treated
+          // as a policy denial. Both are host faults, and a filtered list
+          // has nowhere to report one: the candidate is simply omitted, so
+          // a host that forgets a `return` in its `resource_anonymous`
+          // branch would otherwise see an empty `resources/list` with no
+          // diagnostic anywhere. Per-item isolation still stands and the
+          // response shape does not change.
+          if (threw || decision.reason === AUTHORIZER_INVALID_SHAPE_REASON) {
             console.error(
-              "[mcp-gateway] resource authorizer threw during resources/list for resource",
+              "[mcp-gateway] resource authorizer failed during resources/list for resource",
               candidate.resource.uri,
               decision.reason,
             );
           }
           if (decision.allowed) {
             resources.push(pickResourceFields(candidate.resource));
+          } else if (
+            !threw &&
+            decision.reason !== undefined &&
+            /^unauth/i.test(decision.reason)
+          ) {
+            authWouldHelp = true;
           }
         }
+        // An anonymous caller the host granted NOTHING, having said
+        // authentication would help, is challenged rather than handed an
+        // empty catalog. Before `anonymousResources` existed this method
+        // answered `-32001` and the client knew to re-authenticate; a
+        // client whose Bearer merely expired would otherwise now get an
+        // empty HTTP 200 and no signal at all, and the capability set is
+        // fixed at `initialize`, so it could stay that way for the life of
+        // the connection. Requiring an EMPTY result keeps a mixed mount
+        // quiet: a caller that got the public subset is not told to log in.
+        const challengeList =
+          identity == null && resources.length === 0 && authWouldHelp;
         if (shouldAuditResource(options.auditResources, "list")) {
           await safeRecordResourceAudit(ctx, component, {
             resourceOperation: "list",
             args: { resourceCount: resources.length },
-            outcome: "allowed",
-            identitySubject: auditIdentitySubject,
+            // `denied` when an ANONYMOUS caller got nothing it asked
+            // for, which is what lets the suppression in
+            // `safeRecordResourceAudit` fire: a hardcoded `allowed` never
+            // did, so an unauthenticated client looping this method would
+            // otherwise write one row per request even when the authorizer
+            // granted it nothing. Scoped to anonymous callers, so an authenticated
+            // caller's rows keep the outcome every release so far
+            // recorded.
+            outcome:
+              auditCaller.anonymous &&
+              candidates.length > 0 &&
+              resources.length === 0
+                ? "denied"
+                : "allowed",
+            ...auditCaller,
             durationMs: Date.now() - start,
           });
+        }
+        if (challengeList) {
+          raw = await requireAuthChallenge(ctx, request, component, message.id);
+          body = "";
+          break;
         }
         if (isStateless) {
           resources.sort((a, b) => a.uri.localeCompare(b.uri));
@@ -3369,7 +3731,7 @@ async function handlePost(
             resourceOperation: "list",
             args: null,
             outcome: "error",
-            identitySubject: auditIdentitySubject,
+            ...auditCaller,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
             errorMessage: full,
@@ -3399,7 +3761,7 @@ async function handlePost(
         );
         break;
       }
-      if (!identity) {
+      if (!identity && !options.anonymousResources) {
         // Not audited on the anonymous deny path, see the resources/list
         // rationale: anonymous spam must never grow the audit table.
         body = jsonErrorEnvelope(
@@ -3421,6 +3783,9 @@ async function handlePost(
           byUriTemplate.set(provider.template.uriTemplate, provider.template);
         }
         const resourceTemplates = [];
+        // See `resources/list`: the host's `unauth`-shaped denial is the
+        // only per-candidate reason that survives the loop.
+        let authWouldHelp = false;
         for (const template of byUriTemplate.values()) {
           const problem = describeResourceTemplateProblem(template);
           if (problem) {
@@ -3431,32 +3796,54 @@ async function handlePost(
           const { decision, threw } = await safeAuthorizeResource(
             options.authorizeResource,
             ctx,
-            {
-              mode: "resource_templates_list",
-              resourceUri: template.uriTemplate,
-              resourceMetadata: null,
+            resourceAuthorizerArgs(
+              "templates_list",
+              template.uriTemplate,
+              null,
               identity,
-            },
+            ),
           );
-          if (threw) {
+          // Same as `resources/list`: a malformed return is a host fault
+          // with nowhere to surface in a filtered list, so log it.
+          if (threw || decision.reason === AUTHORIZER_INVALID_SHAPE_REASON) {
             console.error(
-              "[mcp-gateway] resource authorizer threw during resources/templates/list for template",
+              "[mcp-gateway] resource authorizer failed during resources/templates/list for template",
               template.uriTemplate,
               decision.reason,
             );
           }
           if (decision.allowed) {
             resourceTemplates.push(pickTemplateFields(template));
+          } else if (
+            !threw &&
+            decision.reason !== undefined &&
+            /^unauth/i.test(decision.reason)
+          ) {
+            authWouldHelp = true;
           }
         }
+        // Same rule and same reasoning as `resources/list`.
+        const challengeTemplates =
+          identity == null && resourceTemplates.length === 0 && authWouldHelp;
         if (shouldAuditResource(options.auditResources, "templatesList")) {
           await safeRecordResourceAudit(ctx, component, {
             resourceOperation: "templates_list",
             args: { resourceTemplateCount: resourceTemplates.length },
-            outcome: "allowed",
-            identitySubject: auditIdentitySubject,
+            // Same scoping as `resources/list`.
+            outcome:
+              auditCaller.anonymous &&
+              byUriTemplate.size > 0 &&
+              resourceTemplates.length === 0
+                ? "denied"
+                : "allowed",
+            ...auditCaller,
             durationMs: Date.now() - start,
           });
+        }
+        if (challengeTemplates) {
+          raw = await requireAuthChallenge(ctx, request, component, message.id);
+          body = "";
+          break;
         }
         if (isStateless) {
           resourceTemplates.sort((a, b) =>
@@ -3475,7 +3862,7 @@ async function handlePost(
             resourceOperation: "templates_list",
             args: null,
             outcome: "error",
-            identitySubject: auditIdentitySubject,
+            ...auditCaller,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
             errorMessage: full,
@@ -3502,7 +3889,7 @@ async function handlePost(
         // with `completeRead`) serves reads with no provider and no
         // template, so "nothing is registered" is not the same as "reads
         // are unsupported here".
-        options.beforeResourceRead === undefined
+        options.beforeResourceRead == null
       ) {
         if (isStateless) responseStatus = 404;
         body = jsonErrorEnvelope(
@@ -3512,7 +3899,7 @@ async function handlePost(
         );
         break;
       }
-      if (!identity) {
+      if (!identity && !options.anonymousResources) {
         // Not audited on the anonymous deny path, see the resources/list
         // rationale. This matters most here: the denied `read` carries a
         // caller-controlled `uri`, so auditing would let an unauthenticated
@@ -3532,7 +3919,7 @@ async function handlePost(
             resourceOperation: "read",
             args: null,
             outcome: "error",
-            identitySubject: auditIdentitySubject,
+            ...auditCaller,
             durationMs: Date.now() - start,
             errorCode: INVALID_PARAMS,
             errorMessage: "Missing resource uri",
@@ -3551,16 +3938,37 @@ async function handlePost(
       const resourceAuthz = await safeAuthorizeResource(
         options.authorizeResource,
         ctx,
-        {
-          mode: "resource_read",
-          resourceUri: uri,
-          resourceMetadata: metadata,
-          identity,
-        },
+        resourceAuthorizerArgs("read", uri, metadata, identity),
       );
       if (!resourceAuthz.decision.allowed) {
         const reason = resourceAuthz.decision.reason ?? "Forbidden";
-        const code = resourceAuthz.threw
+        // A malformed return is a host BUG, not a policy denial. It is the
+        // likeliest first-day failure of a new `resource_anonymous`
+        // branch: forget one `return` and this is what arrives.
+        const malformed = reason === AUTHORIZER_INVALID_SHAPE_REASON;
+        if (resourceAuthz.threw || malformed) {
+          // Unconditional, for every caller: the two sibling list
+          // branches already log this way, and the read branch relied on
+          // the audit row alone, which for an anonymous caller is dropped.
+          // So this was the one authorizer fault that could leave no trace
+          // anywhere. Adding a log changes no response.
+          console.error(
+            "[mcp-gateway] resource authorizer failed during resources/read",
+            uri,
+            reason,
+          );
+        }
+        // Reading a malformed return as a FAULT rather than a denial is
+        // scoped to an anonymous caller, which is the case this option
+        // creates. For an authenticated one it would move the wire code
+        // from -32003 to -32603 and the audit outcome from `denied` to
+        // `error` on a mount that opted into nothing, and a host alerting
+        // on either would start firing. That the internal shape text
+        // still reaches an authenticated caller is a separate,
+        // pre-existing issue.
+        const faulted =
+          resourceAuthz.threw || (malformed && identity == null);
+        const code = faulted
           ? INTERNAL_ERROR
           : /^unauth/i.test(reason)
             ? UNAUTHORIZED
@@ -3570,20 +3978,43 @@ async function handlePost(
             resourceUri: uri,
             resourceOperation: "read",
             args: null,
-            outcome: resourceAuthz.threw ? "error" : "denied",
-            identitySubject: auditIdentitySubject,
+            outcome: faulted ? "error" : "denied",
+            ...auditCaller,
             durationMs: Date.now() - start,
             errorCode: code,
             errorMessage: reason,
           });
         }
+        // An ANONYMOUS caller denied with an `unauth`-shaped reason gets
+        // the same 401 + `WWW-Authenticate` a denied anonymous
+        // `tools/call` gets, because a browser MCP client reacts to that
+        // status and to nothing else. Without it, a mount that serves
+        // some resources publicly and gates the rest could never tell
+        // such a client to log in, which is the whole point of mixing
+        // the two. Scoped to anonymous callers: an authenticated one
+        // keeps the HTTP 200 JSON-RPC body every release so far
+        // returned, and changing that is not this option's business.
+        if (identity == null && code === UNAUTHORIZED) {
+          raw = await requireAuthChallenge(
+            ctx,
+            request,
+            component,
+            message.id,
+            reason,
+          );
+          body = "";
+          break;
+        }
         // Same split as the `tools/call` denial: a returned reason is
-        // host-authored and goes to the caller, a thrown one carries
-        // exception text and stays in the audit row above.
+        // host-authored and goes to the caller, while a thrown or
+        // malformed one carries text the caller must not see. That text
+        // goes to the deployment log above, and to the audit row only for
+        // an authenticated caller: an anonymous fault is `outcome:
+        // "error"`, which the audit rule drops.
         body = jsonErrorEnvelope(
           message.id,
           code,
-          resourceAuthz.threw ? GENERIC_AUTHORIZER_ERROR : reason,
+          faulted ? GENERIC_AUTHORIZER_ERROR : reason,
         );
         break;
       }
@@ -3594,7 +4025,12 @@ async function handlePost(
       // after the answer costs no provider work.
       const requestState = message.params?.requestState;
       const inputResponses = message.params?.inputResponses;
-      const beforeResourceRead = options.beforeResourceRead;
+      // `?? undefined` so a config-shaped `null` is absent here exactly as
+      // it is at the five `options.beforeResourceRead` predicates above.
+      // The advertisement and the -32601 branches read this option too, so
+      // one of them disagreeing would advertise, and serve, a resources
+      // capability whose only justification was a hook nobody installed.
+      const beforeResourceRead = options.beforeResourceRead ?? undefined;
       const hasContinuation =
         requestState !== undefined || inputResponses !== undefined;
       if (hasContinuation && !beforeResourceRead) {
@@ -3608,6 +4044,18 @@ async function handlePost(
         break;
       }
       if (beforeResourceRead) {
+        if (!identity) {
+          // Unreachable: the mount refuses `anonymousResources` together
+          // with `beforeResourceRead`. Kept as the fail-closed answer if
+          // that ever stops holding, because the hook's contract promises
+          // a principal and the chain it can open must bind to one.
+          body = jsonErrorEnvelope(
+            message.id,
+            UNAUTHORIZED,
+            "Unauthorized: authentication required",
+          );
+          break;
+        }
         // The chain is keyed on the operation AND the concrete URI, so a
         // tool continuation can never be presented as a read continuation,
         // and a continuation minted for one template expansion cannot be
@@ -3811,7 +4259,7 @@ async function handlePost(
               resourceOperation: "read",
               args: null,
               outcome: "denied",
-              identitySubject: auditIdentitySubject,
+              ...auditCaller,
               durationMs: Date.now() - start,
               errorCode: FORBIDDEN,
               errorMessage: decision.reason,
@@ -3828,7 +4276,7 @@ async function handlePost(
               resourceOperation: "read",
               args: null,
               outcome: "allowed",
-              identitySubject: auditIdentitySubject,
+              ...auditCaller,
               durationMs: Date.now() - start,
             });
           }
@@ -3969,7 +4417,7 @@ async function handlePost(
               resourceOperation: "read",
               args: null,
               outcome: "allowed",
-              identitySubject: auditIdentitySubject,
+              ...auditCaller,
               durationMs: Date.now() - start,
             });
           }
@@ -4050,7 +4498,7 @@ async function handlePost(
               resourceOperation: "read",
               args: null,
               outcome: "error",
-              identitySubject: auditIdentitySubject,
+              ...auditCaller,
               durationMs: Date.now() - start,
               errorCode: code,
               errorMessage: providerError?.full ?? notFound,
@@ -4081,7 +4529,7 @@ async function handlePost(
             resourceOperation: "read",
             args: null,
             outcome: "error",
-            identitySubject: auditIdentitySubject,
+            ...auditCaller,
             durationMs: Date.now() - start,
             errorCode: INTERNAL_ERROR,
             errorMessage: full,
@@ -4142,6 +4590,13 @@ async function handlePost(
       // Subscriptions are identity-scoped, like list/read. (Read-time
       // authorization still governs content: the `updated` notification
       // carries only a URI, and `resources/read` re-checks `resource_read`.)
+      //
+      // `anonymousResources` deliberately does NOT reach here. Unlike a
+      // list or a read, a subscribe is server-side state an anonymous
+      // caller accumulates: the rows are capped per session, but nothing
+      // caps how many sessions one anonymous client opens. It also buys a
+      // client nothing on this transport, which cannot push the
+      // `updated` notification a subscription exists to receive.
       if (!identity) {
         body = jsonErrorEnvelope(
           message.id,

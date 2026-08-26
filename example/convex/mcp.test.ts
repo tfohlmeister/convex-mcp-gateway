@@ -5,6 +5,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import schema from "./schema.js";
 import { api, components, internal } from "./_generated/api.js";
 import { McpGateway } from "convex-mcp-gateway";
+import {
+  conformanceResourceTemplates,
+  conformanceResources,
+} from "./conformance.js";
+import { authorizeResource } from "./http.js";
 
 const modules = import.meta.glob(["./**/*.ts", "./**/*.js", "!**/*.test.ts"]);
 const componentModules = import.meta.glob([
@@ -4235,5 +4240,58 @@ describe("MCP tasks (host executor, e2e)", () => {
     };
     expect(body.result?.isError).toBe(true);
     expect(body.result?.content?.[0]?.text).toMatch(/must be invoked as an MCP task/);
+  });
+});
+
+describe("conformance fixtures (MCP_CONFORMANCE mount)", () => {
+  // The conformance mount is the one place `anonymousResources` is set, and
+  // it is gated on an env var that no test sets, so none of this is
+  // otherwise exercised by `pnpm test`. What it protects is an external
+  // suite whose failure mode is invisible here: if the anonymous branch
+  // ever denied a fixture, `resources-list` would come back empty, and if
+  // it denied with an `unauth`-shaped reason the gateway would answer 401
+  // instead of the catalog.
+  test("the anonymous branch allows every fixture, and never asks for a login", async () => {
+    const anonymous = (
+      resourceUri: string,
+      operation: "list" | "templates_list" | "read",
+      resourceMetadata: unknown = null,
+    ) =>
+      authorizeResource({} as never, {
+        mode: "resource_anonymous",
+        operation,
+        resourceUri,
+        resourceMetadata,
+        identity: null,
+      });
+
+    for (const resource of conformanceResources) {
+      // Layer one: the fixtures carry `metadata: { public: true }`.
+      expect(
+        await anonymous(resource.resource.uri, "list", resource.resource.metadata),
+      ).toEqual({ allowed: true });
+      // Layer two: the `test://` scheme, which is what a read of an
+      // unregistered URI relies on, since a read carries no metadata.
+      expect(await anonymous(resource.resource.uri, "read")).toEqual({
+        allowed: true,
+      });
+    }
+    for (const provider of conformanceResourceTemplates) {
+      expect(
+        await anonymous(provider.template.uriTemplate, "templates_list"),
+      ).toEqual({ allowed: true });
+    }
+    // SEP-2164 wants the not-found answer, so an unknown `test://` URI has
+    // to reach resolution rather than stopping at a 403.
+    expect(
+      await anonymous("test://nonexistent-resource-for-conformance-testing", "read"),
+    ).toEqual({ allowed: true });
+
+    // Layer three: nothing outside the scheme is public, and the refusal
+    // is deliberately NOT `unauth`-shaped, so an empty list answers 200
+    // rather than challenging.
+    const refused = await anonymous("docs://private", "list");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reason ?? "").not.toMatch(/^unauth/i);
   });
 });

@@ -657,6 +657,8 @@ kinds. Judge each one by whether anything in `src/client/` calls it.
 | Authorize returns `allowed: false` | `-32001 Unauthorized` if reason starts `Unauth*`, else `-32003 Forbidden`. 401 also gets `WWW-Authenticate`. (audit `denied`) |
 | Authorize throws | `-32603 Authorization check failed` on the wire; the full `Authorizer threw: ...` text goes to the audit row only (audit `error`) |
 | Authorize returns malformed shape | Treated as `allowed: false` with explanatory reason (audit `denied`) |
+| `authorizeResource` returns malformed shape, on `resources/read` | Logged to `console.error` for every caller. For an ANONYMOUS one it also reads as a host fault rather than a denial: `-32603` on the wire, and no audit row, since the anonymous rule drops a non-`allowed` outcome. For an authenticated one the answer is unchanged (`-32003`, audit `denied`): it is the shape a pre-existing authorizer produces for the new `resource_anonymous` mode, so only that mode's answer moves |
+| `authorizeResource` denies an ANONYMOUS `resources/read` | `-32001` at HTTP **401** (+ `WWW-Authenticate` when OAuth is configured) if the reason starts `Unauth*`, else `-32003` at HTTP 200. No audit row either way, since the anonymous rule drops a non-`allowed` outcome. Authenticated denials stay at HTTP 200 and are audited as before |
 | Tool handler throws | `-32000 Tool execution failed` on the wire, unless it threw a `ConvexError`, whose message is deliberate and passes through. Full text in the audit row (audit `error`) |
 | Audit-write fails | Logged via `console.error`, swallowed. Dispatch outcome unchanged. |
 | Session id missing on a non-`initialize` request | HTTP 400 |

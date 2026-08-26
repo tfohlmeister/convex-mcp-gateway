@@ -54,6 +54,40 @@ export const recordEntry = internalMutation({
 });
 
 /**
+ * Longest caller-influenced string a RESOURCE audit row stores. Tool rows
+ * go through `recordEntry`, which stores `args` and `errorMessage`
+ * verbatim; `docs/audit-log.md` states that scope and points at
+ * `metadata.auditArgs` for redacting them.
+ *
+ * Counted in UTF-16 code units, like `String.prototype.length` and
+ * `slice`, so the ceiling is ~3 KiB of UTF-8 rather than 1024 bytes, and
+ * the stored value is up to 1024 units plus the marker. A resource read
+ * URI is chosen by the caller and unbounded, and it reaches a row through
+ * two columns: `resourceUri`, and `errorMessage` on the not-found branch,
+ * which embeds it. Capping here rather than in the handler is deliberate:
+ * this mutation is public because the host's HTTP handler writes it, so a
+ * cap that lived only in the handler would be a convention any other
+ * caller could skip. Uncapped, one read of a megabyte-long URI writes a
+ * megabyte, and a long enough one pushes the document past Convex's limit
+ * so the insert throws and the row for a served read is lost entirely.
+ */
+const AUDIT_TEXT_MAX_LENGTH = 1024;
+
+/**
+ * Truncate on a code-point boundary. `slice` counts UTF-16 units, so
+ * cutting between a surrogate pair leaves a lone high surrogate, which is
+ * not encodable as UTF-8 and would make the insert throw on exactly the
+ * inputs this cap exists to survive.
+ */
+function truncateAuditText(value: string): string {
+  if (value.length <= AUDIT_TEXT_MAX_LENGTH) return value;
+  let end = AUDIT_TEXT_MAX_LENGTH;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${value.slice(0, end)}…(truncated)`;
+}
+
+/**
  * Append one resource-operation audit row. Unlike `recordEntry` (written by
  * the in-component `dispatch.runTool`), resource audit is recorded by the
  * host's HTTP handler, so this must be a public `mutation` exposed on the
@@ -77,6 +111,12 @@ export const recordResourceEntry = mutation({
     return await ctx.db.insert("audit", {
       entryType: "resource",
       ...entry,
+      ...(entry.resourceUri !== undefined
+        ? { resourceUri: truncateAuditText(entry.resourceUri) }
+        : {}),
+      ...(entry.errorMessage !== undefined
+        ? { errorMessage: truncateAuditText(entry.errorMessage) }
+        : {}),
     });
   },
 });

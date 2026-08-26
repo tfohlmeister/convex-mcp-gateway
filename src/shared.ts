@@ -570,6 +570,17 @@ export function isDeliberateConvexError(err: unknown): boolean {
 }
 
 /**
+ * The reason a malformed authorizer return is denied with. Named so the
+ * gateway's own call sites can tell it apart from a deliberate policy
+ * denial and log it rather than shipping it: a host that forgets a
+ * `return` on one branch produces exactly this, and it is the likeliest
+ * first-day failure of a new authorizer branch. Not part of the package's
+ * public surface; `src/client/index.ts` does not re-export it.
+ */
+export const AUTHORIZER_INVALID_SHAPE_REASON =
+  "Authorizer returned an invalid shape. Expected `{ allowed: boolean, reason?: string }`.";
+
+/**
  * Runtime validation of the host's authorize-callback return value.
  * Lenient on extra fields (forward-compat); strict on the required
  * `allowed` boolean. Lives in `shared.ts` so both the host (`mcp-handler`)
@@ -586,8 +597,7 @@ export function parseAuthorizerDecision(
   ) {
     return {
       allowed: false,
-      reason:
-        "Authorizer returned an invalid shape. Expected `{ allowed: boolean, reason?: string }`.",
+      reason: AUTHORIZER_INVALID_SHAPE_REASON,
     };
   }
   const d = decision as { allowed: boolean; reason?: unknown };
