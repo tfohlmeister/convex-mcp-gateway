@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.11.0...v1.0.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* three exported types widen, so a consumer taking this version recompiles against them whether or not it sets `anonymousResources`. `McpResourceProvider.list` / `.read` and `McpResourceReadHandler` now receive `McpResourceCaller`, which is nullable, so a provider reading `identity.subject` unconditionally needs one narrowing check. `McpResourceAuthorizerArgs` becomes a discriminated union with a fourth `mode`, so an authorizer that switched exhaustively over the old three gains a branch. Both are no-ops at runtime for a mount that leaves the option off, where the identity is never null. `docs/resources.md` carries the upgrade note.
+
+### Features
+
+* let a host serve resources to anonymous callers ([1d4a89e](https://github.com/tfohlmeister/convex-mcp-gateway/commit/1d4a89e8394f3bd9c7946199f65ebe51508bfbb4)), closes [#51](https://github.com/tfohlmeister/convex-mcp-gateway/issues/51)
+
+
+### Bug Fixes
+
+* regenerate the component API types ([#59](https://github.com/tfohlmeister/convex-mcp-gateway/issues/59)) ([f025687](https://github.com/tfohlmeister/convex-mcp-gateway/commit/f0256875b44a3562ab4dea4a1ca918ae3ae18fae))
+
 ## [0.11.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.10.0...v0.11.0) (2026-08-17)
 
 
