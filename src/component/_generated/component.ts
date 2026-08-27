@@ -212,6 +212,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           _creationTime: number;
           _id: string;
+          authoredInputSchemaJson?: string;
+          authoredOutputSchemaJson?: string;
           description: string;
           functionHandle: string;
           identityArg?: string;
@@ -273,6 +275,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Array<{
           _creationTime: number;
           _id: string;
+          authoredInputSchemaJson?: string;
+          authoredOutputSchemaJson?: string;
           description: string;
           functionHandle: string;
           identityArg?: string;
@@ -320,6 +324,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          authoredInputSchemaJson?: string;
+          authoredOutputSchemaJson?: string;
           description: string;
           functionHandle: string;
           identityArg?: string;
@@ -376,6 +382,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           fingerprint?: string;
           tools: Array<{
+            authoredInputSchemaJson?: string;
+            authoredOutputSchemaJson?: string;
             description: string;
             functionHandle: string;
             identityArg?: string;
