@@ -72,7 +72,7 @@ function request(
           "io.modelcontextprotocol/protocolVersion": "2026-07-28",
           "io.modelcontextprotocol/clientCapabilities":
             options.clientCapabilities ?? {
-              "io.modelcontextprotocol/tasks": {},
+              extensions: { "io.modelcontextprotocol/tasks": {} },
             },
         },
       },
@@ -85,6 +85,7 @@ type Call = { ref: unknown; args: Record<string, unknown> };
 function harness(tasks: McpTasksOptions | undefined) {
   const api = component();
   const mutations: Call[] = [];
+  let cancelOutcome: Record<string, unknown> | null = null;
   const taskRow = {
     taskId: "task-1",
     toolName: registeredTool.name,
@@ -106,7 +107,12 @@ function harness(tasks: McpTasksOptions | undefined) {
         return { created: true, task: taskRow };
       }
       if (ref === api.tasks.cancelTaskForOwner) {
-        return { outcome: "cancelled", task: { ...taskRow, status: "cancelled" } };
+        return (
+          cancelOutcome ?? {
+            outcome: "cancelled",
+            task: { ...taskRow, status: "cancelled" },
+          }
+        );
       }
       if (ref === api.tasks.submitInputResponsesForOwner) {
         return { outcome: "accepted", task: taskRow };
@@ -122,7 +128,19 @@ function harness(tasks: McpTasksOptions | undefined) {
     authorize: async () => ({ allowed: true as const }),
     ...(tasks !== undefined ? { tasks } : {}),
   };
-  return { api, ctx, mutations, options };
+  return {
+    api,
+    ctx,
+    mutations,
+    options,
+    // Mutable so a test can age the row or settle it without a second
+    // harness: the timestamps and the cancel outcome are exactly what
+    // the wire shape is derived from.
+    taskRow,
+    setCancelOutcome: (outcome: Record<string, unknown>) => {
+      cancelOutcome = outcome;
+    },
+  };
 }
 
 describe("task-augmented tools/call with a host executor", () => {
@@ -152,10 +170,30 @@ describe("task-augmented tools/call with a host executor", () => {
     );
 
     const body = (await response.json()) as {
-      result: { resultType: string; task: { pollIntervalMs: number } };
+      result: {
+        resultType: string;
+        taskId: string;
+        status: string;
+        pollIntervalMs: number;
+        createdAt: string;
+        lastUpdatedAt: string;
+        ttlMs: number;
+        task?: unknown;
+      };
     };
+    // SEP-2663: `Result & Task`, flat, with no nested wrapper.
     expect(body.result.resultType).toBe("task");
-    expect(body.result.task.pollIntervalMs).toBe(500);
+    expect(body.result.task).toBeUndefined();
+    expect(body.result.pollIntervalMs).toBe(500);
+    expect(body.result.taskId).toBe("task-1");
+    expect(body.result.status).toBe("working");
+    // The fixture row is long expired, so the remaining lifetime floors
+    // at zero rather than going negative. The arithmetic itself is
+    // pinned by "ttlMs counts the lifetime that is left" below.
+    expect(body.result.ttlMs).toBe(0);
+    // ISO-8601, not the milliseconds the component stores.
+    expect(body.result.createdAt).toMatch(/^\d{4}-\d\d-\d\dT/);
+    expect(body.result.lastUpdatedAt).toMatch(/^\d{4}-\d\d-\d\dT/);
     expect(started).toHaveLength(1);
     expect(started[0]).toMatchObject({
       toolName: registeredTool.name,
@@ -239,19 +277,14 @@ describe("tasks/update hooks", () => {
     });
     const response = await handleMcpRequest(
       ctx,
-      request(
-        3,
-        "tasks/update",
-        { taskId: "task-1", action: "cancel" },
-        { name: "task-1" },
-      ),
+      request(3, "tasks/cancel", { taskId: "task-1" }, { name: "task-1" }),
       api,
       options,
     );
-    const body = (await response.json()) as {
-      result: { task: { status: string } };
-    };
-    expect(body.result.task.status).toBe("cancelled");
+    // An empty ack: the settled status is observed on the next tasks/get.
+    expect(await response.json()).toMatchObject({
+      result: { resultType: "complete" },
+    });
     expect(cancelled).toEqual(["task-1"]);
   });
 
@@ -283,12 +316,7 @@ describe("tasks/update hooks", () => {
     };
     const response = await handleMcpRequest(
       ctx,
-      request(
-        3,
-        "tasks/update",
-        { taskId: "task-1", action: "cancel" },
-        { name: "task-1" },
-      ),
+      request(3, "tasks/cancel", { taskId: "task-1" }, { name: "task-1" }),
       api,
       options,
     );
@@ -357,11 +385,13 @@ describe("tasks/update hooks", () => {
     expect(resumed).toEqual([responses]);
   });
 
-  test("update requires exactly one of action or inputResponses", async () => {
+  test("update requires inputResponses, and takes no action parameter", async () => {
     const { api, ctx, options } = harness({});
     for (const params of [
       { taskId: "task-1" },
-      { taskId: "task-1", action: "cancel", inputResponses: {} },
+      // `action` was this gateway's own spelling of cancellation before
+      // SEP-2663 gave it a method. It is not a way to reach `tasks/cancel`.
+      { taskId: "task-1", action: "cancel" },
       { taskId: "task-1", action: "pause" },
     ]) {
       const response = await handleMcpRequest(
@@ -420,10 +450,11 @@ describe("tasks/update outcomes that are not a plain acceptance", () => {
       api,
       options,
     );
-    const body = (await response.json()) as {
-      result: { task: { status: string } };
-    };
-    expect(body.result.task.status).toBe("cancelled");
+    // An all-cancel submission is still a `tasks/update`, so it acks
+    // empty like any other; the cancelled status shows up on the next get.
+    expect(await response.json()).toMatchObject({
+      result: { resultType: "complete" },
+    });
     // Stopping the host's run is the whole point: resuming it would apply
     // the side effect the owner just refused.
     expect(cancelled).toEqual(["task-1"]);
@@ -517,12 +548,7 @@ describe("mount scope", () => {
 
     await handleMcpRequest(
       ctx,
-      request(
-        32,
-        "tasks/update",
-        { taskId: "task-1", action: "cancel" },
-        { name: "task-1" },
-      ),
+      request(32, "tasks/cancel", { taskId: "task-1" }, { name: "task-1" }),
       api,
       options,
     );
@@ -530,6 +556,139 @@ describe("mount scope", () => {
       (m) => m.ref === api.tasks.cancelTaskForOwner,
     );
     expect(cancel?.args.scope).toBe("main");
+  });
+});
+
+describe("SEP-2663 wire shape", () => {
+  test("a task-augmented call names the capability it is missing", async () => {
+    const { api, ctx, options } = harness({});
+    const response = await handleMcpRequest(
+      ctx,
+      request(
+        55,
+        "tools/call",
+        { name: registeredTool.name, arguments: {}, task: {} },
+        { name: registeredTool.name, clientCapabilities: {} },
+      ),
+      api,
+      options,
+    );
+    // The same diagnosis the task methods give: same missing
+    // declaration, and this is where a client meets it first.
+    const body = (await response.json()) as {
+      error: { code: number; data: { requiredCapabilities: unknown } };
+    };
+    expect(body.error.code).toBe(-32021);
+    expect(body.error.data.requiredCapabilities).toEqual({
+      extensions: { "io.modelcontextprotocol/tasks": {} },
+    });
+  });
+
+  test("a client that never declared the extension is told what it lacks", async () => {
+    const { api, ctx, options } = harness({});
+    for (const method of ["tasks/get", "tasks/update", "tasks/cancel"]) {
+      const response = await handleMcpRequest(
+        ctx,
+        request(
+          51,
+          method,
+          { taskId: "task-1", inputResponses: {} },
+          { name: "task-1", clientCapabilities: {} },
+        ),
+        api,
+        options,
+      );
+      const body = (await response.json()) as {
+        error: { code: number; data: { requiredCapabilities: unknown } };
+      };
+      expect(body.error.code).toBe(-32021);
+      // Only what is MISSING, in the shape the client would have sent.
+      expect(body.error.data.requiredCapabilities).toEqual({
+        extensions: { "io.modelcontextprotocol/tasks": {} },
+      });
+    }
+  });
+
+  test("the capability gate runs before the identity challenge", async () => {
+    const { api, ctx, options } = harness({});
+    (ctx as { auth: unknown }).auth = { getUserIdentity: async () => null };
+    const response = await handleMcpRequest(
+      ctx,
+      request(
+        52,
+        "tasks/get",
+        { taskId: "task-1" },
+        { name: "task-1", clientCapabilities: {} },
+      ),
+      api,
+      options,
+    );
+    // Not a 401: telling an unauthenticated caller to log in for a
+    // feature it never negotiated answers the wrong question.
+    expect(response.status).not.toBe(401);
+    expect(
+      ((await response.json()) as { error: { code: number } }).error.code,
+    ).toBe(-32021);
+  });
+
+  test("ttlMs counts the lifetime that is left, not the one it had", async () => {
+    const { api, ctx, options, taskRow } = harness({});
+    const now = Date.now();
+    taskRow.createdAt = now - 60_000;
+    taskRow.updatedAt = now - 30_000;
+    taskRow.expiresAt = now + 120_000;
+
+    const response = await handleMcpRequest(
+      ctx,
+      request(53, "tasks/get", { taskId: "task-1" }, { name: "task-1" }),
+      api,
+      options,
+    );
+    const body = (await response.json()) as {
+      result: {
+        resultType: string;
+        ttlMs: number;
+        createdAt: string;
+        lastUpdatedAt: string;
+        task?: unknown;
+      };
+    };
+    // A poll is an ordinary answer, so `complete`; only a creating call
+    // carries the `task` discriminator.
+    expect(body.result.resultType).toBe("complete");
+    expect(body.result.task).toBeUndefined();
+    expect(body.result.ttlMs).toBeGreaterThan(100_000);
+    expect(body.result.ttlMs).toBeLessThanOrEqual(120_000);
+    expect(body.result.createdAt).toBe(new Date(now - 60_000).toISOString());
+    expect(body.result.lastUpdatedAt).toBe(
+      new Date(now - 30_000).toISOString(),
+    );
+    // SEP-2549 and SEP-2663 both spell a duration on a result `ttlMs`.
+    // A task result carries the task's meaning, so the caching hint must
+    // not be injected here: a `cacheScope` beside a task lifetime would
+    // read as "cache this poll for the task's whole life", and polling is
+    // exactly what must not be cached.
+    expect(
+      (body.result as { cacheScope?: string }).cacheScope,
+    ).toBeUndefined();
+  });
+
+  test("cancelling an already terminal task acks like a live one", async () => {
+    const { api, ctx, options, setCancelOutcome } = harness({});
+    setCancelOutcome({ outcome: "conflict", status: "completed" });
+
+    const response = await handleMcpRequest(
+      ctx,
+      request(54, "tasks/cancel", { taskId: "task-1" }, { name: "task-1" }),
+      api,
+      options,
+    );
+    // Idempotent: SEP-2663 reserves an error for an id the server does
+    // not know, not for work that already finished.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      result: { resultType: "complete" },
+    });
   });
 });
 
@@ -820,7 +979,7 @@ describe("a task-capable tool with an MRTR beforeCall hook", () => {
       {
         name: mrtrTool.name,
         clientCapabilities: {
-          "io.modelcontextprotocol/tasks": {},
+          extensions: { "io.modelcontextprotocol/tasks": {} },
           elicitation: { form: {} },
         },
       },
@@ -879,20 +1038,20 @@ describe("a task-capable tool with an MRTR beforeCall hook", () => {
 
     const second = (await (
       await handleMcpRequest(ctx, taskCall(2, continuation), api, options)
-    ).json()) as { result: { task: { taskId: string } } };
+    ).json()) as { result: { taskId: string } };
     // Replaying the continuation is a legitimate lost-response retry, and
     // it reaches createTask again with the SAME key (the chain key). The
     // component answers with the task that key already owns, so the
     // client keeps one handle, one TTL and one audit trail.
     const third = (await (
       await handleMcpRequest(ctx, taskCall(3, continuation), api, options)
-    ).json()) as { result: { task: { taskId: string } } };
+    ).json()) as { result: { taskId: string } };
     const keys = mutations
       .filter((m) => m.ref === api.tasks.createTask)
       .map((m) => m.args.idempotencyKey);
     expect(keys).toHaveLength(2);
     expect(keys[0]).toBe(keys[1]);
-    expect(third.result.task.taskId).toBe(second.result.task.taskId);
+    expect(third.result.taskId).toBe(second.result.taskId);
   });
 
   test("a forked branch cannot create a task once a sibling settled the chain", async () => {

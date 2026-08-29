@@ -44,12 +44,24 @@ gateway.handleMcpRequest(ctx, request, {
 ## Wire contract
 
 - `tools/call` with `params.task` (an object; optional numeric `ttlMs`)
-  returns `resultType: "task"` with
-  `task: { taskId, toolName, status, createdAt, updatedAt, expiresAt, pollIntervalMs }`
-  instead of running the tool inline. The client must declare the
-  `io.modelcontextprotocol/tasks` capability in its per-request
-  `clientCapabilities`.
+  returns a **flat** `CreateTaskResult` instead of running the tool
+  inline: `resultType: "task"` alongside `taskId`, `status`,
+  `createdAt`, `lastUpdatedAt`, `ttlMs` and `pollIntervalMs`, with no
+  nested `task` key. Timestamps are ISO-8601 and `ttlMs` is the lifetime
+  the task has **left**, counted from the moment it is read, so a client
+  polling twice is told how much longer it may keep going rather than how
+  long it could have.
+
+  The client must declare the extension in its per-request
+  `clientCapabilities`, under `extensions`:
+  `{ extensions: { "io.modelcontextprotocol/tasks": {} } }`. The server
+  advertises the same key under `capabilities.extensions` in
+  `server/discover`, and that capability object is empty: the poll
+  interval belongs to a task, and arrives with one.
 - `tasks/get` (`params.taskId`, mirrored in `Mcp-Name`) polls the task.
+  It answers `resultType: "complete"` with the task's fields flat
+  alongside it. Only a call that *creates* a task carries the `task`
+  discriminator.
   A completed task carries `result`; a failed one carries
   `error: { code, message }`; an `input_required` one carries
   `inputRequests`.
@@ -99,11 +111,14 @@ gateway.handleMcpRequest(ctx, request, {
   where the same condition surfaces as a tool result: a queued call cannot
   re-challenge the caller, so it fails rather than reporting a refusal as
   a call that ran.
-- `tasks/update` (`params.taskId`, mirrored in `Mcp-Name`) takes exactly
-  one of:
-  - `action: "cancel"`: cancels a non-terminal task. Idempotent; a task
-    that already completed or failed answers with an error because its
-    outcome must stay observable.
+- `tasks/cancel` (`params.taskId`, mirrored in `Mcp-Name`) cancels a
+  task and answers an empty `{ resultType: "complete" }` ack.
+  Cancellation is cooperative and idempotent: a task that already
+  reached a terminal status answers the same ack, and the status a
+  cancel settles to is read from the next `tasks/get`. An error is
+  reserved for a task id the server does not know.
+- `tasks/update` (`params.taskId`, mirrored in `Mcp-Name`) answers an
+  input round, and acks empty. It takes:
   - `inputResponses`: MRTR-shaped answers
     (`{ key: { action: "accept" | "decline" | "cancel", content? } }`)
     for an `input_required` task, plus `inputRound` echoed from the
@@ -126,6 +141,26 @@ gateway.handleMcpRequest(ctx, request, {
 Task methods exist only on the stateless path. A session-based request that
 carries `params.task` is rejected loudly (never run synchronously as a
 silent fallback), and legacy `tasks/*` methods are unknown methods.
+
+A caller that never declared the extension is answered
+`-32021 MissingRequiredClientCapability` at HTTP `400`, with
+`data.requiredCapabilities` naming what to add:
+
+```json
+{ "requiredCapabilities": { "extensions": { "io.modelcontextprotocol/tasks": {} } } }
+```
+
+That applies to `tasks/get`, `tasks/update` and `tasks/cancel` as well as
+to a task-augmented `tools/call`, and it is checked before the caller is
+challenged to authenticate: telling a client to log in for a feature it
+never negotiated answers the wrong question.
+
+A task result carries **no caching hints**, unlike every other stateless
+result. SEP-2549 reads `ttlMs` on a result as a cache lifetime and
+SEP-2663 puts a `ttlMs` on the task meaning its remaining lifetime, so
+the two share a key; the task meaning wins, because a client that cannot
+read the remaining lifetime cannot know when to stop polling. A poll is
+uncacheable by nature.
 
 ## Ownership and privacy
 
@@ -403,7 +438,7 @@ it is scheduled inside the creating mutation.
 **Hooks are at-least-once and must be idempotent.** A hook that throws
 is logged and the client's update still succeeds (the state is already
 durably committed). The retry path is wire-driven: an idempotent repeat
-of the same `tasks/update` (re-sent responses, repeated cancel)
+of the same `tasks/update` (re-sent responses) or `tasks/cancel`
 re-fires the corresponding hook, so a resume or cancel notification
 that failed once is not lost forever. Resuming the same workflow twice
 or cancelling an already-cancelled run must therefore be safe.

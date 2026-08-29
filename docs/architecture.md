@@ -499,7 +499,8 @@ host configures the `tasks` handler option; without both, nothing is
 advertised and every task method answers as an unknown method. A
 task-augmented `tools/call` runs the full authorize pipeline, then
 creates a durable task row and returns a handle instead of dispatching;
-the client polls `tasks/get` and mutates via `tasks/update`. A legacy
+the client polls `tasks/get`, answers input rounds with
+`tasks/update`, and cancels with `tasks/cancel`. A legacy
 request carrying a task request is rejected loudly, never silently run
 inline, and anonymous callers get the real `401` + `WWW-Authenticate`
 challenge because a task they could not poll must never be created.
