@@ -435,7 +435,8 @@ infrastructure.
 Modern clients can run a tool as an MCP task
 (`io.modelcontextprotocol/tasks`): `tools/call` with a `task` request
 returns a handle immediately, and the client polls `tasks/get` for the
-outcome; `tasks/update` cancels or answers `input_required` rounds.
+outcome; `tasks/update` answers `input_required` rounds and
+`tasks/cancel` cancels.
 Doubly opt-in: register the tool with `taskSupport: true` AND configure
 the `tasks` option; the capability is not advertised otherwise.
 

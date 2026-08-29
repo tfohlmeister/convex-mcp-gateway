@@ -351,6 +351,42 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
+  test("advertises MCP Tasks under `extensions`, and only when configured", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+
+    const withoutTasks = await readJson(
+      await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({ id: 1, method: "server/discover" }),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      ),
+    );
+    expect(
+      (withoutTasks as { result: { capabilities: Record<string, unknown> } })
+        .result.capabilities.extensions,
+    ).toBeUndefined();
+
+    const withTasks = (await readJson(
+      await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({ id: 2, method: "server/discover" }),
+        component,
+        { authorize: async () => ({ allowed: true }), tasks: {} },
+      ),
+    )) as { result: { capabilities: Record<string, unknown> } };
+    // SEP-2663 nests every extension under this key, and the capability
+    // object is empty: `pollIntervalMs` belongs to a task, not to the
+    // negotiation, so it rides on each task instead.
+    expect(withTasks.result.capabilities.extensions).toEqual({
+      "io.modelcontextprotocol/tasks": {},
+    });
+    expect(
+      withTasks.result.capabilities["io.modelcontextprotocol/tasks"],
+    ).toBeUndefined();
+  });
+
   test("syncs a declarative catalog before modern discovery", async () => {
     const component = createComponent();
     const state = createCtx(component);

@@ -3338,7 +3338,7 @@ describe("MCP tasks (modern, e2e)", () => {
     vi.useRealTimers();
   });
 
-  const TASK_CAPS = { "io.modelcontextprotocol/tasks": {} };
+  const TASK_CAPS = { extensions: { "io.modelcontextprotocol/tasks": {} } };
 
   function statelessBody(
     id: number,
@@ -3409,13 +3409,13 @@ describe("MCP tasks (modern, e2e)", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      result: { resultType: string; task: { taskId: string; status: string } };
+      result: { resultType: string; taskId: string; status: string };
       error?: unknown;
     };
     expect(body.error, JSON.stringify(body.error)).toBeUndefined();
     expect(body.result.resultType).toBe("task");
-    expect(body.result.task.status).toBe("working");
-    return body.result.task.taskId;
+    expect(body.result.status).toBe("working");
+    return body.result.taskId;
   }
 
   async function getTask(
@@ -3432,12 +3432,13 @@ describe("MCP tasks (modern, e2e)", () => {
     return (await res.json()) as {
       result?: {
         resultType: string;
-        task: {
-          status: string;
-          result?: unknown;
-          error?: { code: number; message: string };
-          pollIntervalMs?: number;
-        };
+        status: string;
+        result?: unknown;
+        error?: { code: number; message: string };
+        pollIntervalMs?: number;
+        ttlMs?: number;
+        createdAt?: string;
+        lastUpdatedAt?: string;
       };
       error?: { code: number; message: string };
     };
@@ -3457,18 +3458,18 @@ describe("MCP tasks (modern, e2e)", () => {
 
     // Deferred: the mutation has not run yet, the task is polling-ready.
     const pending = await getTask(t, taskId);
-    expect(pending.result?.task.status).toBe("working");
-    expect(pending.result?.task.pollIntervalMs).toBe(2000);
+    expect(pending.result?.status).toBe("working");
+    expect(pending.result?.pollIntervalMs).toBe(2000);
 
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
 
     const done = await getTask(t, taskId);
-    expect(done.result?.task.status).toBe("completed");
+    expect(done.result?.status).toBe("completed");
     // The stored result is the same CallToolResult a synchronous call
     // returns: renderable `content`, `structuredContent` because the tool
     // declares an outputSchema, and `isError`.
-    expect(done.result?.task.result).toEqual({
+    expect(done.result?.result).toEqual({
       // Compact rather than pretty-printed: the task envelope is derived
       // inside a Convex query on every poll, where indentation that
       // multiplies with nesting depth would eventually make a completed
@@ -3533,7 +3534,7 @@ describe("MCP tasks (modern, e2e)", () => {
             name: "invoices_archiveAfterConfirmation",
             as: "alice",
             clientCapabilities: {
-              "io.modelcontextprotocol/tasks": {},
+              extensions: { "io.modelcontextprotocol/tasks": {} },
               elicitation: { form: {} },
             },
           },
@@ -3571,14 +3572,14 @@ describe("MCP tasks (modern, e2e)", () => {
             name: "invoices_archiveAfterConfirmation",
             as: "alice",
             clientCapabilities: {
-              "io.modelcontextprotocol/tasks": {},
+              extensions: { "io.modelcontextprotocol/tasks": {} },
               elicitation: { form: {} },
             },
           },
         )
-      ).json()) as { result: { resultType: string; task: { taskId: string } } };
+      ).json()) as { result: { resultType: string; taskId: string } };
       expect(second.result.resultType).toBe("task");
-      const taskId = second.result.task.taskId;
+      const taskId = second.result.taskId;
 
       const row = (await t.run(async (ctx) =>
         ctx.runQuery(components.mcpGateway.tasks.getTaskInternal, { taskId }),
@@ -3589,12 +3590,12 @@ describe("MCP tasks (modern, e2e)", () => {
 
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const done = await getTask(t, taskId);
-      expect(done.result?.task.status).toBe("completed");
+      expect(done.result?.status).toBe("completed");
       // This tool declares no `returns`, so it advertises no outputSchema
       // and its task result must carry no `structuredContent` either. The
       // synchronous path is asserted the same way elsewhere; that symmetry
       // is the whole point of wrapping in the executor.
-      const envelope = done.result!.task.result as Record<string, unknown>;
+      const envelope = done.result!.result as Record<string, unknown>;
       expect(envelope.isError).toBe(false);
       expect(Array.isArray(envelope.content)).toBe(true);
       expect("structuredContent" in envelope).toBe(false);
@@ -3623,8 +3624,8 @@ describe("MCP tasks (modern, e2e)", () => {
       const taskId = await startRecountTask(t, { padResult: 200 * 1024 });
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const done = await getTask(t, taskId);
-      expect(done.result?.task.status).toBe("completed");
-      const envelope = done.result!.task.result as {
+      expect(done.result?.status).toBe("completed");
+      const envelope = done.result!.result as {
         content: Array<{ text: string }>;
         structuredContent: { pad?: string };
       };
@@ -3647,8 +3648,8 @@ describe("MCP tasks (modern, e2e)", () => {
       });
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const failed = await getTask(t, taskId);
-      expect(failed.result?.task.status).toBe("failed");
-      expect(failed.result?.task.error?.message).toMatch(/262144 serialized/);
+      expect(failed.result?.status).toBe("failed");
+      expect(failed.result?.error?.message).toMatch(/262144 serialized/);
     } finally {
       vi.useRealTimers();
     }
@@ -3666,9 +3667,9 @@ describe("MCP tasks (modern, e2e)", () => {
       const taskId = await startRecountTask(t, { bigintResult: true });
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const failed = await getTask(t, taskId);
-      expect(failed.result?.task.status).toBe("failed");
-      expect(failed.result?.task.error?.message).toMatch(/cannot be serialized/);
-      expect(failed.result?.task.error?.message).not.toMatch(/262144/);
+      expect(failed.result?.status).toBe("failed");
+      expect(failed.result?.error?.message).toMatch(/cannot be serialized/);
+      expect(failed.result?.error?.message).not.toMatch(/262144/);
     } finally {
       vi.useRealTimers();
     }
@@ -3685,7 +3686,7 @@ describe("MCP tasks (modern, e2e)", () => {
       // Same tool, same args, both paths.
       const taskId = await startRecountTask(t);
       await t.finishAllScheduledFunctions(vi.runAllTimers);
-      const viaTask = (await getTask(t, taskId)).result?.task.result;
+      const viaTask = (await getTask(t, taskId)).result?.result;
 
       const sync = (await (
         await statelessRpc(
@@ -3744,8 +3745,8 @@ describe("MCP tasks (modern, e2e)", () => {
     // result says isError, exactly as on the synchronous path: the model
     // can read it and retry. `failed` is reserved for the task itself
     // failing (unknown tool, kind drift, a dispatch that never ran).
-    expect(failed.result?.task.status).toBe("completed");
-    const errorResult = failed.result?.task.result as {
+    expect(failed.result?.status).toBe("completed");
+    const errorResult = failed.result?.result as {
       content: Array<{ text: string }>;
       isError: boolean;
     };
@@ -3763,8 +3764,8 @@ describe("MCP tasks (modern, e2e)", () => {
       });
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const failed = await getTask(t, taskId);
-      expect(failed.result?.task.status).toBe("completed");
-      const sanitized = failed.result?.task.result as {
+      expect(failed.result?.status).toBe("completed");
+      const sanitized = failed.result?.result as {
         content: Array<{ text: string }>;
         isError: boolean;
       };
@@ -3806,33 +3807,33 @@ describe("MCP tasks (modern, e2e)", () => {
     const cancel = await statelessRpc(
       t,
       2,
-      "tasks/update",
-      { taskId, action: "cancel" },
+      "tasks/cancel",
+      { taskId },
       { name: taskId, as: "alice" },
     );
-    const cancelBody = (await cancel.json()) as {
-      result: { task: { status: string } };
-    };
-    expect(cancelBody.result.task.status).toBe("cancelled");
+    // An empty ack; the settled status is what the poll below reads.
+    expect(await cancel.json()).toMatchObject({
+      result: { resultType: "complete" },
+    });
 
     // The scheduled executor observes the cancel and leaves the row alone.
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
     const after = await getTask(t, taskId);
-    expect(after.result?.task.status).toBe("cancelled");
-    expect(after.result?.task.result).toBeUndefined();
+    expect(after.result?.status).toBe("cancelled");
+    expect(after.result?.result).toBeUndefined();
 
+    // Idempotent, and on an already terminal task: the same empty ack.
     const repeat = await statelessRpc(
       t,
       3,
-      "tasks/update",
-      { taskId, action: "cancel" },
+      "tasks/cancel",
+      { taskId },
       { name: taskId, as: "alice" },
     );
-    const repeatBody = (await repeat.json()) as {
-      result: { task: { status: string } };
-    };
-    expect(repeatBody.result.task.status).toBe("cancelled");
+    expect(await repeat.json()).toMatchObject({
+      result: { resultType: "complete" },
+    });
   });
 
   test("tasks never leak across callers", async () => {
@@ -3892,10 +3893,19 @@ describe("MCP tasks (modern, e2e)", () => {
       { name: "invoices_recount", clientCapabilities: {}, as: "alice" },
     );
     const noCapBody = (await noCap.json()) as {
-      error?: { code: number; message: string };
+      error?: {
+        code: number;
+        message: string;
+        data?: { requiredCapabilities?: unknown };
+      };
     };
-    expect(noCapBody.error?.code).toBe(-32602);
+    // MissingRequiredClientCapability, naming what to add rather than
+    // calling the params invalid.
+    expect(noCapBody.error?.code).toBe(-32021);
     expect(noCapBody.error?.message).toMatch(/client capability/);
+    expect(noCapBody.error?.data?.requiredCapabilities).toEqual({
+      extensions: { "io.modelcontextprotocol/tasks": {} },
+    });
 
     // Tool without taskSupport.
     const wrongTool = await statelessRpc(
@@ -3967,9 +3977,11 @@ describe("MCP tasks (modern, e2e)", () => {
     const discoverBody = (await discover.json()) as {
       result: { capabilities: Record<string, unknown> };
     };
-    expect(
-      discoverBody.result.capabilities["io.modelcontextprotocol/tasks"],
-    ).toEqual({ pollIntervalMs: 2000 });
+    // SEP-2663 nests it, and the capability object itself is empty: the
+    // poll interval is a property of each task, and arrives with one.
+    expect(discoverBody.result.capabilities.extensions).toEqual({
+      "io.modelcontextprotocol/tasks": {},
+    });
 
     const list = await statelessRpc(t, 11, "tools/list", {}, { as: "alice" });
     const listBody = (await list.json()) as {
@@ -4006,7 +4018,7 @@ describe("MCP tasks (host executor, e2e)", () => {
   });
 
   const PATH = "/mcp-host-tasks/";
-  const TASK_CAPS = { "io.modelcontextprotocol/tasks": {} };
+  const TASK_CAPS = { extensions: { "io.modelcontextprotocol/tasks": {} } };
 
   async function hostRpc(
     t: ReturnType<typeof newTest>,
@@ -4049,12 +4061,12 @@ describe("MCP tasks (host executor, e2e)", () => {
       { name: "invoices_bulkMarkPaid" },
     );
     const body = (await res.json()) as {
-      result: { resultType: string; task: { taskId: string } };
+      result: { resultType: string; taskId: string };
       error?: unknown;
     };
     expect(body.error, JSON.stringify(body.error)).toBeUndefined();
     expect(body.result.resultType).toBe("task");
-    return body.result.task.taskId;
+    return body.result.taskId;
   }
 
   async function pollTask(t: ReturnType<typeof newTest>, taskId: string) {
@@ -4062,16 +4074,14 @@ describe("MCP tasks (host executor, e2e)", () => {
     return (
       (await res.json()) as {
         result?: {
-          task: {
-            status: string;
-            inputRequests?: Record<string, unknown>;
-            inputRound?: number;
-            result?: unknown;
-            error?: { message: string };
-          };
+          status: string;
+          inputRequests?: Record<string, unknown>;
+          inputRound?: number;
+          result?: unknown;
+          error?: { message: string };
         };
       }
-    ).result?.task;
+    ).result;
   }
 
   async function answer(
@@ -4223,8 +4233,8 @@ describe("MCP tasks (host executor, e2e)", () => {
     // Its own mount still sees it.
     const own = (await (
       await hostRpc(t, 61, "tasks/get", { taskId }, { name: taskId })
-    ).json()) as { result?: { task: { status: string } } };
-    expect(own.result?.task.status).toBe("input_required");
+    ).json()) as { result?: { status: string } };
+    expect(own.result?.status).toBe("input_required");
   });
 
   test("a synchronous call of the task-only tool refuses to run", async () => {

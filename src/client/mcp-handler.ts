@@ -889,6 +889,7 @@ const FORBIDDEN = -32003;
 const INVALID_PARAMS = -32602;
 const INTERNAL_ERROR = -32603;
 const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+const MISSING_REQUIRED_CLIENT_CAPABILITY = -32021;
 const HEADER_MISMATCH = -32020;
 
 /** Advertised default `tasks/get` polling hint (milliseconds). */
@@ -903,6 +904,61 @@ const TASK_DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /** Capability / extension key for MCP Tasks. */
 const TASKS_CAPABILITY_KEY = "io.modelcontextprotocol/tasks";
+
+/**
+ * Whether the caller declared MCP Tasks. SEP-2663 puts the declaration
+ * under `extensions`, on both sides: the client nests it in the
+ * `clientCapabilities` it sends per request, the server in the
+ * capabilities `server/discover` returns.
+ */
+function declaresTasksExtension(
+  clientCapabilities: Record<string, unknown> | null,
+): boolean {
+  const extensions = clientCapabilities?.extensions;
+  return (
+    isPlainObject(extensions) && isPlainObject(extensions[TASKS_CAPABILITY_KEY])
+  );
+}
+
+/**
+ * The `data.requiredCapabilities` of a `-32021`, which names only what
+ * is MISSING and mirrors the shape the client would have had to send.
+ */
+const TASKS_REQUIRED_CAPABILITIES = {
+  extensions: { [TASKS_CAPABILITY_KEY]: {} },
+} as const;
+
+/**
+ * A component task descriptor as the wire wants it.
+ *
+ * SEP-2663 flattened the envelope: a `CreateTaskResult` is `Result &
+ * Task` with no nested `task` key, timestamps are ISO-8601, and the
+ * lifetime is a duration (`ttlMs`) rather than the absolute instant the
+ * component stores. `pollIntervalMs` rides on the task rather than on
+ * the capability, which is where a client is told how often to poll.
+ *
+ * `ttlMs` counts from now, not from creation, so a client that polls a
+ * task twice is told how much longer it may keep polling rather than how
+ * long it could have.
+ */
+function taskWireFields(
+  descriptor: {
+    createdAt: number;
+    updatedAt: number;
+    expiresAt: number;
+    [key: string]: unknown;
+  },
+  pollIntervalMs: number,
+): Record<string, unknown> {
+  const { createdAt, updatedAt, expiresAt, ...rest } = descriptor;
+  return {
+    ...rest,
+    createdAt: new Date(createdAt).toISOString(),
+    lastUpdatedAt: new Date(updatedAt).toISOString(),
+    ttlMs: Math.max(0, expiresAt - Date.now()),
+    pollIntervalMs,
+  };
+}
 
 /**
  * What the MCP client is told when host code threw instead of returning
@@ -1346,6 +1402,7 @@ function statelessNameMatches(message: JsonRpcMessage, request: Request): boolea
       return headerName === message.params?.name;
     case "tasks/get":
     case "tasks/update":
+    case "tasks/cancel":
       return headerName === message.params?.taskId;
     default:
       return true;
@@ -1536,12 +1593,21 @@ function finalizeStatelessResult(
     method === "tools/list" ||
     method === "resources/list" ||
     method === "resources/templates/list" ||
-    method === "resources/read" ||
-    method === "tasks/get"
+    method === "resources/read"
   ) {
     envelope.result.ttlMs ??= 0;
     envelope.result.cacheScope ??= "private";
   }
+  // `tasks/get` is deliberately absent. SEP-2549 reads `ttlMs` on a
+  // result as "how long you may cache this"; SEP-2663 puts a `ttlMs` on
+  // the Task itself, meaning "how much lifetime is left", and a task
+  // result carries the task's fields inline, so the two SEPs share one
+  // key. The task meaning wins: a client that cannot read the remaining
+  // lifetime cannot know when to stop polling. Injecting the cache hint
+  // here would be swallowed by the task's own value and would then tell
+  // a caching client to keep one poll for the task's whole life, which
+  // is the single response that must never be cached. A poll is
+  // uncacheable by nature, so there is no hint worth fighting over.
   return JSON.stringify(envelope);
 }
 
@@ -2246,7 +2312,7 @@ async function askMrtrInput(
     return {
       response: statelessErrorResponse(
         input.id,
-        -32021,
+        MISSING_REQUIRED_CLIENT_CAPABILITY,
         "Client lacks a capability required for MRTR input requests",
         // Per spec, data.requiredCapabilities lists only what is MISSING,
         // not the full required set.
@@ -3577,14 +3643,12 @@ async function handlePost(
           tools: {},
           ...(advertiseResources ? { resources: {} } : {}),
           // Opt-in negotiation: tasks are advertised only when the host
-          // configured task execution, per the extension contract.
+          // configured task execution, per the extension contract, and
+          // under `extensions` where SEP-2663 puts it. The capability
+          // object itself is empty: `pollIntervalMs` is a property of
+          // each task, and rides on the task.
           ...(options.tasks
-            ? {
-                "io.modelcontextprotocol/tasks": {
-                  pollIntervalMs:
-                    options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS,
-                },
-              }
+            ? { extensions: { [TASKS_CAPABILITY_KEY]: {} } }
             : {}),
         },
       });
@@ -4931,15 +4995,19 @@ async function handlePost(
           );
           break;
         }
-        if (
-          !isPlainObject(statelessClientCapabilities?.[TASKS_CAPABILITY_KEY])
-        ) {
-          body = jsonErrorEnvelope(
+        if (!declaresTasksExtension(statelessClientCapabilities)) {
+          // The same diagnosis the task methods give, because it is the
+          // same missing declaration, and this is where a client meets it
+          // first: naming the capability in machine-readable form is what
+          // lets it fix the request rather than guess at "invalid params".
+          raw = statelessErrorResponse(
             message.id,
-            INVALID_PARAMS,
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
             `Task-augmented calls require the ${TASKS_CAPABILITY_KEY} ` +
               "client capability",
+            { requiredCapabilities: TASKS_REQUIRED_CAPABILITIES },
           );
+          body = "";
           break;
         }
         if (
@@ -5758,11 +5826,10 @@ async function handlePost(
         }
         body = jsonResultEnvelope(message.id, {
           resultType: "task",
-          task: {
-            ...descriptor_,
-            pollIntervalMs:
-              options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS,
-          },
+          ...taskWireFields(
+            descriptor_,
+            options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS,
+          ),
         });
         break;
       }
@@ -5865,6 +5932,7 @@ async function handlePost(
     }
 
     case "tasks/get":
+    case "tasks/cancel":
     case "tasks/update": {
       // Task methods exist only on the stateless protocol: a session-based client
       // could never have created a task in the first place.
@@ -5886,6 +5954,21 @@ async function handlePost(
         );
         break;
       }
+      // Before the identity gate and before the lookup: a client that
+      // never negotiated the extension is told what it is missing rather
+      // than being challenged to authenticate for a feature it has not
+      // asked for. SEP-2663 names `-32021` for exactly this.
+      if (!declaresTasksExtension(statelessClientCapabilities)) {
+        raw = statelessErrorResponse(
+          message.id,
+          MISSING_REQUIRED_CLIENT_CAPABILITY,
+          `${message.method} requires the ${TASKS_CAPABILITY_KEY} client ` +
+            "capability",
+          { requiredCapabilities: TASKS_REQUIRED_CAPABILITIES },
+        );
+        body = "";
+        break;
+      }
       if (!identity) {
         // Tasks are owner-bound; without an identity there is nothing a
         // task lookup could legally return. 401 + WWW-Authenticate so
@@ -5902,86 +5985,7 @@ async function handlePost(
       const pollIntervalMs =
         options.tasks.pollIntervalMs ?? TASK_POLL_INTERVAL_MS;
 
-      if (message.method === "tasks/get") {
-        const task = await ctx.runQuery(component.tasks.getTaskForOwner, {
-          taskId,
-          ownerSubject: identity.subject,
-          // Scope binds the task to the mount that created it: without
-          // it, a mount with a narrower policy can serve a task the
-          // caller started on a broader one.
-          ...(options.tasks.scope !== undefined
-            ? { scope: options.tasks.scope }
-            : {}),
-        });
-        if (!task) {
-          // Unknown, foreign, and expired ids answer identically so a
-          // task's existence never leaks across callers.
-          body = jsonErrorEnvelope(
-            message.id,
-            INVALID_PARAMS,
-            `Unknown task: ${taskId}`,
-          );
-          break;
-        }
-        body = jsonResultEnvelope(message.id, {
-          resultType: "task",
-          task: { ...task, pollIntervalMs },
-        });
-        break;
-      }
-
-      // tasks/update: exactly one of `action: "cancel"` or MRTR-shaped
-      // `inputResponses`.
-      const updateAction = message.params?.action;
-      const inputResponses = message.params?.inputResponses;
-      // The round the client is answering, echoed from the descriptor it
-      // polled. Optional, but a malformed value is rejected rather than
-      // coerced to "absent": absence is itself meaningful (it means
-      // "answering a task that never asked a round"), so coercing `"1"`
-      // or `1.5` would answer a client's type bug with the factually
-      // wrong "these responses answer a superseded input round".
-      const inputRoundRaw = message.params?.inputRound;
-      const inputRound =
-        inputRoundRaw === undefined ? undefined : Number(inputRoundRaw);
-      if (
-        inputRoundRaw !== undefined &&
-        !(
-          typeof inputRoundRaw === "number" &&
-          Number.isSafeInteger(inputRoundRaw) &&
-          inputRoundRaw >= 0
-        )
-      ) {
-        body = jsonErrorEnvelope(
-          message.id,
-          INVALID_PARAMS,
-          "inputRound must be a non-negative integer",
-        );
-        break;
-      }
-      if (
-        (updateAction === undefined) === (inputResponses === undefined) ||
-        (updateAction !== undefined && updateAction !== "cancel")
-      ) {
-        body = jsonErrorEnvelope(
-          message.id,
-          INVALID_PARAMS,
-          'tasks/update requires exactly one of action: "cancel" or ' +
-            "inputResponses",
-        );
-        break;
-      }
-      // Reject a deeply nested inputResponses before it reaches the
-      // submit mutation's serialization (would overflow into a raw 500).
-      if (inputResponses !== undefined && nestsTooDeep(inputResponses)) {
-        body = jsonErrorEnvelope(
-          message.id,
-          INVALID_PARAMS,
-          "inputResponses nest too deeply",
-        );
-        break;
-      }
-
-      if (updateAction === "cancel") {
+      if (message.method === "tasks/cancel") {
         const cancelled = await ctx.runMutation(
           component.tasks.cancelTaskForOwner,
           {
@@ -6001,11 +6005,12 @@ async function handlePost(
           break;
         }
         if (cancelled.outcome === "conflict") {
-          body = jsonErrorEnvelope(
-            message.id,
-            INVALID_PARAMS,
-            `Task is already ${cancelled.status} and cannot be cancelled`,
-          );
+          // Already terminal. SEP-2663 makes cancellation idempotent and
+          // reserves an error for an id the server does not know, so this
+          // answers the same empty ack a live task does. The settled
+          // status is observed on the next `tasks/get`, which is where
+          // the spec puts it either way.
+          body = jsonResultEnvelope(message.id, { resultType: "complete" });
           break;
         }
         // Notify the host so it can stop its workflow run. Idempotent
@@ -6042,12 +6047,92 @@ async function handlePost(
             cancelled.task.toolName,
           );
         }
+        // An empty ack, not a task envelope: the discriminator belongs to
+        // the creating call, and cancellation is cooperative, so the
+        // status this settles to is whatever the next `tasks/get` reports.
+        body = jsonResultEnvelope(message.id, { resultType: "complete" });
+        break;
+      }
+
+      if (message.method === "tasks/get") {
+        const task = await ctx.runQuery(component.tasks.getTaskForOwner, {
+          taskId,
+          ownerSubject: identity.subject,
+          // Scope binds the task to the mount that created it: without
+          // it, a mount with a narrower policy can serve a task the
+          // caller started on a broader one.
+          ...(options.tasks.scope !== undefined
+            ? { scope: options.tasks.scope }
+            : {}),
+        });
+        if (!task) {
+          // Unknown, foreign, and expired ids answer identically so a
+          // task's existence never leaks across callers.
+          body = jsonErrorEnvelope(
+            message.id,
+            INVALID_PARAMS,
+            `Unknown task: ${taskId}`,
+          );
+          break;
+        }
+        // `tasks/get` is an ordinary answer about a task, not the
+        // creation of one, so it carries `complete` like every other
+        // non-creating result. Only `tools/call` mints `resultType:
+        // "task"`.
         body = jsonResultEnvelope(message.id, {
-          resultType: "task",
-          task: { ...cancelled.task, pollIntervalMs },
+          resultType: "complete",
+          ...taskWireFields(task, pollIntervalMs),
         });
         break;
       }
+
+      // tasks/update answers an input round, and nothing else.
+      // Cancellation is `tasks/cancel` above, which SEP-2663 gives its
+      // own method rather than an action on this one.
+      const inputResponses = message.params?.inputResponses;
+      // The round the client is answering, echoed from the descriptor it
+      // polled. Optional, but a malformed value is rejected rather than
+      // coerced to "absent": absence is itself meaningful (it means
+      // "answering a task that never asked a round"), so coercing `"1"`
+      // or `1.5` would answer a client's type bug with the factually
+      // wrong "these responses answer a superseded input round".
+      const inputRoundRaw = message.params?.inputRound;
+      const inputRound =
+        inputRoundRaw === undefined ? undefined : Number(inputRoundRaw);
+      if (
+        inputRoundRaw !== undefined &&
+        !(
+          typeof inputRoundRaw === "number" &&
+          Number.isSafeInteger(inputRoundRaw) &&
+          inputRoundRaw >= 0
+        )
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "inputRound must be a non-negative integer",
+        );
+        break;
+      }
+      if (inputResponses === undefined) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "tasks/update requires inputResponses",
+        );
+        break;
+      }
+      // Reject a deeply nested inputResponses before it reaches the
+      // submit mutation's serialization (would overflow into a raw 500).
+      if (inputResponses !== undefined && nestsTooDeep(inputResponses)) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "inputResponses nest too deeply",
+        );
+        break;
+      }
+
 
       const submitted = await ctx.runMutation(
         component.tasks.submitInputResponsesForOwner,
@@ -6126,10 +6211,7 @@ async function handlePost(
               submitted.task.toolName,
             );
           }
-          body = jsonResultEnvelope(message.id, {
-            resultType: "task",
-            task: { ...submitted.task, pollIntervalMs },
-          });
+          body = jsonResultEnvelope(message.id, { resultType: "complete" });
           break;
         case "duplicate":
         case "accepted": {
@@ -6174,10 +6256,7 @@ async function handlePost(
               submitted.task.toolName,
             );
           }
-          body = jsonResultEnvelope(message.id, {
-            resultType: "task",
-            task: { ...submitted.task, pollIntervalMs },
-          });
+          body = jsonResultEnvelope(message.id, { resultType: "complete" });
           break;
         }
       }
