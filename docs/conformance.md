@@ -54,17 +54,24 @@ by their catalog.
 
 ## Measured results
 
-Run on 2026-08-29 against a local deployment, gateway `1.0.0` plus the
-two fixes this measurement produced (SEP-2243 base64 decoding, and
-`initialize` at the modern wire), suite
+Run on 2026-08-29 against a local deployment, gateway `1.0.0` plus
+everything this measurement produced so far (SEP-2243 base64 decoding,
+`initialize` at the modern wire, and the SEP-2663 task wire), suite
 `0.2.0-alpha.11`. Counts are checks, not scenarios, and a scenario the
 summary marks with a tick may simply have scored nothing, so read the
 `-o` output rather than the summary when it matters.
 
-| Requirement set | Result |
-| --- | --- |
-| `2026-07-28` | **124 passed, 55 failed** |
-| `2025-11-25` | **54 passed, 19 failed** |
+| Requirement set | Anonymous | Through the auth proxy |
+| --- | --- | --- |
+| `2026-07-28` | **126 passed, 53 failed** | **127 passed, 52 failed** |
+| `2025-11-25` | **54 passed, 19 failed** | unchanged |
+
+The proxy (see below) buys exactly one check today, and that is worth
+stating rather than dressing up: most of the tasks group now fails
+because the gateway waits for a client to ask for a task rather than
+deciding itself, which is the next piece of SEP-2663 work, not an
+identity problem. Its value is that those scenarios reach the task
+machinery at all, so the next change can be measured rather than argued.
 
 Every failure below is accounted for in the next section. Nothing here is
 an unexplained red.
@@ -83,7 +90,9 @@ MRTR scenarios that assert refusals rather than interactions
 (`missing-input-response`, `unsupported-methods`, `ignore-extra-params`,
 `validate-input`).
 
-`server-stateless` is 19/25 and `caching` 7/8, with the misses named
+`tasks-capability-negotiation` is 4/5 since the extension moved under
+`extensions`. `server-stateless` is 19/25 and `caching` 7/8, with the
+misses named
 below.
 
 ### Fully passing, `2025-11-25`
@@ -102,26 +111,41 @@ it as unverified rather than as green.
 
 Three different causes, and the distinction is the useful part.
 
-### 1. The authenticated-hook rule, which blocks the most
+### 1. Nobody authenticated, which is a setup gap, not a wall
 
-A tool carrying a `beforeCall` hook structurally requires an
-authenticated caller, and the suite cannot send an `Authorization`
-header. Since a hook is also the only route to a non-text result and the
-only way to open an MRTR round, one rule makes three groups unreachable:
+Most of what this gateway does needs an authenticated caller: MCP Tasks
+are owner-bound, and a `beforeCall` hook, the only route to an MRTR round
+or to a non-text result, structurally requires one. The suite sends no
+`Authorization` header and has no flag to add one, so all of it answers
+`-32001` and reports as unreachable:
 
+- Ten `input-required-result-*` scenarios.
+- The ten `tasks-*` extension scenarios.
 - `tools-call-image`, `tools-call-audio`, `tools-call-embedded-resource`,
-  `tools-call-mixed-content` (a dispatched Convex result is serialized
-  into exactly one `type: "text"` block; `completeCall` from a hook is the
-  only other route). Tracked in
+  `tools-call-mixed-content`. A dispatched Convex result is serialized
+  into exactly one `type: "text"` block, and `completeCall` from a hook
+  is the only other route, so these need a hook as well. Tracked in
   [#50](https://github.com/tfohlmeister/convex-mcp-gateway/issues/50).
-- Ten `input-required-result-*` scenarios, which need a tool that answers
-  round one with `inputRequests`.
-- The MRTR half of the tasks group (`tasks-mrtr-input`,
-  `tasks-mrtr-composition`), plus `test_input_required_result_*`.
 
-`anonymousResources` solved exactly this shape for resource methods. The
-tool-side equivalent does not exist, so these stay unreachable rather than
-failing on their merits.
+**This is fixable, and it is worth saying plainly because an earlier
+version of this document called it structural.** It is not: the suite
+cannot authenticate, but nothing stops something in front of it from
+doing so. `pnpm conformance:proxy` runs a loopback proxy that puts a
+Bearer on every request and forwards to the deployment; point `--url` at
+it and the scenarios above run for real.
+
+```sh
+pnpm conformance:proxy    # in one shell, defaults to the example's
+                          # valid-admin-token fixture
+
+npx @modelcontextprotocol/conformance@alpha server \
+  --url http://127.0.0.1:3399/mcp --requirements 2026-07-28
+```
+
+The measured numbers above are the ANONYMOUS run, which is the honest
+default: it is what the suite does unaided, and it is the configuration
+a reader reproduces first. The authenticated run measures more of the
+gateway and is the one to use when working on tasks or MRTR.
 
 ### 2. Features the gateway does not implement
 
@@ -159,15 +183,22 @@ suite covered the modern era.
   priming event with an id and empty data on the POST stream, and no
   `retry` field. Both matter for resumability, which this transport does
   not offer anyway.
-- **The tasks extension is implemented against an earlier SEP-2663
-  draft.** The suite tests the v2 wire and the gateway answers v1:
-  `capabilities.extensions` is not advertised, a `CreateTaskResult` is not
-  produced for a client that opts in per request or for server-directed
-  creation, `ttlMs` is missing, `tasks/get` on an unknown id answers
-  `-32001` rather than `-32602`, the non-declaring case answers `-32001` /
-  `-32601` rather than `-32021`, and `taskSupport` has no `required`
-  level. Ten scenarios, all in the extension group, which the suite does
-  not score for conformance.
+- **Tasks are not created unless the client asks.** SEP-2663 makes the
+  decision the server's: a client opts in once through the extension
+  capability, and there is no per-request flag. This gateway still waits
+  for `params.task`, so a conforming client that never sends one gets a
+  synchronous result and the whole lifecycle group has no task to
+  inspect. This is the single largest remaining item, and it is what the
+  auth proxy exists to let us measure.
+- **`taskSupport` has no `required` level.** It is a boolean here and a
+  `"forbidden" | "optional" | "required"` enum in the spec, so a tool
+  that must run as a task cannot say so, and
+  `tasks-required-task-error` expects a `-32021` that nothing produces.
+
+  The rest of the v1-versus-v2 distance is closed: the capability is
+  advertised under `capabilities.extensions`, a `CreateTaskResult` is
+  flat and carries `ttlMs` / `createdAt` / `lastUpdatedAt`, an unknown
+  task id answers `-32602`, and a non-declaring caller answers `-32021`.
 
 ## Known gaps that predate the suite
 
