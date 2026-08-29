@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.0.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v1.0.0...v2.0.0) (2026-08-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* a task now reports `status: "failed"` with an inlined `error` for any non-`ConvexError` failure of its dispatch, where it previously reported `status: "completed"` with a result carrying `isError: true`. That covers a tool that crashed part-way and one that never executed at all, an argument-validator rejection being the common case of the latter. The wire text is unchanged and still generic; what moves is which field a polling client reads it from. A tool that throws a `ConvexError` is unaffected, as is every synchronous call.
+* a mount with `taskSupport` tools starts returning task handles where it previously ran inline. The blast radius is exactly the clients that declared the tasks extension, which is the population that asked to handle handles: an anonymous caller, a caller that never declared it, and a session-era caller all still get the synchronous answer. Hosts that want the old behaviour for a given call pass `tasks: { shouldCreate }`. `params.task` no longer starts a task and its `ttlMs` no longer shortens retention, so a task now lives the mount's full `retentionMs`. A `taskSupport: "required"` tool refuses a session-era call it used to dispatch.
+* the tasks extension's wire shape changes, so a client written against it needs updating whether or not the host changes anything. The capability moves under `extensions` on both sides; a `CreateTaskResult` is flat rather than wrapping a `task`; `createdAt` is an ISO-8601 string rather than milliseconds and is joined by `lastUpdatedAt`; `expiresAt` is replaced by a remaining-lifetime `ttlMs`; `tasks/get` answers `resultType: "complete"`; `tasks/update` and the new `tasks/cancel` acknowledge empty instead of returning the task; and `tasks/update` no longer accepts `action: "cancel"`. Hosts are unaffected: no mount option, hook signature, or registration changes. `docs/tasks.md` carries the contract.
+
+### Features
+
+* bring MCP Tasks to the shipped SEP-2663 wire ([#64](https://github.com/tfohlmeister/convex-mcp-gateway/issues/64)) ([9a6f2dc](https://github.com/tfohlmeister/convex-mcp-gateway/commit/9a6f2dcc35fb9eb946e6a53779f7aadfbf02de93))
+* let the conformance suite authenticate, through a proxy ([#65](https://github.com/tfohlmeister/convex-mcp-gateway/issues/65)) ([88827a8](https://github.com/tfohlmeister/convex-mcp-gateway/commit/88827a8acf764e6a6e2686d8474d8c4cda099765))
+* let the server decide when a call becomes a task ([#66](https://github.com/tfohlmeister/convex-mcp-gateway/issues/66)) ([9c3c795](https://github.com/tfohlmeister/convex-mcp-gateway/commit/9c3c79577c90439e12597c91af9ec25fe819c65a))
+
+
+### Bug Fixes
+
+* answer a malformed _meta as invalid params, and fail a crashed task ([#67](https://github.com/tfohlmeister/convex-mcp-gateway/issues/67)) ([f16d509](https://github.com/tfohlmeister/convex-mcp-gateway/commit/f16d509e06ce0e76a7a4b47f35c5ff26038ef8e6))
+* decode a routing header only when it is canonically base64 ([#61](https://github.com/tfohlmeister/convex-mcp-gateway/issues/61)) ([b81c6b3](https://github.com/tfohlmeister/convex-mcp-gateway/commit/b81c6b3851544aac66d7ecf03e8ce8713a53858f))
+* refuse initialize at the modern wire, like the four methods beside it ([#63](https://github.com/tfohlmeister/convex-mcp-gateway/issues/63)) ([78885e4](https://github.com/tfohlmeister/convex-mcp-gateway/commit/78885e407c7daeabaeb92c656181c748aa77eb17))
+
 ## [1.0.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v0.11.0...v1.0.0) (2026-08-27)
 
 
