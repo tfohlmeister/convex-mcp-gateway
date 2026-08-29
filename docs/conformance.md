@@ -63,7 +63,7 @@ summary marks with a tick may simply have scored nothing, so read the
 
 | Requirement set | Anonymous | Through the auth proxy |
 | --- | --- | --- |
-| `2026-07-28` | **128 passed, 52 failed** | **138 passed, 43 failed** |
+| `2026-07-28` | **130 passed, 50 failed** | **141 passed, 40 failed** |
 | `2025-11-25` | **54 passed, 19 failed** | unchanged |
 
 The ten-check gap between the two columns is the whole tasks group,
@@ -90,8 +90,8 @@ MRTR scenarios that assert refusals rather than interactions
 `validate-input`).
 
 `tasks-capability-negotiation` is 4/5 since the extension moved under
-`extensions`. `server-stateless` is 19/25 and `caching` 7/8, with the
-misses named
+`extensions`, and `tasks-lifecycle` 8/9 through the proxy.
+`server-stateless` is 21/25 and `caching` 7/8, with the misses named
 below.
 
 ### Fully passing, `2025-11-25`
@@ -167,17 +167,6 @@ not provide, because each needs a feature above:
 These are the ones worth acting on. None of them were visible before the
 suite covered the modern era.
 
-- **Missing `_meta` answers `-32020`, not `-32602`.** A stateless request
-  with no `_meta`, or with a `_meta` that omits
-  `io.modelcontextprotocol/protocolVersion`, is a malformed request.
-  SEP-2575 wants `-32602 Invalid params`; the gateway reports the header
-  mismatch it noticed first. Two checks in `server-stateless`.
-- **A task can never report a protocol-level failure.** SEP-2663 splits a
-  tool error (`completed` with `result.isError`) from a protocol error
-  (`failed` with an inlined error). The gateway maps every throw to
-  `-32000` and the task path launders exactly that into the first shape,
-  so only a refusal the tool never saw (unknown tool, missing caller)
-  can fail a task. `protocol_error_job` exists to make that visible.
 - **Two SSE recommendations are unmet**, both SHOULD rather than MUST: no
   priming event with an id and empty data on the POST stream, and no
   `retry` field. Both matter for resumability, which this transport does

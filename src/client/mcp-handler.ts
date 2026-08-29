@@ -3329,6 +3329,24 @@ async function handlePost(
   // mirrored routing metadata before identity resolution, catalog writes,
   // authorization, auditing, or tool dispatch.
   if (isStateless) {
+    // A request that declares the modern wire and then carries no usable
+    // `_meta` is malformed, not mismatched. SEP-2575 asks for `-32602`
+    // here, and the distinction is the useful one: a mismatch tells a
+    // client its two declarations disagree, which is unhelpful advice
+    // when it made only one of them. Checked before the comparison
+    // because the comparison is what would otherwise answer, having
+    // found a `null` on one side.
+    if (metadataProtocolVersion === null) {
+      return statelessErrorResponse(
+        message.id,
+        INVALID_PARAMS,
+        isPlainObject(message.params?._meta)
+          ? "Invalid params: _meta must carry a string " +
+              "io.modelcontextprotocol/protocolVersion"
+          : "Invalid params: a stateless request must carry _meta with " +
+              "io.modelcontextprotocol/protocolVersion",
+      );
+    }
     if (headerProtocolVersion !== metadataProtocolVersion) {
       return statelessErrorResponse(
         message.id,

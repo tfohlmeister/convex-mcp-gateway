@@ -124,15 +124,30 @@ gateway.handleMcpRequest(ctx, request, {
   `failed` would give a task-run tool a different contract from the same
   tool called inline.
 
-  `failed` is reserved for the task never producing a result at all: an
-  unknown tool, a tool whose kind changed since creation, a tool no longer
-  eligible for task execution, a dispatch that never ran, an executor that
-  could not start, a result too large to store, and a tool that needs an
-  authenticated caller when the row has none. That last one is the single
-  place the task path is deliberately **stricter** than the inline one,
-  where the same condition surfaces as a tool result: a queued call cannot
-  re-challenge the caller, so it fails rather than reporting a refusal as
-  a call that ran.
+  `failed` is for the task never producing a result at all: an unknown
+  tool, a tool whose kind changed since creation, a tool no longer
+  eligible for task execution, a dispatch that never ran, an executor
+  that could not start, a result too large to store, a tool that needs an
+  authenticated caller when the row has none, and any **non-`ConvexError`
+  failure of the dispatch**.
+
+  That last one is the split SEP-2663 draws, and it is worth stating
+  precisely because both outcomes come out of the same `try`. A
+  `ConvexError` is the deliberate channel a tool uses to say "this did
+  not work, here is why", so it is a call that ran: `completed` with
+  `isError`. Anything else is a failure the tool did not report, whether
+  it crashed part-way or never executed at all (an argument-validator
+  rejection is the common case of the latter). There is no result to
+  inline, so: `failed`, carrying the generic error the wire always gets.
+
+  The task path is deliberately **stricter** than the inline one in two
+  places, and both are the same reasoning. A queued call cannot
+  re-challenge its caller, so a tool that needs an authenticated caller
+  fails rather than reporting a refusal as a call that ran; and a queued
+  call has a `failed` status to use, so an unreported failure does not
+  have to be dressed as a result. Inline, both surface as a tool result
+  with `isError`, because a synchronous caller has no task to look at and
+  MCP asks for `isError` there.
 - `tasks/cancel` (`params.taskId`, mirrored in `Mcp-Name`) cancels a
   task and answers an empty `{ resultType: "complete" }` ack.
   Cancellation is cooperative and idempotent: a task that already
