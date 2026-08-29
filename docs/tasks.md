@@ -219,10 +219,9 @@ caller's token expired or their access was revoked in between. If you
 need to stop a revoked subject's pending work, call
 `gateway.cancelPendingTasksForOwner(ctx, subject)` when you process the
 revocation: it cancels every live task that subject owns (and returns
-their ids so you can also cancel any durable execution). Choose a task
-TTL (`tasks.retentionMs`, or the per-call `ttlMs`) short enough that the
-revocation window you can tolerate is bounded even without an explicit
-cancel.
+their ids so you can also cancel any durable execution). Choose a
+`tasks.retentionMs` short enough that the revocation window you can
+tolerate is bounded even without an explicit cancel.
 
 ### One task table, shared across mounts
 
@@ -537,16 +536,22 @@ synchronous MRTR path does.
 ## Retention and size limits
 
 - Retention: default 24 hours per task, clamped to
-  [1 minute, 7 days]; the host default is `tasks.retentionMs`, a client
-  may request a shorter `ttlMs` per call. Expired tasks answer like
-  unknown ids; `gateway.pruneTasks(ctx)` drains them from a cron.
+  [1 minute, 7 days], set by the host with `tasks.retentionMs`. The
+  client has no say: SEP-2663 removed the request shape it used to
+  shorten a single call with, so a task lives the mount's full retention.
+  The one exception runs longer, not shorter: a task created from an MRTR
+  continuation is extended to outlive its chain, or a replayed
+  continuation that found the row expired would mint a second task and a
+  second tool run from one chain. Expired tasks answer like unknown ids;
+  `gateway.pruneTasks(ctx)` drains them from a cron.
 - The TTL is an **execution deadline**, not only a retention window.
   Expiry makes a task unobservable to its owner and makes the trusted
   finalizers answer `not_found`, and the prune deletes expired rows
-  whatever their status, including a `working` one. Pick a `ttlMs` that
-  covers the tool's worst-case runtime plus however long the client may
-  take to answer an `input_required` round; the lifecycle audit rows
-  (never pruned here) stay as the record either way.
+  whatever their status, including a `working` one. Pick a
+  `tasks.retentionMs` that covers the tool's worst-case runtime plus
+  however long the client may take to answer an `input_required` round;
+  the lifecycle audit rows (never pruned here) stay as the record either
+  way.
 - A task result is readable only until the task expires: `tasks/get`
   serves `completed` / `failed` outcomes inside the retention window and
   answers like an unknown id after it. That same window is the
