@@ -54,14 +54,15 @@ by their catalog.
 
 ## Measured results
 
-Run on 2026-08-29 against a local deployment, gateway `1.0.0`, suite
+Run on 2026-08-29 against a local deployment, gateway `1.0.0` plus the
+SEP-2243 base64 fix that this measurement produced, suite
 `0.2.0-alpha.11`. Counts are checks, not scenarios, and a scenario the
 summary marks with a tick may simply have scored nothing, so read the
 `-o` output rather than the summary when it matters.
 
 | Requirement set | Result |
 | --- | --- |
-| `2026-07-28` | **120 passed, 59 failed** |
+| `2026-07-28` | **123 passed, 56 failed** |
 | `2025-11-25` | **54 passed, 19 failed** |
 
 Every failure below is accounted for in the next section. Nothing here is
@@ -73,7 +74,9 @@ an unexplained red.
 `server-sse-multiple-streams`, `resources-list`, `resources-read-text`,
 `resources-read-binary`, `resources-templates-read`,
 `sep-2164-resource-not-found` (4/4), `dns-rebinding-protection` (2/2),
-`http-header-validation` (14/14), `json-schema-2020-12` (8/8, including
+`http-header-validation` (14/14),
+`http-custom-header-server-validation` (10/10),
+`json-schema-2020-12` (8/8, including
 the SEP-1613 keyword checks and all three SEP-2106 ones), and four of the
 MRTR scenarios that assert refusals rather than interactions
 (`missing-input-response`, `unsupported-methods`, `ignore-extra-params`,
@@ -151,13 +154,6 @@ suite covered the modern era.
   era unconditionally, which is deliberate dual-era behaviour and is
   exactly what the check reads as non-compliant. Needs a decision, not
   just a fix: the session era has to keep working.
-- **Base64 routing headers accept invalid padding.** `=?base64?SGVsbG8?=`
-  decodes leniently and matched the body value, where the SEP-2243 table
-  requires HTTP 400 with `-32020`.
-- **A malformed base64 wrapper is not treated as a literal.** SEP-2243
-  says a value without the closing `?=` is not an encoded value at all, so
-  it must be compared literally. The gateway rejects it as a mismatch
-  instead, refusing a request it must accept.
 - **A task can never report a protocol-level failure.** SEP-2663 splits a
   tool error (`completed` with `result.isError`) from a protocol error
   (`failed` with an inlined error). The gateway maps every throw to

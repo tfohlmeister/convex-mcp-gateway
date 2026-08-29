@@ -1294,6 +1294,14 @@ function statelessProtocolVersion(message: JsonRpcMessage): string | null {
   return typeof version === "string" ? version : null;
 }
 
+/**
+ * Canonical base64: the standard alphabet, padded to a multiple of four.
+ * `atob` accepts an unpadded tail, so `SGVsbG8` decodes there exactly as
+ * `SGVsbG8=` does, and SEP-2243 requires the former to be REFUSED. The
+ * check has to happen before the decode for that reason, not after.
+ */
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 function decodeMcpHeaderValue(value: string | null): string | null {
   if (value === null) return null;
   if (
@@ -1305,9 +1313,13 @@ function decodeMcpHeaderValue(value: string | null): string | null {
   const prefix = "=?base64?";
   const suffix = "?=";
   if (!value.startsWith(prefix)) return value;
-  if (!value.endsWith(suffix)) return null;
+  // A wrapper the sender never closed is not an encoded value, so it is
+  // the literal it looks like. SEP-2243 is explicit that only the full
+  // `=?base64?...?=` form is decoded, and rejecting this instead refuses
+  // a request whose header genuinely matches the argument.
+  if (!value.endsWith(suffix)) return value;
   const encoded = value.slice(prefix.length, -suffix.length);
-  if (encoded.length === 0) return null;
+  if (encoded.length === 0 || !CANONICAL_BASE64.test(encoded)) return null;
   try {
     const binary = atob(encoded);
     const bytes = Uint8Array.from(binary, (character) =>

@@ -1258,6 +1258,100 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
+  // SEP-2243 spells both of these out in its test-case table, and the
+  // official suite checks them: a wrapper is decoded only when it is
+  // canonical base64, and only when it is closed.
+  test.each([
+    // `SGVsbG8` decodes to "Hello" in a lenient decoder, which is what
+    // makes this the interesting case: accepting it would let a
+    // non-canonical encoding match the argument.
+    ["unpadded", "=?base64?SGVsbG8?="],
+    // `atob` also strips ASCII whitespace, and a space is not a control
+    // character, so nothing upstream of the decoder refuses this one.
+    ["whitespace-infused", "=?base64?SGVs bG8=?="],
+  ])(
+    "refuses an %s base64 routing header instead of decoding it",
+    async (_label, headerValue) => {
+      const component = createComponent();
+      const state = createCtx(component, [
+        {
+          name: "search",
+          description: "Search",
+          kind: "query",
+          functionHandle: "function://search",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string", "x-mcp-header": "Query" },
+            },
+          },
+        },
+      ]);
+
+      const response = await handleMcpRequest(
+        state.ctx,
+        withHeaders(
+          statelessJsonRpcRequest({
+            id: 1,
+            method: "tools/call",
+            params: { name: "search", arguments: { query: "Hello" } },
+          }),
+          { "mcp-name": "search", "mcp-param-query": headerValue },
+        ),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      );
+
+      expect(response.status).toBe(400);
+      expect(await readJson(response)).toMatchObject({
+        error: { code: -32020 },
+      });
+    },
+  );
+
+  test("compares an unclosed base64 wrapper literally rather than refusing it", async () => {
+    const component = createComponent();
+    const state = createCtx(component, [
+      {
+        name: "search",
+        description: "Search",
+        kind: "query",
+        functionHandle: "function://search",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", "x-mcp-header": "Query" },
+          },
+        },
+      },
+    ]);
+    // No closing `?=`, so this is not an encoded value at all. The
+    // argument carries the same characters, so the header matches and the
+    // request must reach authorization.
+    const literal = "=?base64?SGVsbG8=";
+
+    const response = await handleMcpRequest(
+      state.ctx,
+      withHeaders(
+        statelessJsonRpcRequest({
+          id: 1,
+          method: "tools/call",
+          params: { name: "search", arguments: { query: literal } },
+        }),
+        { "mcp-name": "search", "mcp-param-query": literal },
+      ),
+      component,
+      { authorize: async () => ({ allowed: false, reason: "Forbidden" }) },
+    );
+
+    // -32003 is the authorizer refusing, which is proof the header check
+    // passed: a mismatch would have answered -32020 before it ran.
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toMatchObject({
+      error: { code: -32003 },
+    });
+  });
+
   test.each(["resources/list", "resources/templates/list", "resources/read"])(
     "returns HTTP 404 when modern %s is not configured",
     async (method) => {
