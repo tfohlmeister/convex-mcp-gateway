@@ -55,14 +55,15 @@ by their catalog.
 ## Measured results
 
 Run on 2026-08-29 against a local deployment, gateway `1.0.0` plus the
-SEP-2243 base64 fix that this measurement produced, suite
+two fixes this measurement produced (SEP-2243 base64 decoding, and
+`initialize` at the modern wire), suite
 `0.2.0-alpha.11`. Counts are checks, not scenarios, and a scenario the
 summary marks with a tick may simply have scored nothing, so read the
 `-o` output rather than the summary when it matters.
 
 | Requirement set | Result |
 | --- | --- |
-| `2026-07-28` | **123 passed, 56 failed** |
+| `2026-07-28` | **124 passed, 55 failed** |
 | `2025-11-25` | **54 passed, 19 failed** |
 
 Every failure below is accounted for in the next section. Nothing here is
@@ -82,7 +83,7 @@ MRTR scenarios that assert refusals rather than interactions
 (`missing-input-response`, `unsupported-methods`, `ignore-extra-params`,
 `validate-input`).
 
-`server-stateless` is 18/25 and `caching` 7/8, with the misses named
+`server-stateless` is 19/25 and `caching` 7/8, with the misses named
 below.
 
 ### Fully passing, `2025-11-25`
@@ -148,12 +149,6 @@ suite covered the modern era.
   `io.modelcontextprotocol/protocolVersion`, is a malformed request.
   SEP-2575 wants `-32602 Invalid params`; the gateway reports the header
   mismatch it noticed first. Two checks in `server-stateless`.
-- **`initialize` is answered at the `2026-07-28` wire.** The revision
-  removed the method, and a server that does not implement it must answer
-  HTTP 404 with `-32601`. This gateway routes `initialize` to the legacy
-  era unconditionally, which is deliberate dual-era behaviour and is
-  exactly what the check reads as non-compliant. Needs a decision, not
-  just a fix: the session era has to keep working.
 - **A task can never report a protocol-level failure.** SEP-2663 splits a
   tool error (`completed` with `result.isError`) from a protocol error
   (`failed` with an inlined error). The gateway maps every throw to

@@ -867,7 +867,30 @@ describe("handleMcpRequest metadata and resources", () => {
     expect(await readJson(response)).toMatchObject({ error: { code: -32602 } });
   });
 
-  test("keeps initialize session-based when legacy headers carry modern metadata", async () => {
+  // `initialize` is one of the five methods 2026-07-28 removed, and the
+  // only one the era test used to exempt. It now answers like its four
+  // siblings: a request that declares the modern wire and calls it
+  // anyway is refused rather than handed a session it never asked for.
+  test("refuses initialize at the modern wire, and creates no session", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+
+    const response = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("mcp-session-id")).toBeNull();
+    expect(state.sessions.size).toBe(0);
+    expect(await readJson(response)).toMatchObject({
+      error: { code: -32601 },
+    });
+  });
+
+  test("an initialize that declares two protocol versions is a header mismatch", async () => {
     const component = createComponent();
     const state = createCtx(component);
 
@@ -883,6 +906,74 @@ describe("handleMcpRequest metadata and resources", () => {
             "io.modelcontextprotocol/clientCapabilities": {},
           },
         },
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    // Modern metadata with no matching header, which is the same -32020
+    // every other method answers to that shape. Before, this shape was
+    // served a legacy session, so a client that believed it was speaking
+    // 2026-07-28 got a 2025 session and no signal.
+    expect(await readJson(response)).toMatchObject({
+      error: { code: -32020 },
+    });
+    expect(response.headers.get("mcp-session-id")).toBeNull();
+    expect(state.sessions.size).toBe(0);
+  });
+
+  test("names a session revision requested through modern metadata for what it is", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+
+    const response = await handleMcpRequest(
+      state.ctx,
+      new Request("https://app.example.com/mcp/", {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "mcp-protocol-version": "2025-06-18",
+          "mcp-method": "initialize",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            _meta: {
+              "io.modelcontextprotocol/protocolVersion": "2025-06-18",
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        }),
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    // `supported` lists this very version, so the message must not call
+    // it unsupported: it is supported, on the other wire.
+    const body = (await readJson(response)) as {
+      error: { code: number; message: string; data: { supported: string[] } };
+    };
+    expect(body.error.code).toBe(-32022);
+    expect(body.error.data.supported).toContain("2025-06-18");
+    expect(body.error.message).toMatch(/session-based/);
+    expect(body.error.message).toMatch(/initialize/);
+    expect(state.sessions.size).toBe(0);
+  });
+
+  test("a legacy initialize still negotiates a session", async () => {
+    const component = createComponent();
+    const state = createCtx(component);
+
+    const response = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18" },
       }),
       component,
       { authorize: async () => ({ allowed: true }) },

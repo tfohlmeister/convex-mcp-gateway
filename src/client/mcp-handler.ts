@@ -3182,12 +3182,16 @@ async function handlePost(
   const isInitialize = message.method === "initialize";
   const headerProtocolVersion = request.headers.get("mcp-protocol-version");
   const metadataProtocolVersion = statelessProtocolVersion(message);
-  // `initialize` is always session-based, even when a broken client attaches stateless
-  // metadata. This keeps its version negotiation and session contract intact.
+  // The era is decided by what the request declares, for every method
+  // including `initialize`. That revision removed `initialize`, so a
+  // request that declares it and calls it anyway is refused below like
+  // its four siblings (`ping`, `logging/setLevel`, `resources/subscribe`,
+  // `resources/unsubscribe`) rather than being handed a session it did
+  // not ask for. A client that declares nothing modern still negotiates
+  // exactly as it always has.
   const isStateless =
-    !isInitialize &&
-    (headerProtocolVersion === STATELESS_PROTOCOL_VERSION ||
-      metadataProtocolVersion !== null);
+    headerProtocolVersion === STATELESS_PROTOCOL_VERSION ||
+    metadataProtocolVersion !== null;
   // The validated `clientCapabilities` object of a stateless request,
   // hoisted so MRTR and task-augmented `tools/call` can both negotiate
   // against it below.
@@ -3205,10 +3209,23 @@ async function handlePost(
       );
     }
     if (metadataProtocolVersion !== STATELESS_PROTOCOL_VERSION) {
+      // A session revision named here is supported by this server and
+      // still wrong in this position, so say which of the two it is.
+      // `supported` lists both eras, and a message that flatly called a
+      // listed version unsupported would contradict its own data.
+      const isSessionRevision =
+        metadataProtocolVersion !== null &&
+        (SESSION_PROTOCOL_VERSIONS as readonly string[]).includes(
+          metadataProtocolVersion,
+        );
       return statelessErrorResponse(
         message.id,
         UNSUPPORTED_PROTOCOL_VERSION,
-        `Unsupported MCP protocol version: ${metadataProtocolVersion}`,
+        isSessionRevision
+          ? `MCP protocol version ${metadataProtocolVersion} is session-based ` +
+              `and cannot be selected through stateless request metadata; ` +
+              `negotiate it with initialize instead`
+          : `Unsupported MCP protocol version: ${metadataProtocolVersion}`,
         {
           supported: [STATELESS_PROTOCOL_VERSION, ...SESSION_PROTOCOL_VERSIONS],
           requested: metadataProtocolVersion,
@@ -3413,6 +3430,16 @@ async function handlePost(
 
   switch (message.method) {
     case "initialize": {
+      if (isStateless) {
+        responseStatus = 404;
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `${message.method} is legacy-only; it was removed in ` +
+            STATELESS_PROTOCOL_VERSION,
+        );
+        break;
+      }
       // Legacy clients reconcile their declarative catalog when they
       // initialize. Modern requests do the same work before dispatch above.
       try {
