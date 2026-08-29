@@ -41,10 +41,14 @@ import { action, mutation, query } from "./_generated/server.js";
  *  2. The one escape hatch is a `beforeCall` hook returning
  *     `completeCall(...)`, whose result is forwarded verbatim.
  *  3. A tool carrying a `beforeCall` hook structurally requires an
- *     authenticated caller, and the suite cannot send an Authorization
- *     header.
+ *     authenticated caller, and the suite sends no Authorization header.
  *
- * So the suite cannot reach the gateway's non-text content paths at all.
+ * Constraint 3 is a property of the SUITE, not of the gateway, and
+ * `pnpm conformance:proxy` lifts it (see docs/conformance.md). These
+ * fixtures are still absent because constraints 1 and 2 stand: writing
+ * them means giving the example a hook whose only job is to hand back a
+ * canned image, which teaches a reader nothing. #50 is where the real
+ * fix belongs.
  *
  * ## What the resource fixtures below are for
  *

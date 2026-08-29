@@ -44,6 +44,7 @@
   "module": "./dist/client/index.js",
   "scripts": {
     "local:start": "node scripts/local-convex.mjs",
+    "conformance:proxy": "node scripts/conformance-auth-proxy.mjs",
     "convex:codegen": "convex codegen --component-dir ./src/component && convex codegen",
     "dev:build": "chokidar 'tsconfig*.json' 'src/**/*.ts' -i '**/*.test.ts' -c 'pnpm run build:codegen' --initial",
     "build": "tsc --project ./tsconfig.build.json",

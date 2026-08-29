@@ -152,9 +152,11 @@ const resolveIdentity = async (token: string) => {
  * differ by `tasks` or `authorize`, never by their catalog, which is the
  * same rule `invoices_bulkMarkPaid` documents in mcp.ts.
  *
- * The suite cannot send an Authorization header, so this mode also drops
- * the authorization bar. It stays off by default and the example is
- * otherwise untouched.
+ * The suite sends no Authorization header, so this mode also drops the
+ * authorization bar. It stays off by default and the example is
+ * otherwise untouched. For the scenarios that need a caller rather than
+ * merely an allow-all policy (tasks, MRTR), run the suite through
+ * `pnpm conformance:proxy`.
  */
 // Convex exposes `process.env` in its runtime, but this example's
 // tsconfig carries no Node types (and should not: the Convex runtime is
@@ -208,8 +210,9 @@ const mcpHandler = httpAction(async (ctx, request) =>
     // normally, or the conformance fixtures under the switch below. Reads
     // run through `authorizeResource` and are recorded in the audit log.
     //
-    // The conformance suite cannot send an Authorization header, so every
-    // `resources/*` scenario is unreachable without the anonymous opt-in.
+    // The conformance suite sends no Authorization header, so every
+    // `resources/*` scenario is unreachable without the anonymous opt-in
+    // (or the auth proxy, which is the heavier way round).
     // Off for the ordinary catalog, whose resources are per-caller.
     anonymousResources: CONFORMANCE,
     resources: CONFORMANCE ? conformanceResources : resources,
