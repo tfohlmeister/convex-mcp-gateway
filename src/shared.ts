@@ -346,7 +346,7 @@ export interface McpToolDefinition {
    * gateway-issued idempotency key around its side effect so workflow
    * retries and duplicate client updates cannot double-apply.
    */
-  taskSupport?: boolean;
+  taskSupport?: boolean | "forbidden" | "optional" | "required";
   metadata?: Record<string, unknown>;
 }
 
@@ -1305,4 +1305,26 @@ export function prepareSchemaForStorage(schema: unknown): {
 
   const storable = walk(schema, 0, "", false);
   return problem !== null ? { problem } : { storable };
+}
+
+/**
+ * A tool's task support, normalized to the three SEP-2663 levels.
+ *
+ * This gateway shipped a boolean first, and rows written by an older
+ * version still carry one, so both spellings are read and only the
+ * string is written. `true` means `"optional"`, which is what it meant.
+ *
+ * Lives here because the client decides with it and the component's
+ * executor re-checks it at run time, and the two must not drift: a task
+ * created while a tool was task-capable must not still execute after the
+ * tool was withdrawn, and that comparison is only sound if both sides
+ * read the same field the same way.
+ */
+export function mcpTaskSupportLevel(tool: {
+  taskSupport?: boolean | string | null;
+}): "forbidden" | "optional" | "required" {
+  const value = tool.taskSupport;
+  if (value === true) return "optional";
+  if (value === "optional" || value === "required") return value;
+  return "forbidden";
 }

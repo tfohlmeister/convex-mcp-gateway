@@ -3,6 +3,7 @@ import { action, mutation, query } from "./_generated/server.js";
 import { api } from "./_generated/api.js";
 import type { Id } from "./_generated/dataModel.js";
 import { taskStatusValidator, toolKindValidator } from "./schema.js";
+import { mcpTaskSupportLevel } from "../shared.js";
 
 /**
  * MCP Tasks (`io.modelcontextprotocol/tasks`) storage and lifecycle.
@@ -1347,7 +1348,7 @@ export const executeScheduledTask = action({
           outputSchema?: unknown;
           mrtrArgs?: { idempotencyKey: string };
           mrtrGated?: boolean;
-          taskSupport?: boolean;
+          taskSupport?: boolean | string;
         }
       | null;
     try {
@@ -1418,7 +1419,7 @@ export const executeScheduledTask = action({
       (task.mrtrApproved === true &&
         tool.mrtrArgs === undefined &&
         tool.kind !== "query") ||
-      tool.taskSupport !== true
+      mcpTaskSupportLevel(tool) === "forbidden"
     ) {
       await fail({
         code: -32000,

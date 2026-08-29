@@ -437,7 +437,8 @@ Modern clients can run a tool as an MCP task
 returns a handle immediately, and the client polls `tasks/get` for the
 outcome; `tasks/update` answers `input_required` rounds and
 `tasks/cancel` cancels.
-Doubly opt-in: register the tool with `taskSupport: true` AND configure
+Doubly opt-in: register the tool with `taskSupport: "optional"` (or
+`"required"`) AND configure
 the `tasks` option; the capability is not advertised otherwise.
 
 ```ts
@@ -445,7 +446,7 @@ defineMcpMutation({
   name: "invoices_recount",
   fn: api.invoices.recount,
   args: {},
-  taskSupport: true, // advertised as execution: { taskSupport: "optional" }
+  taskSupport: "optional", // or "required"; `true` still reads as "optional"
 });
 
 gateway.handleMcpRequest(ctx, req, {

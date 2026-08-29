@@ -63,15 +63,14 @@ summary marks with a tick may simply have scored nothing, so read the
 
 | Requirement set | Anonymous | Through the auth proxy |
 | --- | --- | --- |
-| `2026-07-28` | **126 passed, 53 failed** | **127 passed, 52 failed** |
+| `2026-07-28` | **128 passed, 52 failed** | **138 passed, 43 failed** |
 | `2025-11-25` | **54 passed, 19 failed** | unchanged |
 
-The proxy (see below) buys exactly one check today, and that is worth
-stating rather than dressing up: most of the tasks group now fails
-because the gateway waits for a client to ask for a task rather than
-deciding itself, which is the next piece of SEP-2663 work, not an
-identity problem. Its value is that those scenarios reach the task
-machinery at all, so the next change can be measured rather than argued.
+The ten-check gap between the two columns is the whole tasks group,
+which is owner-bound and therefore invisible to a suite that cannot
+authenticate. `tasks-lifecycle` is 7/9 through the proxy and 1/9 without
+it; `tasks-required-task-error` and `tasks-dispatch-and-envelope` tell
+the same story. Run authenticated when working on tasks or MRTR.
 
 Every failure below is accounted for in the next section. Nothing here is
 an unexplained red.
@@ -183,22 +182,27 @@ suite covered the modern era.
   priming event with an id and empty data on the POST stream, and no
   `retry` field. Both matter for resumability, which this transport does
   not offer anyway.
-- **Tasks are not created unless the client asks.** SEP-2663 makes the
-  decision the server's: a client opts in once through the extension
-  capability, and there is no per-request flag. This gateway still waits
-  for `params.task`, so a conforming client that never sends one gets a
-  synchronous result and the whole lifecycle group has no task to
-  inspect. This is the single largest remaining item, and it is what the
-  auth proxy exists to let us measure.
-- **`taskSupport` has no `required` level.** It is a boolean here and a
-  `"forbidden" | "optional" | "required"` enum in the spec, so a tool
-  that must run as a task cannot say so, and
-  `tasks-required-task-error` expects a `-32021` that nothing produces.
+- **A bare string renders differently inline and through a task.** A
+  tool returning `"Hello"` inline puts a JSON-quoted `"Hello"` in the
+  text block; through a task it puts `Hello`. The task path is the
+  deliberate one and the suite agrees with it
+  (`tasks-headers-tolerate-mcp-method-on-tools-call` asserts the
+  unquoted form), so the inline path is the odd one out. Small, and a
+  wire change for anything parsing the quoted form.
+- **`wire-schema-valid` fails in every tasks scenario**, reporting that
+  a `tools/call` result "must have required property `content`". A
+  `CreateTaskResult` has no `content` by construction, and the suite
+  appears to validate every `tools/call` response against
+  `CallToolResult` rather than against the union SEP-2663 defines.
+  Suspected suite limitation rather than a gateway defect, but it is
+  unverified and counted in the numbers above either way.
 
-  The rest of the v1-versus-v2 distance is closed: the capability is
-  advertised under `capabilities.extensions`, a `CreateTaskResult` is
-  flat and carries `ttlMs` / `createdAt` / `lastUpdatedAt`, an unknown
-  task id answers `-32602`, and a non-declaring caller answers `-32021`.
+The rest of the SEP-2663 distance is closed: the capability is
+advertised under `capabilities.extensions`, a `CreateTaskResult` is flat
+and carries `ttlMs` / `createdAt` / `lastUpdatedAt`, an unknown task id
+answers `-32602`, a non-declaring caller answers `-32021`,
+`taskSupport` has the three levels, and the server decides per call
+whether a call becomes a task.
 
 ## Known gaps that predate the suite
 

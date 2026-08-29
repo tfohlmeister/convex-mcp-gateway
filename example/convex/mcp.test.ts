@@ -3688,13 +3688,16 @@ describe("MCP tasks (modern, e2e)", () => {
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const viaTask = (await getTask(t, taskId)).result?.result;
 
+      // Without the extension declared there is no task to create, so
+      // this is the inline path by construction. Declaring it would get
+      // a task back, which is the point of the comparison.
       const sync = (await (
         await statelessRpc(
           t,
           50,
           "tools/call",
           { name: "invoices_recount", arguments: {} },
-          { name: "invoices_recount", as: "alice" },
+          { name: "invoices_recount", as: "alice", clientCapabilities: {} },
         )
       ).json()) as {
         result: {
@@ -3884,13 +3887,15 @@ describe("MCP tasks (modern, e2e)", () => {
   test("negotiation gates: capability, tool support, identity", async () => {
     const t = newTest();
 
-    // Client did not declare the tasks capability.
+    // A REQUIRED tool met by a client that did not declare the
+    // extension: it cannot run any other way, so it names what is
+    // missing rather than calling the params invalid.
     const noCap = await statelessRpc(
       t,
       6,
       "tools/call",
-      { name: "invoices_recount", arguments: {}, task: {} },
-      { name: "invoices_recount", clientCapabilities: {}, as: "alice" },
+      { name: "invoices_bulkMarkPaid", arguments: {} },
+      { name: "invoices_bulkMarkPaid", clientCapabilities: {}, as: "alice" },
     );
     const noCapBody = (await noCap.json()) as {
       error?: {
@@ -3899,35 +3904,51 @@ describe("MCP tasks (modern, e2e)", () => {
         data?: { requiredCapabilities?: unknown };
       };
     };
-    // MissingRequiredClientCapability, naming what to add rather than
-    // calling the params invalid.
     expect(noCapBody.error?.code).toBe(-32021);
     expect(noCapBody.error?.message).toMatch(/client capability/);
     expect(noCapBody.error?.data?.requiredCapabilities).toEqual({
       extensions: { "io.modelcontextprotocol/tasks": {} },
     });
 
-    // Tool without taskSupport.
-    const wrongTool = await statelessRpc(
+    // An OPTIONAL tool has nothing to refuse the same client: nobody
+    // asked for a task, so it answers inline.
+    const optionalNoCap = await statelessRpc(
       t,
       7,
+      "tools/call",
+      { name: "invoices_recount", arguments: {} },
+      { name: "invoices_recount", clientCapabilities: {}, as: "alice" },
+    );
+    const optionalNoCapBody = (await optionalNoCap.json()) as {
+      result?: { resultType?: string; taskId?: string };
+    };
+    expect(optionalNoCapBody.result?.resultType).toBe("complete");
+    expect(optionalNoCapBody.result?.taskId).toBeUndefined();
+
+    // A tool with no task support at all, and a legacy `task` hint:
+    // ignored, not an error, and never promoted to a task.
+    const wrongTool = await statelessRpc(
+      t,
+      8,
       "tools/call",
       { name: "invoices_markPaid", arguments: {}, task: {} },
       { name: "invoices_markPaid", as: "bob" },
     );
     const wrongToolBody = (await wrongTool.json()) as {
-      error?: { code: number; message: string };
+      result?: { resultType?: string; taskId?: string };
+      error?: { code: number };
     };
-    expect(wrongToolBody.error?.code).toBe(-32602);
-    expect(wrongToolBody.error?.message).toMatch(/does not support task/);
+    expect(wrongToolBody.error).toBeUndefined();
+    expect(wrongToolBody.result?.resultType).toBe("complete");
+    expect(wrongToolBody.result?.taskId).toBeUndefined();
 
-    // Anonymous caller cannot own a task.
+    // Anonymous caller cannot own a task, so a required tool challenges.
     const anonymous = await statelessRpc(
       t,
-      8,
+      9,
       "tools/call",
-      { name: "invoices_recount", arguments: {}, task: {} },
-      { name: "invoices_recount" },
+      { name: "invoices_bulkMarkPaid", arguments: {} },
+      { name: "invoices_bulkMarkPaid" },
     );
     const anonymousBody = (await anonymous.json()) as {
       error?: { code: number };
@@ -3937,7 +3958,7 @@ describe("MCP tasks (modern, e2e)", () => {
     // Anonymous polling is rejected before any lookup.
     const anonymousPoll = await statelessRpc(
       t,
-      9,
+      10,
       "tasks/get",
       { taskId: "whatever" },
       { name: "whatever" },
@@ -4237,7 +4258,7 @@ describe("MCP tasks (host executor, e2e)", () => {
     expect(own.result?.status).toBe("input_required");
   });
 
-  test("a synchronous call of the task-only tool refuses to run", async () => {
+  test("the task-only tool becomes a task without being asked", async () => {
     const t = newTest();
     const res = await hostRpc(
       t,
@@ -4247,10 +4268,14 @@ describe("MCP tasks (host executor, e2e)", () => {
       { name: "invoices_bulkMarkPaid" },
     );
     const body = (await res.json()) as {
-      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      result?: { resultType?: string; taskId?: string };
     };
-    expect(body.result?.isError).toBe(true);
-    expect(body.result?.content?.[0]?.text).toMatch(/must be invoked as an MCP task/);
+    // `taskSupport: "required"` and a capable caller, so the server
+    // decides: a handle, not the inline refusal the Convex function
+    // would have produced. That refusal is now unreachable through this
+    // mount, which is the point of declaring the level.
+    expect(body.result?.resultType).toBe("task");
+    expect(body.result?.taskId).toBeTruthy();
   });
 });
 

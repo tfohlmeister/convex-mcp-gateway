@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
   completeCall,
@@ -24,11 +24,28 @@ const registeredTool = {
   taskSupport: true,
 };
 
+/**
+ * The same tool at the level that has something to refuse. An `optional`
+ * tool never refuses a caller who cannot have a task: nobody asked for
+ * one, so it answers inline. A `required` one cannot run any other way,
+ * which is what makes the missing capability, the missing identity and
+ * the unconfigured mount reportable at all.
+ */
+const requiredTaskTool = {
+  ...registeredTool,
+  name: "reports_generate_required",
+  taskSupport: "required" as const,
+};
+
 function component() {
   return {
     registry: {
       getTool: Symbol("getTool"),
       getOAuthConfig: Symbol("getOAuthConfig"),
+    },
+    sessions: {
+      getSession: Symbol("getSession"),
+      touchSession: Symbol("touchSession"),
     },
     dispatch: {
       runTool: Symbol("runTool"),
@@ -95,10 +112,17 @@ function harness(tasks: McpTasksOptions | undefined) {
     expiresAt: 2,
   };
   const ctx = {
-    runQuery: async (ref: unknown) => {
-      if (ref === api.registry.getTool) return registeredTool;
+    runQuery: async (ref: unknown, args?: Record<string, unknown>) => {
+      if (ref === api.registry.getTool) {
+        return (args as { name?: string })?.name === requiredTaskTool.name
+          ? requiredTaskTool
+          : registeredTool;
+      }
       if (ref === api.tasks.getTaskForOwner) return taskRow;
       if (ref === api.registry.getOAuthConfig) return null;
+      if (ref === api.sessions.getSession) {
+        return { sessionId: "session-1", protocolVersion: "2025-06-18" };
+      }
       throw new Error("unexpected query");
     },
     runMutation: async (ref: unknown, args: Record<string, unknown>) => {
@@ -560,21 +584,21 @@ describe("mount scope", () => {
 });
 
 describe("SEP-2663 wire shape", () => {
-  test("a task-augmented call names the capability it is missing", async () => {
+  test("a required tool names the capability a client is missing", async () => {
     const { api, ctx, options } = harness({});
     const response = await handleMcpRequest(
       ctx,
       request(
         55,
         "tools/call",
-        { name: registeredTool.name, arguments: {}, task: {} },
-        { name: registeredTool.name, clientCapabilities: {} },
+        { name: requiredTaskTool.name, arguments: {} },
+        { name: requiredTaskTool.name, clientCapabilities: {} },
       ),
       api,
       options,
     );
     // The same diagnosis the task methods give: same missing
-    // declaration, and this is where a client meets it first.
+    // declaration, named in machine-readable form.
     const body = (await response.json()) as {
       error: { code: number; data: { requiredCapabilities: unknown } };
     };
@@ -582,6 +606,32 @@ describe("SEP-2663 wire shape", () => {
     expect(body.error.data.requiredCapabilities).toEqual({
       extensions: { "io.modelcontextprotocol/tasks": {} },
     });
+  });
+
+  test("an optional tool answers inline for a client that cannot have a task", async () => {
+    const { api, ctx, mutations, options } = harness({});
+    // The harness refuses to dispatch, because every other test here is
+    // about NOT dispatching. This one is the opposite.
+    (ctx as { runAction: unknown }).runAction = async () => ({
+      ok: true,
+      value: "generated",
+    });
+    const response = await handleMcpRequest(
+      ctx,
+      request(
+        56,
+        "tools/call",
+        { name: registeredTool.name, arguments: {} },
+        { name: registeredTool.name, clientCapabilities: {} },
+      ),
+      api,
+      options,
+    );
+    // Nobody asked for a task, so there is nothing to refuse: the call
+    // runs synchronously rather than erroring over a capability the
+    // client never needed.
+    expect(response.status).toBe(200);
+    expect(mutations.some((m) => m.ref === api.tasks.createTask)).toBe(false);
   });
 
   test("a client that never declared the extension is told what it lacks", async () => {
@@ -715,8 +765,8 @@ describe("wire negotiation", () => {
       request(
         40,
         "tools/call",
-        { name: registeredTool.name, arguments: {}, task: {} },
-        { name: registeredTool.name },
+        { name: requiredTaskTool.name, arguments: {} },
+        { name: requiredTaskTool.name },
       ),
       api,
       options,
@@ -728,7 +778,7 @@ describe("wire negotiation", () => {
       (m) => m.ref === api.dispatch.recordAuthDenial,
     );
     expect(denial?.args).toMatchObject({
-      name: registeredTool.name,
+      name: requiredTaskTool.name,
       auditIdentitySubject: null,
       outcome: "denied",
       errorMessage: "Task-augmented calls require authentication",
@@ -758,8 +808,8 @@ describe("wire negotiation", () => {
       request(
         41,
         "tools/call",
-        { name: registeredTool.name, arguments: {}, task: {} },
-        { name: registeredTool.name },
+        { name: requiredTaskTool.name, arguments: {} },
+        { name: requiredTaskTool.name },
       ),
       api,
       options,
@@ -767,19 +817,196 @@ describe("wire negotiation", () => {
     expect(response.status).toBe(401);
   });
 
-  test("a task-augmented call 404s when tasks are not configured", async () => {
+  test("a required tool refuses on the session era instead of running inline", async () => {
+    const { api, ctx, mutations, options } = harness({});
+    // Not `statelessJsonRpcRequest`: a legacy session request, which is
+    // the era with no tasks at all.
+    const response = await handleMcpRequest(
+      ctx,
+      new Request("https://gateway.example/mcp", {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "mcp-session-id": "session-1",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 57,
+          method: "tools/call",
+          params: { name: requiredTaskTool.name, arguments: {} },
+        }),
+      }),
+      api,
+      options,
+    );
+
+    // The tool has no synchronous answer, so dispatching it would run
+    // the side effect the level exists to defer. `tools/list` does not
+    // advertise `execution` on this era either, so the client could not
+    // have known without being told.
+    const body = (await response.json()) as {
+      error?: { code: number; message: string };
+    };
+    expect(body.error?.code).toBe(-32602);
+    expect(body.error?.message).toMatch(/runs only as a task/);
+    expect(mutations.some((m) => m.ref === api.tasks.createTask)).toBe(false);
+  });
+
+  test("shouldCreate decides an optional call, and never sees a denied one", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const inline = { ...harness({}) };
+    (inline.ctx as { runAction: unknown }).runAction = async () => ({
+      ok: true,
+      value: "generated",
+    });
+    const inlineOptions = {
+      ...inline.options,
+      tasks: {
+        shouldCreate: (_ctx: unknown, call: Record<string, unknown>) => {
+          seen.push(call);
+          return false;
+        },
+      },
+    };
+    const declined = await handleMcpRequest(
+      inline.ctx,
+      request(
+        58,
+        "tools/call",
+        { name: registeredTool.name, arguments: { month: "2026-08" } },
+        { name: registeredTool.name },
+      ),
+      inline.api,
+      inlineOptions as never,
+    );
+    expect(declined.status).toBe(200);
+    expect(
+      inline.mutations.some((m) => m.ref === inline.api.tasks.createTask),
+    ).toBe(false);
+    // The payload is the call, not the request: enough to judge "is this
+    // one going to be slow" without parsing the wire.
+    expect(seen).toEqual([
+      {
+        toolName: registeredTool.name,
+        toolKind: registeredTool.kind,
+        args: { month: "2026-08" },
+        identity: { subject: "user-1", claims: { subject: "user-1" } },
+      },
+    ]);
+
+    // Returning true is the same as omitting it.
+    const accepted = harness({ shouldCreate: () => true });
+    await handleMcpRequest(
+      accepted.ctx,
+      request(
+        59,
+        "tools/call",
+        { name: registeredTool.name, arguments: {} },
+        { name: registeredTool.name },
+      ),
+      accepted.api,
+      accepted.options,
+    );
+    expect(
+      accepted.mutations.some((m) => m.ref === accepted.api.tasks.createTask),
+    ).toBe(true);
+
+    // A denied call never reaches host policy: the predicate runs after
+    // `authorize`, so it judges calls that are actually going to happen.
+    const deniedSeen: unknown[] = [];
+    const denied = harness({
+      shouldCreate: () => {
+        deniedSeen.push(true);
+        return true;
+      },
+    });
+    const deniedResponse = await handleMcpRequest(
+      denied.ctx,
+      request(
+        60,
+        "tools/call",
+        { name: registeredTool.name, arguments: {} },
+        { name: registeredTool.name },
+      ),
+      denied.api,
+      { ...denied.options, authorize: async () => ({ allowed: false }) },
+    );
+    expect((await deniedResponse.json()) as unknown).toMatchObject({
+      error: { code: -32003 },
+    });
+    expect(deniedSeen).toEqual([]);
+  });
+
+  test("a required tool does not consult shouldCreate", async () => {
+    const seen: unknown[] = [];
+    const { api, ctx, mutations, options } = harness({
+      shouldCreate: () => {
+        seen.push(true);
+        return false;
+      },
+    });
+    await handleMcpRequest(
+      ctx,
+      request(
+        61,
+        "tools/call",
+        { name: requiredTaskTool.name, arguments: {} },
+        { name: requiredTaskTool.name },
+      ),
+      api,
+      options,
+    );
+    // "Required" is not a default a host may override: a `false` here
+    // would leave the call with no way to run at all.
+    expect(seen).toEqual([]);
+    expect(mutations.some((m) => m.ref === api.tasks.createTask)).toBe(true);
+  });
+
+  test("a shouldCreate that throws still answers, with a task", async () => {
+    const { api, ctx, mutations, options } = harness({
+      shouldCreate: () => {
+        throw new Error("host policy exploded");
+      },
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let response: Response;
+    try {
+      response = await handleMcpRequest(
+        ctx,
+        request(
+          62,
+          "tools/call",
+          { name: registeredTool.name, arguments: {} },
+          { name: registeredTool.name },
+        ),
+        api,
+        options,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    // Not a raw 500: every other host callback on this path is guarded,
+    // and the fallback is the durable direction.
+    expect(response.status).toBe(200);
+    expect(mutations.some((m) => m.ref === api.tasks.createTask)).toBe(true);
+  });
+
+  test("a required tool 404s when tasks are not configured", async () => {
     const { api, ctx, options } = harness(undefined);
     const response = await handleMcpRequest(
       ctx,
       request(
         7,
         "tools/call",
-        { name: registeredTool.name, arguments: {}, task: {} },
-        { name: registeredTool.name },
+        { name: requiredTaskTool.name, arguments: {} },
+        { name: requiredTaskTool.name },
       ),
       api,
       options,
     );
+    // The capability was never advertised and this tool cannot run any
+    // other way, so it is an unknown method rather than a refusal.
     expect(response.status).toBe(404);
   });
 
@@ -797,7 +1024,7 @@ describe("wire negotiation", () => {
     ).toBe(-32020);
   });
 
-  test("a client ttl can only shorten the host's retention ceiling", async () => {
+  test("the host's retention ceiling is the whole answer", async () => {
     const { api, ctx, mutations, options } = harness({
       execute: async () => {},
       retentionMs: 5 * 60 * 1000,
@@ -810,6 +1037,8 @@ describe("wire negotiation", () => {
         {
           name: registeredTool.name,
           arguments: {},
+          // A legacy hint. SEP-2663 removed the shape a client used to
+          // shorten retention with, so this says nothing.
           task: { ttlMs: 7 * 24 * 60 * 60 * 1000 },
         },
         { name: registeredTool.name },
@@ -821,22 +1050,24 @@ describe("wire negotiation", () => {
     expect(createCall?.args.ttlMs).toBe(5 * 60 * 1000);
   });
 
-  test("a malformed task request object is rejected", async () => {
-    const { api, ctx, options } = harness({});
+  test("a legacy task param is ignored, not rejected", async () => {
+    const { api, ctx, mutations, options } = harness({});
     const response = await handleMcpRequest(
       ctx,
       request(
         9,
         "tools/call",
+        // Malformed by the old contract's rules, and meaningless by the
+        // new one: the server decides, so there is nothing here to
+        // validate and nothing to refuse.
         { name: registeredTool.name, arguments: {}, task: { ttlMs: "soon" } },
         { name: registeredTool.name },
       ),
       api,
       options,
     );
-    expect(
-      ((await response.json()) as { error: { code: number } }).error.code,
-    ).toBe(-32602);
+    expect(response.status).toBe(200);
+    expect(mutations.some((m) => m.ref === api.tasks.createTask)).toBe(true);
   });
 });
 

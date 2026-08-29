@@ -10,14 +10,15 @@ which is exactly what a request-scoped Convex `httpAction` can deliver.
 
 Two opt-ins, both required:
 
-1. Register the tool with `taskSupport: true`. Only such tools accept a
-   task request; the catalog advertises them as
-   `execution: { taskSupport: "optional" }`.
+1. Register the tool with `taskSupport: "optional"` or `"required"`
+   (`true` is still accepted and reads as `"optional"`). Only such tools
+   can become tasks, and the catalog advertises the level it was given as
+   `execution: { taskSupport: ... }`.
 2. Configure the `tasks` option of `handleMcpRequest`. Without it the
    capability is never advertised and every task method answers as an
    unknown method.
 
-`taskSupport: true` cannot be combined with `metadata.auditArgs`
+A task-supporting tool cannot be combined with `metadata.auditArgs`
 (`false` or `{ redact }`): a task stores the caller's arguments verbatim
 in the component's task row for the whole retention window, because
 execution needs them, so honouring redaction in the audit row while
@@ -30,7 +31,7 @@ defineMcpMutation({
   name: "invoices_recount",
   fn: api.invoices.recount,
   args: {},
-  taskSupport: true,
+  taskSupport: "optional",
 });
 
 // convex/http.ts
@@ -43,16 +44,37 @@ gateway.handleMcpRequest(ctx, request, {
 
 ## Wire contract
 
-- `tools/call` with `params.task` (an object; optional numeric `ttlMs`)
-  returns a **flat** `CreateTaskResult` instead of running the tool
-  inline: `resultType: "task"` alongside `taskId`, `status`,
+- `tools/call` returns a **flat** `CreateTaskResult` instead of running
+  the tool inline when the SERVER decides this call should be a task.
+  SEP-2663 gives the client no say beyond the capability: it opts in
+  once and handles whichever result arrives. A `params.task` from an
+  older client is a legacy hint and is ignored rather than refused.
+
+  The decision is: a tool registered `taskSupport: "required"` always
+  becomes a task; one registered `"optional"` becomes a task unless the
+  mount's `tasks.shouldCreate` returns `false` for this call; one
+  registered `"forbidden"` (the default) never does. A task is possible
+  at all only when the client declared the extension and the caller is
+  authenticated, since a task is owner-bound; an `optional` tool that
+  cannot have a task simply answers inline, while a `required` one
+  refuses with `-32021` or a `401`.
+
+  On the session era there are no tasks, so a `required` tool refuses
+  there too, with `-32602` naming the protocol it needs. It has no
+  synchronous answer to give, and dispatching it anyway would run the
+  side effect the level exists to defer. A `shouldCreate` that throws is
+  logged and treated as "yes": a task is durable and pollable, where an
+  inline dispatch of work the host wanted deferred can outlive the
+  request and lose its result.
+
+  The result carries: `resultType: "task"` alongside `taskId`, `status`,
   `createdAt`, `lastUpdatedAt`, `ttlMs` and `pollIntervalMs`, with no
   nested `task` key. Timestamps are ISO-8601 and `ttlMs` is the lifetime
   the task has **left**, counted from the moment it is read, so a client
   polling twice is told how much longer it may keep going rather than how
   long it could have.
 
-  The client must declare the extension in its per-request
+  The client declares the extension in its per-request
   `clientCapabilities`, under `extensions`:
   `{ extensions: { "io.modelcontextprotocol/tasks": {} } }`. The server
   advertises the same key under `capabilities.extensions` in

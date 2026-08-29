@@ -15,6 +15,7 @@ import {
   type McpInputRequiredResult,
   type McpServerInfo,
   type McpToolRegistration,
+  mcpTaskSupportLevel,
 } from "../shared.js";
 
 /**
@@ -354,6 +355,33 @@ export type McpTasksOptions = {
    * and completes/fails the task (no retries, no input rounds).
    */
   execute?: McpTaskExecutor;
+  /**
+   * Whether THIS call should become a task, for a tool registered
+   * `taskSupport: "optional"`. SEP-2663 makes the decision the server's:
+   * a client opts in once through the extension capability and sends no
+   * per-request flag, so something on this side has to choose, and the
+   * knowledge of "is this one going to be slow" lives in the host rather
+   * than in the gateway.
+   *
+   * Omit it and every eligible call becomes a task, which is what the
+   * spec's own conformance scenario requires of a task-supporting tool.
+   * Return `false` to answer inline instead; the spec allows that
+   * explicitly for a fast operation.
+   *
+   * Only consulted when a task is possible at all: the tool says
+   * `optional`, the client declared the extension, and the caller is
+   * authenticated. A `required` tool never reaches it, and neither does
+   * a call this mount's `authorize` denied.
+   */
+  shouldCreate?: (
+    ctx: McpHandlerCtx,
+    call: {
+      toolName: string;
+      toolKind: "query" | "mutation" | "action";
+      args: Record<string, unknown>;
+      identity: { subject: string; claims?: Record<string, unknown> };
+    },
+  ) => Promise<boolean> | boolean;
   /**
    * Called after a `tasks/update` accepted MRTR-shaped `inputResponses`
    * for an `input_required` task (now back in `working`). Hosts with a
@@ -918,6 +946,40 @@ function declaresTasksExtension(
   return (
     isPlainObject(extensions) && isPlainObject(extensions[TASKS_CAPABILITY_KEY])
   );
+}
+
+/**
+ * `tasks.shouldCreate`, with the host's throw contained.
+ *
+ * Every other host callback on this path is wrapped, and this one has no
+ * envelope of its own to fall back on: thrown bare it escapes
+ * `handlePost` as a raw 500 with no JSON-RPC body. A throw falls back to
+ * the default, which is to create the task. That direction is the safe
+ * one: a task is durable and pollable, while an inline dispatch of an
+ * operation the host thought worth deferring can exceed the request
+ * timeout and lose the result outright.
+ */
+async function safeShouldCreateTask(
+  shouldCreate: McpTasksOptions["shouldCreate"],
+  ctx: HandlerCtx,
+  call: {
+    toolName: string;
+    toolKind: "query" | "mutation" | "action";
+    args: Record<string, unknown>;
+    identity: { subject: string; claims?: Record<string, unknown> };
+  },
+): Promise<boolean> {
+  if (!shouldCreate) return true;
+  try {
+    return await shouldCreate(ctx, call);
+  } catch (err) {
+    console.error(
+      "[mcp-gateway] tasks shouldCreate threw; creating the task anyway",
+      call.toolName,
+      err,
+    );
+    return true;
+  }
 }
 
 /**
@@ -4827,8 +4889,10 @@ async function handlePost(
             // Advertise task support only when the host actually
             // configured task execution AND the caller speaks the
             // stateless protocol; session-based clients cannot poll tasks.
-            ...(tool.taskSupport === true && isStateless && options.tasks
-              ? { execution: { taskSupport: "optional" } }
+            ...(mcpTaskSupportLevel(tool) !== "forbidden" &&
+            isStateless &&
+            options.tasks
+              ? { execution: { taskSupport: mcpTaskSupportLevel(tool) } }
               : {}),
           });
         }
@@ -4969,68 +5033,120 @@ async function handlePost(
         break;
       }
 
-      // Task augmentation (`io.modelcontextprotocol/tasks`): validate the
-      // whole negotiation before authorize so an unusable task request
-      // never runs the tool synchronously as a silent fallback.
-      const taskRequest = message.params?.task;
-      if (taskRequest !== undefined) {
-        if (!isStateless) {
-          body = jsonErrorEnvelope(
-            message.id,
-            INVALID_PARAMS,
-            "Task-augmented calls require MCP protocol " +
-              `${STATELESS_PROTOCOL_VERSION} or later`,
-          );
-          break;
-        }
+      // Task augmentation (`io.modelcontextprotocol/tasks`). SEP-2663
+      // makes the decision the SERVER's: a client opts in once through
+      // the extension capability and sends no per-request flag, so a
+      // `params.task` from a client is a legacy hint and is ignored
+      // rather than refused. On the session era it is still refused,
+      // loudly: tasks never existed there, so a client sending one has
+      // misread which protocol it is speaking and would otherwise get a
+      // synchronous answer to a question it thinks is asynchronous.
+      const taskLevel = mcpTaskSupportLevel(tool);
+      if (!isStateless && message.params?.task !== undefined) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "Task-augmented calls require MCP protocol " +
+            `${STATELESS_PROTOCOL_VERSION} or later`,
+        );
+        break;
+      }
+      if (!isStateless && taskLevel === "required") {
+        // A `required` tool has no synchronous answer, and the session
+        // era has no tasks, so the only honest outcome is a refusal.
+        // Without this the era gate below skips the whole block and the
+        // call falls through to an ordinary dispatch: the side effect
+        // runs inline, which is the one thing the level exists to
+        // prevent. `tools/list` does not advertise `execution` on this
+        // era either, so the client could not have known.
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          `Tool "${tool.name}" runs only as a task, which requires MCP ` +
+            `protocol ${STATELESS_PROTOCOL_VERSION} or later`,
+        );
+        break;
+      }
+      // Whether this call may become a task, decided here so the refusals
+      // below stay ahead of `authorize` exactly as they were. Only a
+      // `required` tool refuses: an `optional` one has nothing to refuse,
+      // because nobody asked for a task, so it answers inline.
+      let taskEligible = false;
+      if (isStateless && taskLevel !== "forbidden") {
         if (!options.tasks) {
-          // Same "unsupported because unconfigured" shape as the
-          // resource catalogs: the capability was never advertised.
-          responseStatus = 404;
-          body = jsonErrorEnvelope(
-            message.id,
-            -32601,
-            "Tasks are not supported: the host did not configure task " +
-              "execution",
-          );
-          break;
+          if (taskLevel === "required") {
+            // Same "unsupported because unconfigured" shape as the
+            // resource catalogs: the capability was never advertised, and
+            // this tool cannot run any other way.
+            responseStatus = 404;
+            body = jsonErrorEnvelope(
+              message.id,
+              -32601,
+              "Tasks are not supported: the host did not configure task " +
+                "execution",
+            );
+            break;
+          }
+        } else if (!declaresTasksExtension(statelessClientCapabilities)) {
+          if (taskLevel === "required") {
+            // Naming the capability in machine-readable form is what lets
+            // a client fix the request rather than guess.
+            raw = statelessErrorResponse(
+              message.id,
+              MISSING_REQUIRED_CLIENT_CAPABILITY,
+              `Tool "${tool.name}" runs only as a task, which requires the ` +
+                `${TASKS_CAPABILITY_KEY} client capability`,
+              { requiredCapabilities: TASKS_REQUIRED_CAPABILITIES },
+            );
+            body = "";
+            break;
+          }
+        } else if (!identity) {
+          if (taskLevel === "required") {
+            // Tasks are owner-bound rows; an anonymous caller could never
+            // poll the result, so refuse before creating unpollable
+            // state. The real 401 + WWW-Authenticate (same as the
+            // authorize denial path) so browser clients begin OAuth
+            // discovery instead of seeing an unactionable 200.
+            //
+            // Audited like every other refusal on this path: this branch
+            // sits before `safeAuthorize`, so without the row an
+            // anonymous caller could probe which tools require a task and
+            // leave no trace at all.
+            try {
+              await ctx.runMutation(component.dispatch.recordAuthDenial, {
+                name: tool.name,
+                args,
+                auditIdentitySubject: null,
+                outcome: "denied",
+                errorCode: UNAUTHORIZED,
+                errorMessage: "Task-augmented calls require authentication",
+                durationMs: 0,
+              });
+            } catch (err) {
+              // Audit must never change the outcome (see safeRecordAudit
+              // in dispatch.ts); log so a recurring write failure stays
+              // visible.
+              console.error(
+                "[mcp-gateway] failed to record anonymous task denial",
+                tool.name,
+                err,
+              );
+            }
+            raw = await requireAuthChallenge(
+              ctx,
+              request,
+              component,
+              message.id,
+            );
+            body = "";
+            break;
+          }
+        } else {
+          taskEligible = true;
         }
-        if (!declaresTasksExtension(statelessClientCapabilities)) {
-          // The same diagnosis the task methods give, because it is the
-          // same missing declaration, and this is where a client meets it
-          // first: naming the capability in machine-readable form is what
-          // lets it fix the request rather than guess at "invalid params".
-          raw = statelessErrorResponse(
-            message.id,
-            MISSING_REQUIRED_CLIENT_CAPABILITY,
-            `Task-augmented calls require the ${TASKS_CAPABILITY_KEY} ` +
-              "client capability",
-            { requiredCapabilities: TASKS_REQUIRED_CAPABILITIES },
-          );
-          body = "";
-          break;
-        }
-        if (
-          !isPlainObject(taskRequest) ||
-          (taskRequest.ttlMs !== undefined &&
-            typeof taskRequest.ttlMs !== "number")
-        ) {
-          body = jsonErrorEnvelope(
-            message.id,
-            INVALID_PARAMS,
-            "Invalid task request: expected an object with optional " +
-              "numeric ttlMs",
-          );
-          break;
-        }
-        if (tool.taskSupport !== true) {
-          body = jsonErrorEnvelope(
-            message.id,
-            INVALID_PARAMS,
-            `Tool "${tool.name}" does not support task execution`,
-          );
-          break;
-        }
+      }
+      if (taskEligible) {
         // Reject a deeply nested args value here, before it reaches the
         // createTask mutation whose arg serialization would overflow the
         // stack and escape as a raw 500.
@@ -5054,40 +5170,6 @@ async function handlePost(
             INVALID_PARAMS,
             "Task arguments must be an object",
           );
-          break;
-        }
-        if (!identity) {
-          // Tasks are owner-bound rows; an anonymous caller could never
-          // poll the result, so reject before creating unpollable state.
-          // Use the real 401 + WWW-Authenticate challenge (same as the
-          // authorize denial path) so browser clients begin OAuth
-          // discovery instead of seeing an unactionable 200.
-          //
-          // Audited like every other refusal on this path: this branch
-          // sits before `safeAuthorize`, so without the row an anonymous
-          // caller could probe which tools accept tasks and leave no
-          // trace at all.
-          try {
-            await ctx.runMutation(component.dispatch.recordAuthDenial, {
-              name: tool.name,
-              args,
-              auditIdentitySubject: null,
-              outcome: "denied",
-              errorCode: UNAUTHORIZED,
-              errorMessage: "Task-augmented calls require authentication",
-              durationMs: 0,
-            });
-          } catch (err) {
-            // Audit must never change the outcome (see safeRecordAudit in
-            // dispatch.ts); log so a recurring write failure is visible.
-            console.error(
-              "[mcp-gateway] failed to record anonymous task denial",
-              tool.name,
-              err,
-            );
-          }
-          raw = await requireAuthChallenge(ctx, request, component, message.id);
-          body = "";
           break;
         }
       }
@@ -5616,7 +5698,19 @@ async function handlePost(
       //     branch already settled (a decline, say) would create a row
       //     that quietly runs the tool. A lost claim broke above with
       //     `alreadyResolvedEnvelope` and created nothing.
-      if (taskRequest !== undefined && options.tasks && identity) {
+      // `shouldCreate` runs here rather than beside the gates above, so
+      // host policy never sees a call this mount's `authorize` denied.
+      const createTask =
+        taskEligible && options.tasks && identity
+          ? taskLevel === "required" ||
+            (await safeShouldCreateTask(options.tasks.shouldCreate, ctx, {
+              toolName: tool.name,
+              toolKind: tool.kind,
+              args: args as Record<string, unknown>,
+              identity,
+            }))
+          : false;
+      if (createTask && options.tasks && identity) {
         const taskId = generateSessionId();
         // A verified continuation carries the chain's idempotency key, and
         // the executor injects the task row's key into `mrtrArgs`. Reusing
@@ -5626,22 +5720,21 @@ async function handlePost(
         const idempotencyKey =
           continuation?.idempotencyKey ?? crypto.randomUUID();
         const executor = options.tasks.execute ? "host" : "component";
-        // A client may only shorten retention, never extend it past the
-        // host's configured ceiling (or the 24h default, mirroring the
+        // The host's ceiling (or the 24h default, mirroring the
         // component's TASK_DEFAULT_TTL_MS). The component additionally
         // clamps to the global [1 minute, 7 days] bounds.
         const hostRetentionMs =
           options.tasks.retentionMs ?? TASK_DEFAULT_RETENTION_MS;
-        const requestedTtlMs =
-          isPlainObject(taskRequest) && typeof taskRequest.ttlMs === "number"
-            ? Math.min(taskRequest.ttlMs, hostRetentionMs)
-            : hostRetentionMs;
+        // The client no longer has a say: SEP-2663 removed the request
+        // shape it used to shorten this with, so the host's ceiling is
+        // the whole answer.
+        const requestedTtlMs = hostRetentionMs;
         // A task created from a continuation must outlive every
-        // continuation that could ask for it again. Otherwise a client
-        // that shortens `ttlMs` below the continuation's own lifetime gets
-        // the reuse lookup to miss (the row is expired, so it is not
-        // reusable) and every replay mints another task and another tool
-        // run from one chain: the exact duplication the shared chain key
+        // continuation that could ask for it again. A mount whose
+        // retention is shorter than its MRTR TTL would otherwise have the
+        // reuse lookup miss (the row is expired, so it is not reusable)
+        // and every replay would mint another task and another tool run
+        // from one chain: the exact duplication the shared chain key
         // exists to prevent.
         const ttlMs =
           continuation !== null

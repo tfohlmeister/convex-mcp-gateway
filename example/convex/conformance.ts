@@ -293,7 +293,10 @@ export const conformanceTools: McpToolRegistration[] = [
     description: "Always reports a tool execution error, after about a second",
     fn: api.conformance.failingJob,
     args: {},
-    taskSupport: true,
+    // `required`, because the scenario calls this one from a client that
+    // did NOT declare the extension and expects `-32021`. An `optional`
+    // tool has nothing to refuse such a client and would answer inline.
+    taskSupport: "required",
   }),
   defineMcpAction({
     name: "protocol_error_job",

@@ -494,7 +494,7 @@ named.
 ### MCP Tasks (poll-first)
 
 Tasks (`io.modelcontextprotocol/tasks`) exist only on the stateless path
-and are doubly opt-in: the tool declares `taskSupport: true` and the
+and are doubly opt-in: the tool declares a `taskSupport` level and the
 host configures the `tasks` handler option; without both, nothing is
 advertised and every task method answers as an unknown method. A
 task-augmented `tools/call` runs the full authorize pipeline, then
