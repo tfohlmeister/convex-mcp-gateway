@@ -1493,7 +1493,16 @@ export const executeScheduledTask = action({
       // reports -32001 as a tool result: a queued call cannot re-challenge
       // the caller, so it fails rather than reporting a refusal as a call
       // that ran. A code added later defaults to failing the task too.
-      if (dispatched.error.code !== -32000) {
+      //
+      // Within -32000, SEP-2663 splits once more, and only the code that
+      // caught the throw can tell the two apart. A tool that REPORTED an
+      // error (a `ConvexError`, the deliberate channel) is a call that
+      // ran: `completed` with `isError`. A tool that CRASHED did not
+      // report anything, so there is no result to inline and `failed`
+      // with the error is the honest answer. The inline path keeps
+      // reporting both as a tool result, because a synchronous caller
+      // has no task to look at and MCP asks for `isError` there.
+      if (dispatched.error.code !== -32000 || dispatched.deliberate !== true) {
         await fail(dispatched.error);
         return null;
       }

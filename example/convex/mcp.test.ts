@@ -3744,10 +3744,11 @@ describe("MCP tasks (modern, e2e)", () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     vi.useRealTimers();
     const failed = await getTask(t, taskId);
-    // A tool that ran and reported an error is a COMPLETED call whose
+    // A tool that ran and REPORTED an error is a COMPLETED call whose
     // result says isError, exactly as on the synchronous path: the model
-    // can read it and retry. `failed` is reserved for the task itself
-    // failing (unknown tool, kind drift, a dispatch that never ran).
+    // can read it and retry. `failed` is for a call that never reported
+    // anything: an unknown tool, kind drift, a dispatch that never ran,
+    // or the tool crashing (see the plain-throw test below).
     expect(failed.result?.status).toBe("completed");
     const errorResult = failed.result?.result as {
       content: Array<{ text: string }>;
@@ -3767,16 +3768,20 @@ describe("MCP tasks (modern, e2e)", () => {
       });
       await t.finishAllScheduledFunctions(vi.runAllTimers);
       const failed = await getTask(t, taskId);
-      expect(failed.result?.status).toBe("completed");
-      const sanitized = failed.result?.result as {
-        content: Array<{ text: string }>;
-        isError: boolean;
+      // A tool that CRASHED reported nothing, so there is no result to
+      // inline: SEP-2663 wants `failed` with the error, and reserves
+      // `completed` + isError for a call that ran and said so. The
+      // ConvexError case above is the other side of that split.
+      expect(failed.result?.status).toBe("failed");
+      expect(failed.result?.result).toBeUndefined();
+      const sanitized = failed.result?.error as {
+        code: number;
+        message: string;
       };
-      expect(sanitized.isError).toBe(true);
       // The polling client must not receive arbitrary exception text: it
       // is durable, owner-readable, and can quote credentials.
-      expect(sanitized.content[0]!.text).toBe("Tool execution failed");
-      expect(sanitized.content[0]!.text).not.toMatch(/postgres/);
+      expect(sanitized.message).toBe("Tool execution failed");
+      expect(sanitized.message).not.toMatch(/postgres/);
       // The operator still gets the full text, on the tool row.
       const toolRows = await t.run(async (ctx) =>
         ctx.runQuery(components.mcpGateway.audit.listEntries, {

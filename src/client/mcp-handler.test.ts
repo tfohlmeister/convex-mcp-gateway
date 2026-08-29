@@ -822,6 +822,71 @@ describe("handleMcpRequest metadata and resources", () => {
     );
   });
 
+  // SEP-2575 wants `-32602` for a request that declares the modern wire
+  // and then carries no usable `_meta`. Calling that a header mismatch
+  // told a client its two declarations disagreed, which is unhelpful
+  // advice when it made only one of them.
+  test.each([
+    ["no _meta at all", true],
+    ["a _meta without a protocol version", false],
+  ])("names a malformed %s as invalid params", async (_label, dropMeta) => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
+    const body = (await request.json()) as {
+      params: { _meta?: Record<string, unknown> };
+    };
+    if (dropMeta) {
+      delete body.params._meta;
+    } else {
+      delete body.params._meta!["io.modelcontextprotocol/protocolVersion"];
+    }
+
+    const response = await handleMcpRequest(
+      ctx,
+      new Request(request.url, {
+        method: "POST",
+        headers: request.headers,
+        body: JSON.stringify(body),
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(response.status).toBe(400);
+    const answered = (await readJson(response)) as {
+      error: { code: number; message: string };
+    };
+    expect(answered.error.code).toBe(-32602);
+    expect(answered.error.message).toMatch(/_meta/);
+  });
+
+  test("still calls two disagreeing declarations a header mismatch", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const request = statelessJsonRpcRequest({ id: 1, method: "tools/list" });
+    const body = await request.json();
+
+    const response = await handleMcpRequest(
+      ctx,
+      new Request(request.url, {
+        method: "POST",
+        // The client declared a version in `_meta` and a different one in
+        // the header, which is the case the mismatch code is for.
+        headers: (() => {
+          const headers = new Headers(request.headers);
+          headers.set("mcp-protocol-version", "2025-06-18");
+          return headers;
+        })(),
+        body: JSON.stringify(body),
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+
+    expect(await readJson(response)).toMatchObject({ error: { code: -32020 } });
+  });
+
   test("rejects a modern request without client capabilities metadata", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);

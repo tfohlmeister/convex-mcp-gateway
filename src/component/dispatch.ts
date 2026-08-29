@@ -9,6 +9,20 @@ const dispatchResultValidator = v.union(
   v.object({
     ok: v.literal(false),
     error: v.object({ code: v.number(), message: v.string() }),
+    /**
+     * Whether the tool REPORTED this error rather than hit it. A
+     * `ConvexError` is the deliberate channel a tool uses to say "this
+     * did not work, here is why"; anything else is a crash it did not
+     * anticipate.
+     *
+     * Both are `-32000` on the wire and both surface inline as a result
+     * with `isError`, which is what MCP asks for: the model can read the
+     * message and retry. The task path needs the distinction because
+     * SEP-2663 splits them, `completed` with `result.isError` for the
+     * first and `failed` with an inlined error for the second, and only
+     * the code that caught the throw can tell them apart.
+     */
+    deliberate: v.optional(v.boolean()),
   }),
 );
 
@@ -114,6 +128,11 @@ export const runTool = action({
     //     but tools that can quote credentials or other sensitive values
     //     may opt out of persisted error text with metadata.auditErrorMessage.
     let wireError: { code: number; message: string } | null = null;
+    // Whether the tool REPORTED the error rather than hit it, kept beside
+    // the wire error rather than inside it: `error` is the JSON-RPC
+    // object that goes to the client verbatim, and this is for the
+    // caller of `runTool`.
+    let deliberateError = false;
     let auditError: { code: number; message?: string } | null = null;
     try {
       const handle = tool.functionHandle as FunctionHandle<
@@ -148,7 +167,8 @@ export const runTool = action({
       // message; the audit row still records the full text.
       // `isDeliberateConvexError` is shared with the host's resource
       // paths so both classify errors the same way.
-      const wireMessage = isDeliberateConvexError(err)
+      deliberateError = isDeliberateConvexError(err);
+      const wireMessage = deliberateError
         ? fullMessage
         : "Tool execution failed";
       wireError = { code: -32000, message: wireMessage };
@@ -181,7 +201,11 @@ export const runTool = action({
     });
 
     if (wireError) {
-      return { ok: false as const, error: wireError };
+      return {
+        ok: false as const,
+        error: wireError,
+        deliberate: deliberateError,
+      };
     }
     return { ok: true as const, data };
   },

@@ -1229,14 +1229,14 @@ describe("tasks: built-in executor guards", () => {
       taskId: "task-2",
       ownerSubject: "alice",
     });
-    // The fake handle cannot run, so dispatch reports a tool execution
-    // error, which is a COMPLETED call carrying isError. The point is that
-    // it got PAST the eligibility gate rather than being refused there.
-    expect(task?.status).toBe("completed");
-    expect(
-      (task?.result as { isError?: boolean } | undefined)?.isError,
-    ).toBe(true);
-    expect(JSON.stringify(task?.result)).not.toMatch(/no longer eligible/);
+    // The fake handle cannot run, so the dispatch CRASHES rather than the
+    // tool reporting anything: a failed task with an inlined error, not a
+    // completed one carrying isError. The point is unchanged, and it is
+    // in the error text: it got PAST the eligibility gate rather than
+    // being refused there.
+    expect(task?.status).toBe("failed");
+    expect(task?.result).toBeUndefined();
+    expect(JSON.stringify(task?.error)).not.toMatch(/no longer eligible/);
   });
 });
 

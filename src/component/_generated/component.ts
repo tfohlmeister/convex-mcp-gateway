@@ -104,7 +104,11 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
         },
         | { data: any; ok: true }
-        | { error: { code: number; message: string }; ok: false },
+        | {
+            deliberate?: boolean;
+            error: { code: number; message: string };
+            ok: false;
+          },
         Name
       >;
     };
