@@ -144,9 +144,18 @@ optional, but when present must contain its name and version.
 
 Modern requests do not create, read, touch, delete, or return a session id.
 They use `server/discover` for server metadata and capabilities, and the
-declarative catalog is synchronized before discovery or dispatch. The legacy
-wire contract remains unchanged: `initialize` always uses the session path,
-including when a client incorrectly includes stateless metadata.
+declarative catalog is synchronized before discovery or dispatch.
+
+The era is decided by what the request declares, `initialize` included.
+`2026-07-28` removed `initialize`, so a request carrying modern routing
+metadata that calls it is refused with HTTP 404 and `-32601`, exactly as
+`ping`, `logging/setLevel`, `resources/subscribe` and
+`resources/unsubscribe` already were. A request that declares nothing
+modern negotiates a session as it always has, so the legacy wire contract
+is unchanged. A client that mixes the two, modern `_meta` without the
+matching `MCP-Protocol-Version` header, gets the same `-32020` header
+mismatch every other method answers to that shape, rather than a legacy
+session it did not ask for.
 
 ### Stateless multi-round trips (MRTR)
 
