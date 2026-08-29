@@ -29,6 +29,7 @@ import {
   type McpToolKind,
   type McpToolRegistration,
   type McpToolSecurityScheme,
+  mcpTaskSupportLevel,
 } from "../shared.js";
 import {
   describeIconsProblem,
@@ -338,7 +339,7 @@ interface McpToolConfigBase<
    * to defer and must persist the gateway-issued idempotency key around
    * its side effect (see docs/tasks.md).
    */
-  taskSupport?: boolean;
+  taskSupport?: boolean | "forbidden" | "optional" | "required";
   /** Optional display title advertised in `tools/list`. */
   title?: string;
   /** MCP behavior hints advertised in `tools/list`. */
@@ -1146,7 +1147,7 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
 }
 
 /**
- * Reject `taskSupport: true` on a tool that asked for its arguments to be
+ * Reject task support on a tool that asked for its arguments to be
  * kept out of the audit log. A task stores the caller's `args` verbatim in
  * the component's `tasks` table for the whole retention window (execution
  * needs them), so honouring `metadata.auditArgs: false` / `{ redact }` in
@@ -1156,7 +1157,7 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
  */
 function assertTaskAuditCompatibility(tools: McpToolRegistration[]): void {
   for (const tool of tools) {
-    if (tool.taskSupport !== true) continue;
+    if (mcpTaskSupportLevel(tool) === "forbidden") continue;
     const auditArgs = (
       tool.metadata as { auditArgs?: false | true | { redact?: string[] } } | undefined
     )?.auditArgs;

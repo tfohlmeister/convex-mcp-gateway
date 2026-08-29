@@ -110,7 +110,13 @@ export default defineSchema({
      * configured task execution. Pre-existing rows without the column
      * stay valid courtesy of `v.optional`.
      */
-    taskSupport: v.optional(v.boolean()),
+    // A boolean is the LIVE format for any host still registering
+    // `taskSupport: true`, which stays supported, as well as the format
+    // of every row written before the levels existed. It is not a
+    // migration artefact to be dropped later: `true` reads as
+    // `"optional"` on both sides, and `mcpTaskSupportLevel` is the one
+    // place that decides so the client and the executor cannot drift.
+    taskSupport: v.optional(v.union(v.boolean(), v.literal("forbidden"), v.literal("optional"), v.literal("required"))),
     /** MCP-facing title, annotations, `_meta`, and security schemes. */
     protocolMetadata: v.optional(v.any()),
     metadata: v.optional(v.any()),

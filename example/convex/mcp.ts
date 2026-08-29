@@ -192,7 +192,13 @@ export const tools: McpToolRegistration[] = [
     // their `tasks` / `authorize` options, never by their catalog. On the
     // main mount, which has no `tasks.execute`, a task call to this tool
     // simply fails with the fallback's error.
-    taskSupport: true,
+    //
+    // `"required"` rather than `"optional"`: the Convex function refuses
+    // to run inline, so a synchronous answer is never a valid outcome for
+    // it. Saying that in the registration is what lets the gateway refuse
+    // a client that cannot poll, with `-32021` naming the capability,
+    // instead of dispatching a call that can only fail.
+    taskSupport: "required",
   }),
 ];
 

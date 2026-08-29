@@ -225,7 +225,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
-          taskSupport?: boolean;
+          taskSupport?: boolean | "forbidden" | "optional" | "required";
         } | null,
         Name
       >;
@@ -288,7 +288,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
-          taskSupport?: boolean;
+          taskSupport?: boolean | "forbidden" | "optional" | "required";
         }>,
         Name
       >;
@@ -337,7 +337,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           name: string;
           outputSchema?: any;
           protocolMetadata?: any;
-          taskSupport?: boolean;
+          taskSupport?: boolean | "forbidden" | "optional" | "required";
         },
         string,
         Name
@@ -395,7 +395,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             name: string;
             outputSchema?: any;
             protocolMetadata?: any;
-            taskSupport?: boolean;
+            taskSupport?: boolean | "forbidden" | "optional" | "required";
           }>;
         },
         null,
