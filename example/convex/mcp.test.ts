@@ -8,6 +8,7 @@ import { McpGateway } from "convex-mcp-gateway";
 import {
   conformanceResourceTemplates,
   conformanceResources,
+  conformanceTools,
 } from "./conformance.js";
 import { authorizeResource } from "./http.js";
 
@@ -4293,5 +4294,107 @@ describe("conformance fixtures (MCP_CONFORMANCE mount)", () => {
     const refused = await anonymous("docs://private", "list");
     expect(refused.allowed).toBe(false);
     expect(refused.reason ?? "").not.toMatch(/^unauth/i);
+  });
+
+  // Two rows in this catalog are written imperatively rather than through
+  // `defineMcpQuery`, because the keywords they carry are the point. A
+  // mistake in either is rejected at catalog SYNC, which runs on every
+  // request, so it does not fail one scenario: it takes the whole
+  // conformance mount down and every scenario reports a connection
+  // failure. Registering them here is what turns that into a red test.
+  test("every conformance tool registers, keywords and header binding intact", async () => {
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    await t.run(async (ctx) => {
+      for (const tool of conformanceTools) {
+        await gateway.registerTool(
+          ctx,
+          tool as unknown as Parameters<typeof gateway.registerTool>[1],
+        );
+      }
+      const stored = (await ctx.runQuery(
+        components.mcpGateway.registry.listTools,
+        {},
+      )) as Array<{ name: string; inputSchema: unknown }>;
+      expect(stored.map((tool) => tool.name).sort()).toEqual(
+        conformanceTools.map((tool) => tool.name).sort(),
+      );
+
+      // The SEP-2243 fixture's binding has to survive to the STORED
+      // schema, which is what the runtime `Mcp-Param-*` walk reads.
+      const headers = stored.find((tool) => tool.name === "test_custom_headers");
+      expect(headers?.inputSchema).toEqual({
+        type: "object",
+        properties: { region: { type: "string", "x-mcp-header": "region" } },
+      });
+    });
+  });
+
+  // What the SEP-1613 and SEP-2106 checks actually read is the ADVERTISED
+  // schema, which is the authored copy rather than the resolved one, so
+  // `tools/list` is the only place this can be pinned.
+  test("the json-schema fixture advertises every keyword the scenario reads", async () => {
+    const t = newTest();
+    const gateway = new McpGateway(components.mcpGateway);
+    // Authenticated, because the fixture carries no `metadata.public` and
+    // the example's own authorizer filters `tools/list` for an anonymous
+    // caller. The conformance mount allows everything instead, so there
+    // this tool lists for the suite.
+    const tAdmin = t.withIdentity({
+      subject: "carol",
+      roles: ["finance.admin"],
+    } as unknown as Parameters<typeof t.withIdentity>[0]) as ReturnType<
+      typeof newTest
+    >;
+    const session = await initialize(tAdmin);
+    const fixture = conformanceTools.find(
+      (tool) => tool.name === "json_schema_2020_12_tool",
+    )!;
+    await tAdmin.run(async (ctx) => {
+      await gateway.registerTool(
+        ctx,
+        fixture as unknown as Parameters<typeof gateway.registerTool>[1],
+      );
+    });
+
+    const list = await rpc(tAdmin, session, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const body = (await list.json()) as {
+      result: {
+        tools: Array<{
+          name: string;
+          inputSchema: {
+            $schema?: string;
+            $defs?: Record<string, { $anchor?: string }>;
+            additionalProperties?: boolean;
+            allOf?: Array<{ anyOf?: unknown[] }>;
+            if?: unknown;
+            then?: unknown;
+            else?: unknown;
+          };
+        }>;
+      };
+    };
+    const advertised = body.result.tools.find(
+      (tool) => tool.name === "json_schema_2020_12_tool",
+    );
+    expect(advertised).toBeDefined();
+    const schema = advertised!.inputSchema;
+    // SEP-1613.
+    expect(schema.$schema).toBe("https://json-schema.org/draft/2020-12/schema");
+    expect(schema.$defs?.address).toBeDefined();
+    expect(schema.additionalProperties).toBe(false);
+    // SEP-2106: a non-empty `allOf` with a nested `anyOf` in one member,
+    // all three conditional keywords, and the `$anchor` on `$defs.address`.
+    expect(
+      (schema.allOf ?? []).some((member) => Array.isArray(member.anyOf)),
+    ).toBe(true);
+    expect(schema.if).toBeDefined();
+    expect(schema.then).toBeDefined();
+    expect(schema.else).toBeDefined();
+    expect(schema.$defs?.address?.$anchor).toBe("address");
   });
 });
