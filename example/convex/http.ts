@@ -161,6 +161,22 @@ const resolveIdentity = async (token: string) => {
 // not Node). Declare only the slice used here.
 declare const process: { env: Record<string, string | undefined> };
 const CONFORMANCE = process.env.MCP_CONFORMANCE === "1";
+// Set by Convex in every deployment, so this is the deployment's own
+// origin whether it runs on convex.site or on the local backend.
+const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL;
+
+/**
+ * The conformance mount's `allowedOrigins`. A matcher rather than a list,
+ * because the suite derives the origin it sends from the `--url` it was
+ * given, and the local backend answers to two spellings of the same
+ * address: it is started with `--convex-site http://127.0.0.1:<port>`, so
+ * an exact-string allowlist built from `CONVEX_SITE_URL` alone refuses
+ * `http://localhost:<port>` and fails the very scenario the option is
+ * here for.
+ */
+const conformanceOriginAllowed = (origin: string): boolean =>
+  origin === CONVEX_SITE_URL ||
+  /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
 const mcpHandler = httpAction(async (ctx, request) =>
   gateway.handleMcpRequest(ctx, request, {
@@ -168,9 +184,15 @@ const mcpHandler = httpAction(async (ctx, request) =>
     cors: true,
     // `cors` decides what a browser may read; `allowedOrigins` decides
     // which origins the gateway serves at all. Any deployment with browser
-    // clients should pin the latter. Left off here because this example is
-    // driven from CLIs and tests, which send no Origin header:
-    // allowedOrigins: ["https://app.example.com"],
+    // clients should pin the latter. Off for the ordinary catalog because
+    // this example is driven from CLIs and tests, which send no Origin
+    // header: allowedOrigins: ["https://app.example.com"].
+    //
+    // Under the conformance switch it is on, because
+    // `dns-rebinding-protection` sends `Origin: http://evil.example.com`
+    // and requires a refusal. A request with no Origin at all is served
+    // either way, so this does not gate the rest of the suite.
+    ...(CONFORMANCE ? { allowedOrigins: conformanceOriginAllowed } : {}),
     resolveIdentity,
     // Multi-round-trip requests (see invoices_archiveAfterConfirmation in
     // mcp.ts). Real deployments must supply ≥32 bytes of private, stable

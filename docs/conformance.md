@@ -13,15 +13,34 @@ The example app serves a fixture catalog when `MCP_CONFORMANCE=1`:
 ```sh
 npx convex env set MCP_CONFORMANCE 1
 npx convex dev --once                    # redeploy with the switch on
-
-npx @modelcontextprotocol/conformance server --url <site-url>/mcp
-npx @modelcontextprotocol/conformance server --url <site-url>/mcp \
-  --scenario tools-call-simple-text --verbose
-
-# The default "active" suite excludes pending scenarios, which is where
-# `json-schema-2020-12` lives:
-npx @modelcontextprotocol/conformance server --url <site-url>/mcp --suite all
 ```
+
+The suite scores against one spec revision at a time, and this gateway
+serves two eras, so both runs matter:
+
+```sh
+# The 2026-07-28 wire: stateless, MRTR, caching, routing headers, tasks.
+npx @modelcontextprotocol/conformance@alpha server \
+  --url <site-url>/mcp --requirements 2026-07-28
+
+# The session era.
+npx @modelcontextprotocol/conformance@alpha server \
+  --url <site-url>/mcp --requirements 2025-11-25
+
+# One scenario, with the raw JSON:
+npx @modelcontextprotocol/conformance@alpha server \
+  --url <site-url>/mcp --scenario tools-call-simple-text --verbose
+
+# Per-check results as files, which is what the tables below were read from:
+npx @modelcontextprotocol/conformance@alpha server \
+  --url <site-url>/mcp --requirements 2026-07-28 -o ./conformance-out
+```
+
+**Use the `alpha` tag, not `latest`.** The `latest` release (`0.1.16` at
+the time of writing) defines 32 server scenarios, none of them tagged
+`2026-07-28`, so it cannot see the stateless era at all. `0.2.0-alpha.11`
+defines 62, and `--requirements 2026-07-28` freezes the 37 that revision
+requires. `conformance list --requirements 2026-07-28` prints the set.
 
 Turn it off again with `npx convex env remove MCP_CONFORMANCE` and
 redeploy, or the example serves `test_*` tools instead of the invoice
@@ -33,87 +52,133 @@ mounts passing different `tools` arrays delete each other's tools on
 every reconciliation. Mounts may differ by `tasks` or `authorize`, never
 by their catalog.
 
-## What it can and cannot reach
+## Measured results
 
-The suite defines 32 server scenarios. Only some are reachable, and the
-reasons are structural rather than a matter of unfinished fixtures.
+Run on 2026-08-29 against a local deployment, gateway `1.0.0`, suite
+`0.2.0-alpha.11`. Counts are checks, not scenarios, and a scenario the
+summary marks with a tick may simply have scored nothing, so read the
+`-o` output rather than the summary when it matters.
 
-### Reachable and passing
+| Requirement set | Result |
+| --- | --- |
+| `2026-07-28` | **120 passed, 59 failed** |
+| `2025-11-25` | **54 passed, 19 failed** |
 
-`server-initialize`, `tools-list`, `tools-call-simple-text`,
-`tools-call-error`, `ping`, `server-sse-polling`,
-`server-sse-multiple-streams`, and `dns-rebinding-protection` once the
-host sets `allowedOrigins` (the example leaves it off, so that scenario
-fails by default, and passes 2/2 with it configured).
+Every failure below is accounted for in the next section. Nothing here is
+an unexplained red.
 
-`json-schema-2020-12` passes 4/4, including the two SEP-1613 keyword
-checks. It lives in the **pending** suite rather than the active one, so
-`--suite all` is needed to reach it at all:
+### Fully passing, `2026-07-28`
 
-```
-[json-schema-2020-12-tool-found          ] SUCCESS Server advertises tool 'json_schema_2020_12_tool'
-[json-schema-2020-12-$schema             ] SUCCESS inputSchema.$schema field preserved
-[json-schema-2020-12-$defs               ] SUCCESS inputSchema.$defs field preserved with expected structure
-[json-schema-2020-12-additionalProperties] SUCCESS inputSchema.additionalProperties field preserved
-```
+`tools-list`, `tools-call-simple-text`, `tools-call-error`,
+`server-sse-multiple-streams`, `resources-list`, `resources-read-text`,
+`resources-read-binary`, `resources-templates-read`,
+`sep-2164-resource-not-found` (4/4), `dns-rebinding-protection` (2/2),
+`http-header-validation` (14/14), `json-schema-2020-12` (8/8, including
+the SEP-1613 keyword checks and all three SEP-2106 ones), and four of the
+MRTR scenarios that assert refusals rather than interactions
+(`missing-input-response`, `unsupported-methods`, `ignore-extra-params`,
+`validate-input`).
 
-### Unreachable: non-text tool content
+`server-stateless` is 18/25 and `caching` 7/8, with the misses named
+below.
 
-`tools-call-image`, `tools-call-audio`, `tools-call-embedded-resource`
-and `tools-call-mixed-content` cannot be satisfied. Three constraints
-combine:
+### Fully passing, `2025-11-25`
 
-1. A dispatched Convex result is serialized into exactly one
-   `type: "text"` content block.
-2. The only escape hatch is a `beforeCall` hook returning
-   `completeCall(...)`, whose result is forwarded verbatim.
-3. A tool carrying a `beforeCall` hook structurally requires an
-   authenticated caller, and the suite cannot send an `Authorization`
-   header.
+`server-initialize`, `server-session-lifecycle`, `ping`, `tools-list`,
+`tools-call-simple-text`, `tools-call-error`, the four `resources-*`
+read/list scenarios, `dns-rebinding-protection`, `json-schema-2020-12`
+and `server-sse-multiple-streams`.
 
-### Reachable through the anonymous opt-in: `resources/*`
+`server-sse-polling` prints as a pass and is not one. It scores 0 of 0:
+every check it emitted is informational, and it raised two SHOULD-level
+warnings, `server-sse-priming-event` and `server-sse-retry-field`. Read
+it as unverified rather than as green.
 
-`resources-list`, `resources-read-text`, `resources-read-binary` and
-`resources-templates-read` all need an anonymous `resources/*` call,
-which is the only kind the suite can make: it cannot send an
-`Authorization` header.
+## Why the rest fails
 
-The three `sep-2164` not-found checks (`-no-empty-contents`,
-`-error-code`, `-data-uri`) need the same thing, but they ship only in
-`0.2.0-alpha.11`, not in the `latest` the command above installs, so
-reaching them needs an explicit version. They also need the authorizer to
-let an unknown `test://` URI through to resolution: SEP-2164 is about the
-answer a server gives for a resource it does not have, and an authorizer
-that denies unknown URIs replaces that `-32602` with a `-32003`. The
-example allows the whole `test://` scheme under the switch for exactly
-this reason, which is a fixture decision, not a model policy.
+Three different causes, and the distinction is the useful part.
 
-Resource methods require an identity by default, so the example sets
-`anonymousResources` under the `MCP_CONFORMANCE` switch and its
-`authorizeResource` serves the fixtures marked `metadata: { public: true }`.
-Both halves are needed, and not symmetrically: `anonymousResources`
-without an `authorizeResource` is refused outright (it would publish the
-whole catalog), while an `authorizeResource` without the option is the
-ordinary configuration every other mount here uses.
+### 1. The authenticated-hook rule, which blocks the most
 
-The fixtures are transcribed from what each scenario asks for, and the
-gateway side is covered by unit tests, but the suite itself has not been
-run against a live deployment for this change, so treat the entries above
-as reachable rather than as measured passes.
+A tool carrying a `beforeCall` hook structurally requires an
+authenticated caller, and the suite cannot send an `Authorization`
+header. Since a hook is also the only route to a non-text result and the
+only way to open an MRTR round, one rule makes three groups unreachable:
 
-`resources-subscribe` and `resources-unsubscribe` stay unreachable, and
-deliberately so. A subscription is server-side state an anonymous caller
-would accumulate, and this transport cannot push the
-`notifications/resources/updated` a subscription exists to receive.
+- `tools-call-image`, `tools-call-audio`, `tools-call-embedded-resource`,
+  `tools-call-mixed-content` (a dispatched Convex result is serialized
+  into exactly one `type: "text"` block; `completeCall` from a hook is the
+  only other route). Tracked in
+  [#50](https://github.com/tfohlmeister/convex-mcp-gateway/issues/50).
+- Ten `input-required-result-*` scenarios, which need a tool that answers
+  round one with `inputRequests`.
+- The MRTR half of the tasks group (`tasks-mrtr-input`,
+  `tasks-mrtr-composition`), plus `test_input_required_result_*`.
 
-### Not implemented
+`anonymousResources` solved exactly this shape for resource methods. The
+tool-side equivalent does not exist, so these stay unreachable rather than
+failing on their merits.
 
-`prompts/*` (no prompts feature), `logging/setLevel` and
-`completion/complete` (capabilities the gateway never advertises), and
-the sampling, progress and in-call elicitation scenarios, which need
-server-initiated messages the HTTP transport does not push.
+### 2. Features the gateway does not implement
 
-## Known conformance gaps
+`prompts/*` (five scenarios, plus the `prompts/list` half of `caching` and
+of `sep-2549`), `completion/complete`, `logging/setLevel` and
+`tools-call-with-logging`, `tools-call-with-progress`, `tools-call-sampling`,
+the `elicitation-*` scenarios on the session era, and
+`resources-subscribe` / `resources-unsubscribe`, which stay authenticated
+by design. `subscriptions/listen` is unimplemented, so the five
+subscription checks inside `server-stateless` report as skipped rather
+than failed.
+
+`server-stateless` also names three diagnostic fixtures this catalog does
+not provide, because each needs a feature above:
+`test_missing_capability`, `test_streaming_elicitation`,
+`test_logging_tool`. Their checks report untestable.
+
+### 3. Real gaps the run found
+
+These are the ones worth acting on. None of them were visible before the
+suite covered the modern era.
+
+- **Missing `_meta` answers `-32020`, not `-32602`.** A stateless request
+  with no `_meta`, or with a `_meta` that omits
+  `io.modelcontextprotocol/protocolVersion`, is a malformed request.
+  SEP-2575 wants `-32602 Invalid params`; the gateway reports the header
+  mismatch it noticed first. Two checks in `server-stateless`.
+- **`initialize` is answered at the `2026-07-28` wire.** The revision
+  removed the method, and a server that does not implement it must answer
+  HTTP 404 with `-32601`. This gateway routes `initialize` to the legacy
+  era unconditionally, which is deliberate dual-era behaviour and is
+  exactly what the check reads as non-compliant. Needs a decision, not
+  just a fix: the session era has to keep working.
+- **Base64 routing headers accept invalid padding.** `=?base64?SGVsbG8?=`
+  decodes leniently and matched the body value, where the SEP-2243 table
+  requires HTTP 400 with `-32020`.
+- **A malformed base64 wrapper is not treated as a literal.** SEP-2243
+  says a value without the closing `?=` is not an encoded value at all, so
+  it must be compared literally. The gateway rejects it as a mismatch
+  instead, refusing a request it must accept.
+- **A task can never report a protocol-level failure.** SEP-2663 splits a
+  tool error (`completed` with `result.isError`) from a protocol error
+  (`failed` with an inlined error). The gateway maps every throw to
+  `-32000` and the task path launders exactly that into the first shape,
+  so only a refusal the tool never saw (unknown tool, missing caller)
+  can fail a task. `protocol_error_job` exists to make that visible.
+- **Two SSE recommendations are unmet**, both SHOULD rather than MUST: no
+  priming event with an id and empty data on the POST stream, and no
+  `retry` field. Both matter for resumability, which this transport does
+  not offer anyway.
+- **The tasks extension is implemented against an earlier SEP-2663
+  draft.** The suite tests the v2 wire and the gateway answers v1:
+  `capabilities.extensions` is not advertised, a `CreateTaskResult` is not
+  produced for a client that opts in per request or for server-directed
+  creation, `ttlMs` is missing, `tasks/get` on an unknown id answers
+  `-32001` rather than `-32602`, the non-declaring case answers `-32001` /
+  `-32601` rather than `-32021`, and `taskSupport` has no `required`
+  level. Ten scenarios, all in the extension group, which the suite does
+  not score for conformance.
+
+## Known gaps that predate the suite
 
 - **A property name outside ASCII cannot be registered.** Convex field
   names must be non-control ASCII, and a property name carries meaning,
@@ -121,16 +186,34 @@ server-initiated messages the HTTP transport does not push.
   schema fails registration with the tool and the field named, rather
   than failing the write from inside Convex.
 
-SEP-1613 keyword preservation used to sit here. The registry now keeps
-the authored schema beside the resolved one, so `$schema`, `$defs` and
-`$ref` reach the client intact while the gateway keeps walking the
-resolved form. See "Two schemas per tool" in
-[architecture.md](./architecture.md). Measured: `json-schema-2020-12`
-passes 4/4 against a local deployment, see above.
+## Fixtures
 
-## What the suite does not cover
+`example/convex/conformance.ts` is a transcription of what the scenarios
+ask for, not a design of its own. Two parts are load-bearing and easy to
+break:
 
-There are **no server scenarios for `2026-07-28`**. All 32 are tagged
-`2025-06-18` / `2025-11-25`, so the stateless era, which is the larger
-half of this gateway, is not verified by conformance at all today. Any
-claim about stateless conformance still rests on this repo's own tests.
+- **`anonymousResources`.** Resource methods require an identity by
+  default, so `http.ts` sets the option under the switch and its
+  `authorizeResource` serves the fixtures marked
+  `metadata: { public: true }`. Both halves are needed, and not
+  symmetrically: `anonymousResources` without an `authorizeResource` is
+  refused outright (it would publish the whole catalog), while an
+  `authorizeResource` without the option is the ordinary configuration
+  every other mount here uses. SEP-2164 additionally needs the authorizer
+  to let an unknown `test://` URI reach resolution, or the `-32602` it
+  tests for is replaced by a `-32003`.
+- **`allowedOrigins`.** Set under the switch, because
+  `dns-rebinding-protection` sends `Origin: http://evil.example.com` and
+  requires a refusal. A request with no `Origin` at all is served either
+  way, so it does not gate the rest of the suite. It is a matcher rather
+  than a list on purpose: the suite derives its "valid" origin from the
+  `--url` you pass, and the local backend answers to both
+  `http://127.0.0.1:<port>` and `http://localhost:<port>`, so an
+  exact-string allowlist built from `CONVEX_SITE_URL` alone fails the
+  scenario for whichever spelling you did not use.
+
+The tasks fixtures (`greet`, `slow_compute`, `failing_job`,
+`protocol_error_job`, `test_tool_with_task`) are named by the SEP-2663
+scenarios and exist so that group reaches the gateway's task machinery
+rather than reporting the capability as absent. They currently surface
+the v1-versus-v2 gap above, which is what they are for.

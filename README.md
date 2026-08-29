@@ -546,6 +546,9 @@ template + per-resource auth + audit + subscription) is wired into
   login continuation for `@convex-dev/better-auth` as the IdP
 - **[Testing](./docs/testing.md)**: convex-test patterns, identity
   injection, swappable authorizers
+- **[Conformance](./docs/conformance.md)**: running the official MCP
+  suite against the example, what it measured per spec revision, and
+  what each remaining failure is
 
 ## Design choices, briefly
 
