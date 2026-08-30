@@ -221,7 +221,10 @@ need to stop a revoked subject's pending work, call
 revocation: it cancels every live task that subject owns (and returns
 their ids so you can also cancel any durable execution). Choose a
 `tasks.retentionMs` short enough that the revocation window you can
-tolerate is bounded even without an explicit cancel.
+tolerate is bounded even without an explicit cancel. One case outruns
+that number: a task minted from an MRTR continuation is extended to
+outlive its chain, so its window is the longer of `tasks.retentionMs`
+and the chain's remaining lifetime, which `mrtr.ttlMs` caps at one hour.
 
 ### One task table, shared across mounts
 

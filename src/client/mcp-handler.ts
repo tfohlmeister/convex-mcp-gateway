@@ -314,7 +314,10 @@ export type McpResourceAuditOption =
 export type McpMrtrOptions = {
   /** At least 32 bytes of private, stable key material for HMAC-SHA-256. */
   secret: string;
-  /** Maximum continuation lifetime. Defaults to five minutes. */
+  /**
+   * Maximum continuation lifetime. Defaults to five minutes, and is
+   * capped at one hour: a larger value is clamped, not refused.
+   */
   ttlMs?: number;
 };
 
