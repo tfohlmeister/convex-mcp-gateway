@@ -411,11 +411,19 @@ export type McpTasksOptions = {
     event: { taskId: string; toolName: string },
   ) => Promise<void> | void;
   /**
-   * Default task retention. A task row (and with it the result) expires
+   * Task retention. A task row (and with it the result) expires
    * `retentionMs` after creation; expired tasks answer like unknown ids
    * and are dropped by `gateway.pruneTasks`. Clamped to
-   * [1 minute, 7 days]; defaults to 24 hours. A client may request a
-   * shorter `ttlMs` per call, clamped the same way.
+   * [1 minute, 7 days]; defaults to 24 hours.
+   *
+   * The mount decides this alone. SEP-2663 removed the request shape a
+   * client used to shorten a single call with, so `ttlMs` is now only a
+   * remaining-lifetime field the gateway reports back on a task.
+   *
+   * One case runs longer: a task created from an MRTR continuation is
+   * extended to outlive its chain, because a replayed continuation that
+   * found the row expired would mint a second task and a second tool run
+   * from one chain.
    */
   retentionMs?: number;
   /**
