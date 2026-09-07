@@ -124,8 +124,9 @@ const asHandler = httpAction(async (ctx, req) =>
     // Enable only when the upstream authorization server validates
     // Client ID Metadata Documents itself. DCR remains available.
     clientIdMetadataDocuments: true,
-    // See "Pitfalls" below, issuer override matches tokens, NOT spec.
-    overrides: { issuer: UPSTREAM_ISSUER },
+    // Keep the default issuer for standards-compliant discovery.
+    // An upstream issuer override is a client-specific legacy workaround;
+    // it breaks Codex discovery. See "Issuer mismatch" below.
   }),
 );
 http.route({ path: "/.well-known/oauth-authorization-server", method: "GET", handler: asHandler });
@@ -243,21 +244,35 @@ explicitly. If you only mount `/mcp/`, Convex's strict-path routing
 
 ### Issuer mismatch with upstream token claims
 
-RFC 8414 §2.1 says the `issuer` field in your AS metadata MUST equal
-the URL the metadata document was served from. If you follow that
-literally, the bridge advertises `issuer: <your origin>`, but tokens
-from the upstream carry `iss: <upstream origin>`. Some clients
-validate `id_token.iss === metadata.issuer` and reject the OAuth flow
-silently.
+RFC 8414 requires the returned `issuer` to match the authorization-server
+issuer used to derive the metadata URL. For this root-mounted bridge, that is
+its own origin, not the full `/.well-known/oauth-authorization-server` URL.
+`serveAuthorizationServerMetadata` uses that origin by default.
 
-Workaround: **override `issuer` to the upstream's value**:
+The upstream still issues tokens with its own `iss`. Some OIDC clients validate
+`id_token.iss === metadata.issuer`; older claude.ai integrations used this
+host-side workaround:
 
 ```ts
-overrides: { issuer: UPSTREAM_ISSUER }
+// Legacy-client workaround only; not compatible with every MCP client.
+overrides: {
+  issuer: UPSTREAM_ISSUER;
+}
 ```
 
-Technically a spec violation but no client we've tested
-(claude.ai, MCP Inspector) refuses on that.
+**Do not apply this override as a general recommendation.** It makes discovery
+inconsistent: Codex 0.153.4 rejects it before opening the login page with
+`OAuth authorization server issuer does not match authorization metadata origin`.
+Changing HTTP to another transport does not fix that OAuth error.
+
+Prefer direct discovery of the upstream authorization server when clients can
+use a pre-registered public PKCE client. If an existing Claude connector depends
+on the bridge workaround, preserve that route and add an opt-in direct-discovery
+alias for the other client. Both aliases must use the same access-control policy
+and canonical resource audience. This is host routing, not a built-in
+`/mcp/codex` gateway feature. See
+[Client interoperability](./client-interoperability.md) for the tested setup,
+callback requirements, and the distinction between the three relevant URLs.
 
 ### Hardcoded client scopes
 

@@ -99,6 +99,21 @@ Ten tables, all owned by the component:
 
 ## MCP Streamable HTTP transport
 
+The gateway implements **Streamable HTTP**, not a WebSocket endpoint. MCP's
+standard bindings are stdio (a local subprocess) and Streamable HTTP (a remote
+endpoint); custom transports require support at both ends. SSE is an HTTP
+response format, not a WebSocket connection or the old standalone HTTP+SSE
+transport.
+
+Convex's reactive SDK uses WebSockets for its own query subscription protocol.
+That connection does not make a mounted MCP HTTP action speak MCP over WebSocket.
+Likewise, resource-subscription options only track subscribers and construct
+notifications: a host opting into them must supply its own push-capable
+SSE/WebSocket delivery layer. The gateway's GET route returns 405 and its POST
+SSE response contains a single message; it does not provide a persistent push
+channel. See [Client interoperability](./client-interoperability.md#transport)
+for setup implications and protocol references.
+
 The host-mounted `handleMcpRequest` supports two protocol eras on the same
 `/mcp/` endpoint. Legacy 2025-03-26, 2025-06-18, and 2025-11-25 requests
 retain the session lifecycle below; `initialize` negotiates the newest

@@ -541,6 +541,8 @@ template + per-resource auth + audit + subscription) is wired into
   metadata wrap + userinfo token validation, for browser MCP clients
   (claude.ai) against IdPs that don't support Dynamic Client
   Registration (Pocket-ID, etc.)
+- **[Client interoperability](./docs/client-interoperability.md)**: Claude and
+  Codex OAuth setup, issuer mismatches, and HTTP versus WebSocket support
 - **[Audit log](./docs/audit-log.md)**: tool / resource / task row
   shapes, reading, filtering, redacting, pruning
 - **[Recipe: Better Auth on Convex](./docs/recipes/better-auth.md)**:

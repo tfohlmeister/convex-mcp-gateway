@@ -2252,8 +2252,10 @@ export class McpGateway {
        *   force pure-OAuth code flow (no `id_token` hybrid).
        * - Setting `issuer` to the upstream issuer instead of the
        *   bridge origin, if the client refuses to accept the
-       *   mismatch (technically violates RFC 8414 §2 but works with
-       *   stricter clients).
+       *   mismatch. This legacy workaround violates RFC 8414 issuer
+       *   discovery consistency and is rejected by Codex 0.153.4. Prefer
+       *   direct upstream discovery with a pre-registered client instead.
+       *   See docs/client-interoperability.md.
        *
        * Any key set here replaces the bridged value verbatim. Keys
        * not set fall through to the upstream's value (or our default).
