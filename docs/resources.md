@@ -292,6 +292,12 @@ defineMcpResource({
 });
 ```
 
+The caller gets the error's `data`: a string as is, any other value
+(`new ConvexError({ code: "NOT_FOUND", message })`) as JSON. The same
+holds for tools, and for a `ConvexError` thrown inside a function the
+provider calls, whose runtime message would otherwise carry an
+`Uncaught ConvexError:` prefix and a stack trace with your file paths.
+
 Two things are deliberately still verbatim on the wire, because both are
 written by the gateway and name only a field, never your data:
 

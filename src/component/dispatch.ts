@@ -2,7 +2,11 @@ import { v } from "convex/values";
 import type { FunctionHandle } from "convex/server";
 import { action, mutation } from "./_generated/server.js";
 import { api, internal } from "./_generated/api.js";
-import { isDeliberateConvexError, mcpCallerValidator } from "../shared.js";
+import {
+  deliberateErrorMessage,
+  isDeliberateConvexError,
+  mcpCallerValidator,
+} from "../shared.js";
 
 const dispatchResultValidator = v.union(
   v.object({ ok: v.literal(true), data: v.any() }),
@@ -169,7 +173,7 @@ export const runTool = action({
       // paths so both classify errors the same way.
       deliberateError = isDeliberateConvexError(err);
       const wireMessage = deliberateError
-        ? fullMessage
+        ? deliberateErrorMessage(err)
         : "Tool execution failed";
       wireError = { code: -32000, message: wireMessage };
       auditError = {

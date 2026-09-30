@@ -249,6 +249,18 @@ export const throwsConvexError = query({
 });
 
 /**
+ * Test-only fixture: a `ConvexError` carrying structured data, which the
+ * gateway ships to the caller as JSON.
+ */
+export const throwsStructuredConvexError = query({
+  args: {},
+  returns: v.null(),
+  handler: async () => {
+    throw new ConvexError({ code: "NOT_FOUND", message: "Invoice not found" });
+  },
+});
+
+/**
  * Test-only fixture: accepts any payload under `args.payload`, returns
  * null. Lets redaction tests pass arbitrarily-shaped args without
  * tripping Convex's per-function arg validator.

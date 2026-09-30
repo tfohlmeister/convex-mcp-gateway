@@ -1,6 +1,7 @@
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
   buildProtectedResourceMetadataUrl,
+  deliberateErrorMessage,
   isDeliberateConvexError,
   AUTHORIZER_INVALID_SHAPE_REASON,
   parseAuthorizerDecision,
@@ -1251,9 +1252,10 @@ function splitErrorText(
   generic: string,
 ): { full: string; wire: string } {
   const full = err instanceof Error ? err.message : String(err);
-  const deliberate =
-    isDeliberateConvexError(err) || err instanceof ResourceContractError;
-  return { full, wire: deliberate ? full : generic };
+  if (isDeliberateConvexError(err)) {
+    return { full, wire: deliberateErrorMessage(err) };
+  }
+  return { full, wire: err instanceof ResourceContractError ? full : generic };
 }
 
 /**

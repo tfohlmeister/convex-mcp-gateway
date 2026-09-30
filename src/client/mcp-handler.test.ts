@@ -2760,6 +2760,48 @@ describe("handleMcpRequest metadata and resources", () => {
     });
   });
 
+  test("a resource read handler's structured ConvexError reaches the caller as JSON", async () => {
+    const component = createComponent();
+    const { ctx } = createCtx(component);
+    const resource = defineMcpResource({
+      uri: "docs://missing",
+      name: "Missing",
+      read: async () => {
+        throw new ConvexError({ code: "ARCHIVED", message: "Archived" });
+      },
+    });
+    const options = {
+      authorize: async () => ({ allowed: true }),
+      resources: [resource],
+    };
+
+    const init = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      options,
+    );
+    const read = await handleMcpRequest(
+      ctx,
+      jsonRpcRequest(
+        {
+          id: 2,
+          method: "resources/read",
+          params: { uri: "docs://missing" },
+        },
+        init.headers.get("mcp-session-id")!,
+      ),
+      component,
+      options,
+    );
+    expect(await readJson(read)).toMatchObject({
+      error: {
+        code: -32603,
+        message: '{"code":"ARCHIVED","message":"Archived"}',
+      },
+    });
+  });
+
   test("resources/list isolates a throwing provider from healthy ones", async () => {
     const component = createComponent();
     const { ctx } = createCtx(component);

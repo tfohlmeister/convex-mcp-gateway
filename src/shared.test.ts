@@ -1,9 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import {
   buildProtectedResourceMetadataUrl,
   buildResourceUrl,
   convexValidatorToJsonSchema,
+  deliberateErrorMessage,
   propertyValidatorsToObjectSchema,
   resourcePathFromWellKnownRequest,
 } from "./shared.js";
@@ -181,5 +182,61 @@ describe("convexValidatorToJsonSchema", () => {
       required: ["inner"],
       additionalProperties: false,
     });
+  });
+});
+
+describe("deliberateErrorMessage", () => {
+  // The shape a real backend gives an error that crossed a function
+  // boundary; `convex-test` leaves `message` bare, so the test builds it.
+  function crossedBoundary(data: string | Record<string, string>) {
+    const err = new ConvexError(data);
+    const rendered = typeof data === "string" ? data : JSON.stringify(data);
+    err.message =
+      `Uncaught ConvexError: ${rendered}\n` +
+      "    at handler (../convex/projects.ts:12:11)\n";
+    return err;
+  }
+
+  test("string data reaches the caller without prefix or stack", () => {
+    expect(
+      deliberateErrorMessage(crossedBoundary('No project with id "x".')),
+    ).toBe('No project with id "x".');
+  });
+
+  test("structured data reaches the caller as JSON, code included", () => {
+    expect(
+      deliberateErrorMessage(
+        crossedBoundary({ code: "NOT_FOUND", message: "No project" }),
+      ),
+    ).toBe('{"code":"NOT_FOUND","message":"No project"}');
+  });
+
+  test("data serialized in place by convex is decoded", () => {
+    const err = Object.assign(new ConvexError<string>("unused"), {
+      data: '{"code":"NOT_FOUND"}',
+      ConvexErrorSymbol: Symbol.for("ConvexError"),
+    });
+    expect(deliberateErrorMessage(err)).toBe('{"code":"NOT_FOUND"}');
+    err.data = '"Invoice not found"';
+    expect(deliberateErrorMessage(err)).toBe("Invoice not found");
+  });
+
+  test("oversized data is truncated to the runtime's error length", () => {
+    const text = deliberateErrorMessage(new ConvexError("x".repeat(20000)));
+    expect(text).toHaveLength(16384);
+    expect(text.endsWith("[...truncated]")).toBe(true);
+  });
+
+  test("truncation never splits a surrogate pair", () => {
+    const text = deliberateErrorMessage(
+      new ConvexError("x".repeat(16384 - 15) + "😀".repeat(10)),
+    );
+    expect(text).toBe("x".repeat(16384 - 15) + "[...truncated]");
+  });
+
+  test("an error named ConvexError without Convex data keeps its message", () => {
+    const err = new Error("Invoice not found");
+    err.name = "ConvexError";
+    expect(deliberateErrorMessage(err)).toBe("Invoice not found");
   });
 });

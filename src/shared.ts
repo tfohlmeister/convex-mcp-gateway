@@ -1,4 +1,11 @@
-import { ConvexError, v } from "convex/values";
+import {
+  ConvexError,
+  convexToJson,
+  jsonToConvex,
+  v,
+  type JSONValue,
+  type Value,
+} from "convex/values";
 import type { FunctionReference } from "convex/server";
 import type {
   GenericValidator,
@@ -547,7 +554,8 @@ export interface McpAuthorizerDecision {
  * Is this a `ConvexError`, i.e. a message the host threw on purpose?
  *
  * The gateway treats `ConvexError` as the deliberate caller-facing
- * channel: its message reaches the MCP client verbatim. Every other
+ * channel: its `data` reaches the MCP client (see
+ * `deliberateErrorMessage`). Every other
  * throw is an accident (a failed `fetch` quoting a signed URL, a driver
  * error echoing a connection string) and only ever reaches the client
  * as a generic message.
@@ -568,6 +576,53 @@ export function isDeliberateConvexError(err: unknown): boolean {
     (err instanceof Error && err.name === "ConvexError")
   );
 }
+
+/**
+ * The caller-facing text of a deliberate `ConvexError`, built from its
+ * `data` rather than its `message`.
+ *
+ * Once the error has crossed a Convex function boundary, the runtime's
+ * `message` reads `Uncaught ConvexError: <data>` followed by a stack
+ * trace with the host's file paths. `data` is the value the host threw:
+ * a string passes as is, any other value goes out as JSON so a structured
+ * error's `code` reaches the caller too. `convex-test` does not add the
+ * prefix, so only a real backend shows the difference.
+ *
+ * `convex` serializes `data` to a JSON string in place when a function
+ * throws, and marks the error with `ConvexErrorSymbol`. The real runtime
+ * parses it back before the caller sees it; `convex-test` hands the
+ * marked error over as is, so the marked form is decoded here.
+ *
+ * Falls back to `message` when `data` is not a Convex value; such an
+ * error cannot have crossed a boundary, so its message is the host's own.
+ *
+ * Capped at the length the runtime itself allows a rendered error value.
+ */
+export function deliberateErrorMessage(err: unknown): string {
+  let text: string;
+  try {
+    let data = (err as { data?: unknown }).data;
+    if (typeof data === "string" && "ConvexErrorSymbol" in (err as object)) {
+      data = jsonToConvex(JSON.parse(data) as JSONValue);
+    }
+    text =
+      typeof data === "string"
+        ? data
+        : JSON.stringify(convexToJson(data as Value));
+  } catch {
+    text = err instanceof Error ? err.message : String(err);
+  }
+  if (text.length <= MAX_DELIBERATE_ERROR_LENGTH) return text;
+  const marker = "[...truncated]";
+  let cut = MAX_DELIBERATE_ERROR_LENGTH - marker.length;
+  // Never split a surrogate pair.
+  const last = text.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return text.slice(0, cut) + marker;
+}
+
+/** `MAX_VALUE_FOR_ERROR_LEN` in `convex/values`, which does not export it. */
+const MAX_DELIBERATE_ERROR_LENGTH = 16384;
 
 /**
  * The reason a malformed authorizer return is denied with. Named so the

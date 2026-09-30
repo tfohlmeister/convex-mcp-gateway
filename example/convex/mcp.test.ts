@@ -1215,9 +1215,42 @@ describe("tool execution failures", () => {
     if (!result.ok) {
       expect(result.error.code).toBe(-32000);
       // ConvexError is the deliberate user-facing channel; its
-      // message reaches the wire so the LLM can reason about
+      // data reaches the wire so the LLM can reason about
       // "Invoice not found" and react.
-      expect(result.error.message).toContain("Invoice not found");
+      expect(result.error.message).toBe("Invoice not found");
+    }
+  });
+
+  test("ConvexError with structured data reaches the wire as JSON", async () => {
+    const t = newTest();
+    await t.run(async (ctx) => {
+      const handle = await createFunctionHandle(
+        api.invoices.throwsStructuredConvexError,
+      );
+      await ctx.runMutation(components.mcpGateway.registry.replaceTools, {
+        tools: [
+          {
+            name: "structured_throw",
+            description: "throws ConvexError with object data",
+            kind: "query",
+            functionHandle: handle,
+            inputSchema: { type: "object" },
+          },
+        ],
+      });
+    });
+
+    const result = await t.action(components.mcpGateway.dispatch.runTool, {
+      name: "structured_throw",
+      args: {},
+      auditIdentitySubject: null,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(JSON.parse(result.error.message)).toEqual({
+        code: "NOT_FOUND",
+        message: "Invoice not found",
+      });
     }
   });
 
