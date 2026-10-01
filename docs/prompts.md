@@ -143,7 +143,11 @@ get every prompt. Set it and:
 | `"prompt_anonymous"` | either method, `operation: "list" \| "get"`, only on a mount with `anonymousPrompts` | `null` |
 
 Each call carries `promptName` and, for a get, the request's `arguments`
-(strings, but not yet checked against the declaration).
+(strings, but not yet checked against the declaration). Like the one
+`get` receives, that object is a null-prototype copy: read it with
+`args.arguments.name` or `Object.hasOwn(args.arguments, "name")`, since
+`Object.prototype` methods such as `hasOwnProperty` are not on it and
+calling one throws, which answers the request as an authorizer fault.
 
 `prompts/get` is authorized **before** the name is resolved, so a caller
 who may not get a prompt cannot tell a hidden prompt from a missing one.
