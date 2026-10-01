@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v2.0.1...v2.1.0) (2026-10-01)
+
+
+### Features
+
+* serve prompts (prompts/list, prompts/get) ([#75](https://github.com/tfohlmeister/convex-mcp-gateway/issues/75)) ([319baf2](https://github.com/tfohlmeister/convex-mcp-gateway/commit/319baf2ce66dc980d4bf28efb8baa8dd6b99cacd)), closes [#72](https://github.com/tfohlmeister/convex-mcp-gateway/issues/72)
+
 ## [2.0.1](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v2.0.0...v2.0.1) (2026-09-30)
 
 
