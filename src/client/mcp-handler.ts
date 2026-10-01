@@ -417,7 +417,9 @@ export interface McpIdentifiedPromptAuthorizerArgs {
    * The arguments of a `prompts/get`, already checked to be strings but
    * not yet against the prompt's declaration (the authorizer runs first,
    * so an unauthorized caller learns nothing about which prompts exist).
-   * Empty when filtering `prompts/list`.
+   * For a get, a null-prototype object, the same copy `get` receives: it
+   * has no `Object.prototype` methods such as `hasOwnProperty`. Empty
+   * when filtering `prompts/list`.
    */
   arguments: Record<string, string>;
   /** Non-null: these modes run only for an authenticated caller. */
