@@ -312,6 +312,150 @@ export type McpResourceAuditOption =
       templatesList?: boolean;
     };
 
+/**
+ * One argument a prompt accepts. The spec types every argument VALUE as a
+ * string, so there is no schema here: `required` is the only constraint,
+ * and `prompts/get` refuses a request that omits a required argument.
+ */
+export type McpPromptArgument = {
+  name: string;
+  /** Human-friendly display name; falls back to `name` in clients. */
+  title?: string;
+  description?: string;
+  required?: boolean;
+};
+
+/** A `prompts/list` entry. */
+export type McpPrompt = {
+  name: string;
+  /** Human-friendly display name; falls back to `name` in clients. */
+  title?: string;
+  description?: string;
+  arguments?: McpPromptArgument[];
+  icons?: McpIcon[];
+};
+
+/**
+ * The content of one prompt message: a single MCP content block. An
+ * embedded `resource` carries the same shape `resources/read` returns, and
+ * a `resource_link` the same shape `resources/list` does.
+ */
+export type McpPromptContent =
+  | { type: "text"; text: string; annotations?: McpResourceAnnotations }
+  | {
+      type: "image" | "audio";
+      /** Base64-encoded. */
+      data: string;
+      mimeType: string;
+      annotations?: McpResourceAnnotations;
+    }
+  | ({ type: "resource_link" } & McpResource)
+  | {
+      type: "resource";
+      resource: McpResourceContent;
+      annotations?: McpResourceAnnotations;
+    };
+
+export type McpPromptMessage = {
+  role: "user" | "assistant";
+  content: McpPromptContent;
+};
+
+/** What a prompt's `get` returns: the `prompts/get` result. */
+export type McpPromptResult = {
+  description?: string;
+  messages: McpPromptMessage[];
+};
+
+/**
+ * The caller a prompt's `get` sees. `null` only on a mount that set
+ * `anonymousPrompts`, the same rule `McpResourceCaller` follows.
+ */
+export type McpPromptCaller = McpCallerIdentity | null;
+
+/**
+ * Builds a prompt's messages for one `prompts/get`. `arguments` holds only
+ * arguments the prompt declares, every required one present, all strings.
+ * Throw `ConvexError` for a message the caller should see (an id that
+ * does not exist, say); any other throw reaches the caller as a generic
+ * error, with the full text in the deployment log.
+ */
+export type McpPromptGetHandler = (
+  ctx: McpHandlerCtx,
+  args: {
+    name: string;
+    arguments: Record<string, string>;
+    identity: McpPromptCaller;
+  },
+) => Promise<McpPromptResult> | McpPromptResult;
+
+/**
+ * Runtime form of a prompt, as produced by `defineMcpPrompt`: the
+ * descriptor `prompts/list` serves, and the handler `prompts/get` runs.
+ */
+export type McpPromptProvider = {
+  prompt: McpPrompt;
+  get: McpPromptGetHandler;
+};
+
+/** The two prompt methods, as the anonymous authorizer mode names them. */
+export type McpPromptOperation = "list" | "get";
+
+/**
+ * The prompt authorizer input for a caller the gateway has authenticated.
+ * Every prompt method resolves to one of these unless the mount opted
+ * into `anonymousPrompts`.
+ */
+export interface McpIdentifiedPromptAuthorizerArgs {
+  /**
+   * `"prompt_list"` once per prompt when filtering `prompts/list`,
+   * `"prompt_get"` before a prompt's `get` runs.
+   */
+  mode: "prompt_list" | "prompt_get";
+  promptName: string;
+  /**
+   * The arguments of a `prompts/get`, already checked to be strings but
+   * not yet against the prompt's declaration (the authorizer runs first,
+   * so an unauthorized caller learns nothing about which prompts exist).
+   * Empty when filtering `prompts/list`.
+   */
+  arguments: Record<string, string>;
+  /** Non-null: these modes run only for an authenticated caller. */
+  identity: McpCallerIdentity;
+}
+
+/**
+ * The prompt authorizer input for an UNAUTHENTICATED caller, only on a
+ * mount that set `anonymousPrompts: true`. A mode of its own for the same
+ * reason `resource_anonymous` is one: an authorizer written for
+ * authenticated callers meets an unrecognised mode rather than a familiar
+ * one with a null identity. One whose default branch returns
+ * `{ allowed: true }` still allows it, so read that branch before opting in.
+ */
+export interface McpAnonymousPromptAuthorizerArgs {
+  mode: "prompt_anonymous";
+  /** Which prompt method the anonymous caller is attempting. */
+  operation: McpPromptOperation;
+  promptName: string;
+  arguments: Record<string, string>;
+  /** Always `null`. The discriminant is `mode`; this documents the fact. */
+  identity: null;
+}
+
+/**
+ * What `authorizePrompt` receives. Narrow on `mode` before reading
+ * `identity`: non-null for `"prompt_list"` / `"prompt_get"`, null for
+ * `"prompt_anonymous"`.
+ */
+export type McpPromptAuthorizerArgs =
+  | McpIdentifiedPromptAuthorizerArgs
+  | McpAnonymousPromptAuthorizerArgs;
+
+export type McpPromptAuthorizerHandler = (
+  ctx: McpHandlerCtx,
+  args: McpPromptAuthorizerArgs,
+) => Promise<McpAuthorizerDecision> | McpAuthorizerDecision;
+
 export type McpMrtrOptions = {
   /** At least 32 bytes of private, stable key material for HMAC-SHA-256. */
   secret: string;
@@ -734,6 +878,41 @@ export interface HandleMcpRequestOptions {
     listChanged?: boolean;
   };
   /**
+   * Optional MCP prompts, built with `defineMcpPrompt`. Advertised as
+   * `capabilities.prompts`, listed by `prompts/list` and served by
+   * `prompts/get`. Unlike resources they are runtime-only: nothing is
+   * persisted in the registry, so a mount serves exactly the prompts
+   * passed to it. Names must be unique; a duplicate throws on the first
+   * request through the mount.
+   *
+   * Authenticated callers only, unless `anonymousPrompts` is set, and
+   * subject to `authorizePrompt` when it is configured. The capability
+   * carries no `listChanged`: this transport cannot push the
+   * notification.
+   */
+  prompts?: McpPromptProvider[];
+  /**
+   * Optional authorization hook for prompts, the prompt counterpart of
+   * `authorizeResource`. If omitted, authenticated callers can list and
+   * get every prompt. If set, `prompts/list` filters each prompt through
+   * `prompt_list`, and `prompts/get` checks `prompt_get` before the
+   * prompt's `get` runs. A denial whose reason starts with "unauth" is
+   * answered with `-32001`, any other with `-32003`.
+   */
+  authorizePrompt?: McpPromptAuthorizerHandler;
+  /**
+   * Serve `prompts/list` and `prompts/get` to unauthenticated callers,
+   * under `mode: "prompt_anonymous"`. Default `false`, and with it off
+   * both methods refuse an anonymous caller with `-32001` before the
+   * authorizer runs. Requires `authorizePrompt`, for the reason
+   * `anonymousResources` requires `authorizeResource`: without one every
+   * prompt is allowed, so opting in would publish the whole catalog
+   * rather than delegate the decision. Setting it without one throws on
+   * the first request through the mount. Like `anonymousResources`, it
+   * does not override `requireAuth`.
+   */
+  anonymousPrompts?: boolean;
+  /**
    * Opt-in support for stateless-era multi-round-trip requests (MRTR). A
    * declarative tool's host-side `beforeCall` hook is the state machine:
    * on the first call it can return `inputRequired(inputRequests, state)`
@@ -1054,6 +1233,7 @@ const GENERIC_RESOURCE_READ_ERROR = "Resource read failed";
 const GENERIC_RESOURCE_LIST_ERROR = "Resource listing failed";
 const GENERIC_RESOURCE_TEMPLATES_LIST_ERROR =
   "Resource template listing failed";
+const GENERIC_PROMPT_GET_ERROR = "Prompt retrieval failed";
 
 function resolveCorsOrigin(
   cors: McpCorsOption | undefined,
@@ -1668,7 +1848,8 @@ function finalizeStatelessResult(
     method === "tools/list" ||
     method === "resources/list" ||
     method === "resources/templates/list" ||
-    method === "resources/read"
+    method === "resources/read" ||
+    method === "prompts/list"
   ) {
     envelope.result.ttlMs ??= 0;
     envelope.result.cacheScope ??= "private";
@@ -2572,9 +2753,10 @@ let warnedRequireAuthWithoutOAuth = false;
  *
  * Called from the `requireAuth` gate, from the anonymous task-augmented
  * `tools/call` and `tasks/*` paths, and from the three resource methods
- * when the host's authorizer denies an anonymous caller with an
- * `unauth`-shaped reason. Only the read path passes a reason through; a
- * list discards its per-candidate reasons, so it takes the generic one.
+ * and the two prompt methods when the host's authorizer denies an
+ * anonymous caller with an `unauth`-shaped reason. Only the read and get
+ * paths pass a reason through; a list discards its per-candidate
+ * reasons, so it takes the generic one.
  */
 async function requireAuthChallenge(
   ctx: HandlerCtx,
@@ -2950,6 +3132,279 @@ export function describeResourceContentsProblem(
   return null;
 }
 
+/**
+ * Validate a prompt descriptor (a `prompts/list` entry, and what
+ * `defineMcpPrompt` accepts). `name` is a required non-empty string;
+ * `title`/`description` optional strings; each declared argument needs a
+ * unique non-empty `name`, with optional string `title`/`description` and
+ * boolean `required`. Returns a problem string or `null`.
+ */
+export function describePromptProblem(prompt: unknown): string | null {
+  if (!isPlainObject(prompt)) return "prompt must be an object";
+  if (typeof prompt.name !== "string" || prompt.name.length === 0) {
+    return "prompt.name must be a non-empty string";
+  }
+  for (const field of ["title", "description"] as const) {
+    if (prompt[field] !== undefined && typeof prompt[field] !== "string") {
+      return `prompt.${field} must be a string`;
+    }
+  }
+  if (prompt.arguments !== undefined) {
+    if (!Array.isArray(prompt.arguments)) {
+      return "prompt.arguments must be an array";
+    }
+    const seen = new Set<string>();
+    for (const argument of prompt.arguments) {
+      if (!isPlainObject(argument)) {
+        return "prompt.arguments entries must be objects";
+      }
+      if (typeof argument.name !== "string" || argument.name.length === 0) {
+        return "prompt.arguments[].name must be a non-empty string";
+      }
+      if (seen.has(argument.name)) {
+        return `prompt.arguments declares "${argument.name}" twice`;
+      }
+      seen.add(argument.name);
+      for (const field of ["title", "description"] as const) {
+        if (
+          argument[field] !== undefined &&
+          typeof argument[field] !== "string"
+        ) {
+          return `prompt.arguments[].${field} must be a string`;
+        }
+      }
+      if (
+        argument.required !== undefined &&
+        typeof argument.required !== "boolean"
+      ) {
+        return "prompt.arguments[].required must be a boolean";
+      }
+    }
+  }
+  return describeIconsProblem(prompt.icons, "prompt");
+}
+
+/**
+ * Validate one prompt message's content block: `text`, `image`, `audio`,
+ * `resource_link` or an embedded `resource`, the content types a
+ * `PromptMessage` may carry. Another `type` is refused rather than passed
+ * through, because a client validating the result would drop the whole
+ * response over it.
+ */
+function describePromptContentProblem(content: unknown): string | null {
+  if (!isPlainObject(content)) return "message.content must be an object";
+  switch (content.type) {
+    case "text":
+      if (typeof content.text !== "string") {
+        return "text content.text must be a string";
+      }
+      break;
+    case "image":
+    case "audio":
+      if (typeof content.data !== "string" || content.data.length === 0) {
+        return `${content.type} content.data must be a non-empty base64 string`;
+      }
+      if (
+        typeof content.mimeType !== "string" ||
+        content.mimeType.length === 0
+      ) {
+        return `${content.type} content.mimeType must be a non-empty string`;
+      }
+      break;
+    case "resource_link": {
+      const problem = describeResourceProblem(content);
+      if (problem) return `resource_link content: ${problem}`;
+      break;
+    }
+    case "resource": {
+      const problem = describeResourceContentsProblem([content.resource]);
+      if (problem) return `resource content: ${problem}`;
+      break;
+    }
+    default:
+      return (
+        "message.content.type must be text, image, audio, resource_link " +
+        "or resource"
+      );
+  }
+  return describeAnnotationsProblem(content.annotations);
+}
+
+/**
+ * Validate what a prompt's `get` returned: an object with a `messages`
+ * array (optionally a string `description`), each message a `user` or
+ * `assistant` role and one content block. Returns a problem string or
+ * `null`.
+ */
+export function describePromptResultProblem(result: unknown): string | null {
+  if (!isPlainObject(result)) return "prompt result must be an object";
+  if (
+    result.description !== undefined &&
+    typeof result.description !== "string"
+  ) {
+    return "prompt result.description must be a string";
+  }
+  if (!Array.isArray(result.messages)) {
+    return "prompt result.messages must be an array";
+  }
+  for (const message of result.messages) {
+    if (!isPlainObject(message)) return "each message must be an object";
+    if (message.role !== "user" && message.role !== "assistant") {
+      return 'message.role must be "user" or "assistant"';
+    }
+    const problem = describePromptContentProblem(message.content);
+    if (problem) return problem;
+  }
+  return null;
+}
+
+/** The `prompts/list` entry for a prompt: only the spec's fields. */
+export function pickPromptFields(prompt: McpPrompt): McpPrompt {
+  return {
+    name: prompt.name,
+    ...(prompt.title !== undefined ? { title: prompt.title } : {}),
+    ...(prompt.description !== undefined
+      ? { description: prompt.description }
+      : {}),
+    ...(prompt.arguments !== undefined
+      ? {
+          arguments: prompt.arguments.map((argument) => ({
+            name: argument.name,
+            ...(argument.title !== undefined ? { title: argument.title } : {}),
+            ...(argument.description !== undefined
+              ? { description: argument.description }
+              : {}),
+            ...(argument.required !== undefined
+              ? { required: argument.required }
+              : {}),
+          })),
+        }
+      : {}),
+    ...(prompt.icons !== undefined ? { icons: prompt.icons } : {}),
+  };
+}
+
+/**
+ * Check `prompts/get` arguments against what the prompt declares: every
+ * value a string (the spec's `{ [key: string]: string }`), no undeclared
+ * argument, every required one present. An undeclared argument is refused
+ * rather than dropped, the way a tool's input schema refuses one, so a
+ * misspelt name fails loudly instead of reaching `get` as a missing value.
+ * Returns the problem, or `null`.
+ */
+function describePromptArgumentsProblem(
+  prompt: McpPrompt,
+  args: Record<string, string>,
+): string | null {
+  const declared = prompt.arguments ?? [];
+  for (const name of Object.keys(args)) {
+    if (!declared.some((argument) => argument.name === name)) {
+      const known = declared.map((argument) => argument.name);
+      return (
+        `Unknown argument "${name}" for prompt "${prompt.name}"; ` +
+        (known.length > 0
+          ? `it takes: ${known.join(", ")}`
+          : "it takes no arguments")
+      );
+    }
+  }
+  for (const argument of declared) {
+    // Own properties only: an inherited one (`constructor`, `toString`)
+    // would count as present when the client omitted it.
+    if (
+      argument.required &&
+      !Object.prototype.hasOwnProperty.call(args, argument.name)
+    ) {
+      return (
+        `Missing required argument "${argument.name}" for prompt ` +
+        `"${prompt.name}"`
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the `authorizePrompt` input. An anonymous caller only reaches here
+ * on a mount that set `anonymousPrompts`, and is presented under
+ * `"prompt_anonymous"`. `== null` for the reason `resourceAuthorizerArgs`
+ * gives: an untyped host's `undefined` must not build an authenticated
+ * mode for a caller the method gates called anonymous.
+ */
+function promptAuthorizerArgs(
+  operation: McpPromptOperation,
+  promptName: string,
+  args: Record<string, string>,
+  identity: McpPromptCaller,
+): McpPromptAuthorizerArgs {
+  if (identity == null) {
+    return {
+      mode: "prompt_anonymous",
+      operation,
+      promptName,
+      arguments: args,
+      identity: null,
+    };
+  }
+  return {
+    mode: operation === "get" ? "prompt_get" : "prompt_list",
+    promptName,
+    arguments: args,
+    identity,
+  };
+}
+
+async function safeAuthorizePrompt(
+  authorizePrompt: McpPromptAuthorizerHandler | undefined,
+  ctx: HandlerCtx,
+  args: McpPromptAuthorizerArgs,
+): Promise<{ decision: McpAuthorizerDecision; threw: boolean }> {
+  if (!authorizePrompt) {
+    return { decision: { allowed: true }, threw: false };
+  }
+  try {
+    const result = await authorizePrompt(ctx, args);
+    return { decision: parseAuthorizerDecision(result), threw: false };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      decision: {
+        allowed: false,
+        reason: `Prompt authorizer threw: ${message}`,
+      },
+      threw: true,
+    };
+  }
+}
+
+/**
+ * Mount-time checks on the `prompts` option: each descriptor valid, a
+ * `get` function, and names unique. Built from constants, so a problem
+ * here is wrong for every request, which is why the caller throws rather
+ * than answering one request with an error (as for `serverInfo`).
+ */
+function describePromptsOptionProblem(
+  prompts: McpPromptProvider[] | undefined,
+): string | null {
+  if (prompts === undefined) return null;
+  if (!Array.isArray(prompts)) return "prompts must be an array";
+  const names = new Set<string>();
+  for (const provider of prompts) {
+    if (!isPlainObject(provider)) {
+      return "prompts entries must be built with defineMcpPrompt";
+    }
+    const problem = describePromptProblem(provider.prompt);
+    if (problem) return problem;
+    const name = (provider.prompt as McpPrompt).name;
+    if (typeof provider.get !== "function") {
+      return `prompt "${name}" has no get function`;
+    }
+    if (names.has(name)) return `two prompts are named "${name}"`;
+    names.add(name);
+  }
+  return null;
+}
+
 function publicResource(resource: RegisteredResource): McpResource {
   return {
     uri: resource.uri,
@@ -3153,6 +3608,24 @@ export async function handleMcpRequest(
           "the hook requires an authenticated caller.",
       );
     }
+  }
+  const promptsProblem = describePromptsOptionProblem(options.prompts);
+  if (promptsProblem) throw new Error(`MCP prompts: ${promptsProblem}`);
+  // Same two guards as `anonymousResources`, for the same reasons: a
+  // non-boolean is the `process.env.X` shape that turns "off" into on, and
+  // with no authorizer every prompt is allowed.
+  if (
+    options.anonymousPrompts !== undefined &&
+    typeof options.anonymousPrompts !== "boolean"
+  ) {
+    throw new Error("anonymousPrompts must be a boolean.");
+  }
+  if (options.anonymousPrompts && !options.authorizePrompt) {
+    throw new Error(
+      "anonymousPrompts requires an authorizePrompt callback; without one " +
+        "every prompt is allowed, so anonymous callers would get the whole " +
+        "catalog.",
+    );
   }
   // Before the preflight branch: telling a browser via CORS that a
   // cross-origin POST is permitted, only to 403 the POST itself, defeats
@@ -3694,6 +4167,8 @@ async function handlePost(
                 },
               }
             : {}),
+          // No `listChanged`: nothing here can deliver the notification.
+          ...((options.prompts ?? []).length > 0 ? { prompts: {} } : {}),
         },
       });
       break;
@@ -3735,6 +4210,7 @@ async function handlePost(
         capabilities: {
           tools: {},
           ...(advertiseResources ? { resources: {} } : {}),
+          ...((options.prompts ?? []).length > 0 ? { prompts: {} } : {}),
           // Opt-in negotiation: tasks are advertised only when the host
           // configured task execution, per the extension contract, and
           // under `extensions` where SEP-2663 puts it. The capability
@@ -4737,6 +5213,244 @@ async function handlePost(
         }
         body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, wire);
       }
+      break;
+    }
+
+    case "prompts/list": {
+      const prompts = options.prompts ?? [];
+      if (prompts.length === 0) {
+        if (isStateless) responseStatus = 404;
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `Unsupported method: ${message.method}`,
+        );
+        break;
+      }
+      if (!identity && !options.anonymousPrompts) {
+        // The same gate `resources/list` applies, before the authorizer.
+        body = jsonErrorEnvelope(
+          message.id,
+          UNAUTHORIZED,
+          "Unauthorized: authentication required",
+        );
+        break;
+      }
+      const listed: McpPrompt[] = [];
+      // Whether a denial asked for the caller to authenticate, the
+      // `unauth`-shaped convention `resources/list` reads the same way.
+      let authWouldHelp = false;
+      for (const provider of prompts) {
+        // Isolated per prompt, as `tools/list` and `resources/list` do: a
+        // throwing or malformed decision hides that prompt and is logged,
+        // since a filtered list has nowhere else to report it.
+        const { decision, threw } = await safeAuthorizePrompt(
+          options.authorizePrompt,
+          ctx,
+          promptAuthorizerArgs("list", provider.prompt.name, {}, identity),
+        );
+        if (threw || decision.reason === AUTHORIZER_INVALID_SHAPE_REASON) {
+          console.error(
+            "[mcp-gateway] prompt authorizer failed during prompts/list for prompt",
+            provider.prompt.name,
+            decision.reason,
+          );
+        }
+        if (decision.allowed) {
+          listed.push(pickPromptFields(provider.prompt));
+        } else if (
+          !threw &&
+          decision.reason !== undefined &&
+          /^unauth/i.test(decision.reason)
+        ) {
+          authWouldHelp = true;
+        }
+      }
+      // An anonymous caller granted nothing, having been told that
+      // authenticating would help, is challenged rather than handed an
+      // empty list: the 401 is the only signal a browser client acts on.
+      if (identity == null && listed.length === 0 && authWouldHelp) {
+        raw = await requireAuthChallenge(ctx, request, component, message.id);
+        body = "";
+        break;
+      }
+      if (isStateless) {
+        listed.sort((a, b) => a.name.localeCompare(b.name));
+      }
+      body = jsonResultEnvelope(message.id, { prompts: listed });
+      break;
+    }
+
+    case "prompts/get": {
+      const prompts = options.prompts ?? [];
+      if (prompts.length === 0) {
+        if (isStateless) responseStatus = 404;
+        body = jsonErrorEnvelope(
+          message.id,
+          -32601,
+          `Unsupported method: ${message.method}`,
+        );
+        break;
+      }
+      if (!identity && !options.anonymousPrompts) {
+        body = jsonErrorEnvelope(
+          message.id,
+          UNAUTHORIZED,
+          "Unauthorized: authentication required",
+        );
+        break;
+      }
+      const name = message.params?.name;
+      if (typeof name !== "string" || name.length === 0) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "Missing prompt name",
+        );
+        break;
+      }
+      // 2026-07-28 lets `prompts/get` take part in a multi-round-trip
+      // request, which this gateway does not offer for prompts. Fail closed,
+      // as `resources/read` does on a mount without `beforeResourceRead`,
+      // rather than answer while ignoring the continuation the client
+      // believes it is answering.
+      if (
+        message.params?.requestState !== undefined ||
+        message.params?.inputResponses !== undefined
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "This gateway does not support MRTR continuations for prompts/get",
+        );
+        break;
+      }
+      const rawArguments = message.params?.arguments ?? {};
+      if (
+        !isPlainObject(rawArguments) ||
+        !Object.values(rawArguments).every((value) => typeof value === "string")
+      ) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          "Prompt arguments must be an object of strings",
+        );
+        break;
+      }
+      // A null-prototype copy of what the client sent, so `get` reading an
+      // argument it left out gets `undefined` whatever the name, rather
+      // than an inherited `Object.prototype` member (an optional argument
+      // named `toString` would otherwise arrive as a function).
+      const promptArguments: Record<string, string> = Object.assign(
+        Object.create(null) as Record<string, string>,
+        rawArguments,
+      );
+      // Authorized before the name is resolved, so a caller who may not
+      // get a prompt cannot tell a hidden prompt from a missing one.
+      const promptAuthz = await safeAuthorizePrompt(
+        options.authorizePrompt,
+        ctx,
+        promptAuthorizerArgs("get", name, promptArguments, identity),
+      );
+      if (!promptAuthz.decision.allowed) {
+        const reason = promptAuthz.decision.reason ?? "Forbidden";
+        // A throw or a malformed return is a host fault rather than a
+        // policy denial, for every caller: unlike `resources/read`, there
+        // is no earlier release whose wire codes this would change.
+        const faulted =
+          promptAuthz.threw || reason === AUTHORIZER_INVALID_SHAPE_REASON;
+        if (faulted) {
+          console.error(
+            "[mcp-gateway] prompt authorizer failed during prompts/get",
+            name,
+            reason,
+          );
+        }
+        const code = faulted
+          ? INTERNAL_ERROR
+          : /^unauth/i.test(reason)
+            ? UNAUTHORIZED
+            : FORBIDDEN;
+        // An anonymous caller told to authenticate gets the 401 +
+        // `WWW-Authenticate` a denied anonymous `resources/read` gets.
+        if (identity == null && code === UNAUTHORIZED) {
+          raw = await requireAuthChallenge(
+            ctx,
+            request,
+            component,
+            message.id,
+            reason,
+          );
+          body = "";
+          break;
+        }
+        // A returned reason is host-authored and goes to the caller; a
+        // thrown or malformed one stays in the deployment log.
+        body = jsonErrorEnvelope(
+          message.id,
+          code,
+          faulted ? GENERIC_AUTHORIZER_ERROR : reason,
+        );
+        break;
+      }
+      const provider = prompts.find((p) => p.prompt.name === name);
+      if (!provider) {
+        body = jsonErrorEnvelope(
+          message.id,
+          INVALID_PARAMS,
+          `Prompt not found: ${name}`,
+        );
+        break;
+      }
+      const argumentsProblem = describePromptArgumentsProblem(
+        provider.prompt,
+        promptArguments,
+      );
+      if (argumentsProblem) {
+        body = jsonErrorEnvelope(message.id, INVALID_PARAMS, argumentsProblem);
+        break;
+      }
+      let result: unknown;
+      try {
+        result = await provider.get(ctx, {
+          name,
+          arguments: promptArguments,
+          identity,
+        });
+      } catch (err) {
+        // A deliberate `ConvexError` reaches the caller; anything else is
+        // replaced by a generic message, its text kept for the log.
+        const { wire } = splitErrorText(err, GENERIC_PROMPT_GET_ERROR);
+        console.error(
+          "[mcp-gateway] prompt get threw during prompts/get",
+          name,
+          err,
+        );
+        body = jsonErrorEnvelope(message.id, INTERNAL_ERROR, wire);
+        break;
+      }
+      // Validated before it reaches the client, as resource reads are: a
+      // malformed result is a host bug, answered with a deterministic
+      // -32603 naming the field rather than shipped as malformed JSON-RPC.
+      const resultProblem = describePromptResultProblem(result);
+      if (resultProblem) {
+        console.error(
+          "[mcp-gateway] prompt get returned an invalid result",
+          name,
+          resultProblem,
+        );
+        body = jsonErrorEnvelope(
+          message.id,
+          INTERNAL_ERROR,
+          `prompts/get handler returned an invalid result: ${resultProblem}`,
+        );
+        break;
+      }
+      const { description, messages } = result as McpPromptResult;
+      body = jsonResultEnvelope(message.id, {
+        ...(description !== undefined ? { description } : {}),
+        messages,
+      });
       break;
     }
 

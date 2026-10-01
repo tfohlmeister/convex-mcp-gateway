@@ -2,12 +2,14 @@ import { ConvexError, v } from "convex/values";
 import {
   McpGateway,
   defineMcpMutation,
+  defineMcpPrompt,
   defineMcpQuery,
   defineMcpResource,
   defineMcpResourceTemplate,
   completeCall,
   inputRequired,
   mcpCallerValidator,
+  type McpPromptProvider,
   type McpResourceRegistration,
   type McpResourceTemplateProvider,
   type McpToolRegistration,
@@ -276,6 +278,69 @@ export const resourceTemplates: McpResourceTemplateProvider[] = [
       return [
         { uri, mimeType: "application/json", text: JSON.stringify(invoice) },
       ];
+    },
+  }),
+];
+
+/**
+ * MCP prompts, passed to `gateway.handleMcpRequest({ prompts })`. A client
+ * lists them with `prompts/list` and shows them as ready-made commands; a
+ * `prompts/get` with the arguments returns the messages to start from.
+ *
+ * `get` runs in the HTTP action with the same `ctx` a resource read gets,
+ * so a prompt can load data: this one embeds the invoice it is about, as
+ * the same JSON `invoice://{id}` serves. That `ctx` is not scoped to the
+ * caller, so the prompt is gated as strictly as the resource:
+ * `authorizePrompt` in `http.ts` requires the same `finance.admin` role
+ * `authorizeResource` requires for `invoice://{id}`. By the time `get`
+ * runs, the gateway has checked that and the arguments (only
+ * `invoiceId`, present, a string).
+ */
+export const prompts: McpPromptProvider[] = [
+  defineMcpPrompt({
+    name: "invoices_review",
+    title: "Review an invoice",
+    description: "Check one invoice for problems before it is sent.",
+    arguments: [
+      {
+        name: "invoiceId",
+        description: "The invoice to review",
+        required: true,
+      },
+    ],
+    get: async (ctx, { arguments: { invoiceId }, identity }) => {
+      // Nullable for the reason a resource read's is: a mount may set
+      // `anonymousPrompts`. This one does not.
+      if (!identity) throw new ConvexError("Unauthorized");
+      const invoice = await ctx.runQuery(api.invoices.get, { id: invoiceId! });
+      // `ConvexError`, so the caller sees this message rather than the
+      // generic one an accidental exception gets.
+      if (!invoice) throw new ConvexError(`No invoice ${invoiceId}`);
+      return {
+        description: `Review of invoice ${invoice.id}`,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "resource",
+              resource: {
+                uri: `invoice://${invoice.id}`,
+                mimeType: "application/json",
+                text: JSON.stringify(invoice),
+              },
+            },
+          },
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text:
+                "Review the invoice above: is the amount plausible, and is " +
+                "its status right? List anything to fix before it is sent.",
+            },
+          },
+        ],
+      };
     },
   }),
 ];

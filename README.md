@@ -49,6 +49,10 @@ Built as a [Convex Component](https://www.convex.dev/components).
   runtime shape validation, opt-in `resources/subscribe` capability, and
   opt-in anonymous access for public content.
   See [Resources & templates](./docs/resources.md)
+- **MCP prompts**: `defineMcpPrompt` serves `prompts/list` and
+  `prompts/get`, with argument checks, result validation, an
+  `authorizePrompt` hook, and opt-in anonymous access.
+  See [Prompts](./docs/prompts.md)
 - **One authorize callback**: gates `tools/call` and filters `tools/list`
   with `mode: "list" | "call"`; uses your existing `ctx.auth.getUserIdentity()`
 - **OAuth 2.1 protected-resource discovery**: RFC 9728 metadata,
@@ -535,6 +539,8 @@ template + per-resource auth + audit + subscription) is wired into
   `mode: "list"` vs `"call"`, scope/role recipes
 - **[Resources & templates](./docs/resources.md)**: concrete resources
   vs RFC 6570 templates, `resources/templates/list`, read resolution
+- **[Prompts](./docs/prompts.md)**: `defineMcpPrompt`, argument and
+  result validation, `authorizePrompt`, public prompts
 - **[OAuth 2.1 setup](./docs/oauth.md)**: RFC 9728 discovery, host-side
   mount, multi-tenant, `requireAuth` for all-private servers
 - **[OAuth bridge mode](./docs/oauth-bridge.md)**: opt-in DCR + AS

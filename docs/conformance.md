@@ -72,6 +72,13 @@ authenticate. `tasks-lifecycle` is 7/9 through the proxy and 1/9 without
 it; `tasks-required-task-error` and `tasks-dispatch-and-envelope` tell
 the same story. Run authenticated when working on tasks or MRTR.
 
+The totals above predate prompts. Measured on 2026-10-01 with the same
+suite and the prompt fixtures: all five `prompts-*` scenarios pass on
+both revisions (2/2 each), `caching` is 8/8 (its prompts half was the
+miss), and `server-stateless` stays 21/25 with
+`sep-2575-server-declares-prompts-in-discover` now passing against a
+catalog that has prompts rather than vacuously.
+
 Every failure below is accounted for in the next section. Nothing here is
 an unexplained red.
 
@@ -80,7 +87,8 @@ an unexplained red.
 `tools-list`, `tools-call-simple-text`, `tools-call-error`,
 `server-sse-multiple-streams`, `resources-list`, `resources-read-text`,
 `resources-read-binary`, `resources-templates-read`,
-`sep-2164-resource-not-found` (4/4), `dns-rebinding-protection` (2/2),
+`sep-2164-resource-not-found` (4/4), the five `prompts-*` scenarios,
+`caching` (8/8), `dns-rebinding-protection` (2/2),
 `http-header-validation` (14/14),
 `http-custom-header-server-validation` (10/10),
 `json-schema-2020-12` (8/8, including
@@ -91,15 +99,15 @@ MRTR scenarios that assert refusals rather than interactions
 
 `tasks-capability-negotiation` is 4/5 since the extension moved under
 `extensions`, and `tasks-lifecycle` 8/9 through the proxy.
-`server-stateless` is 21/25 and `caching` 7/8, with the misses named
-below.
+`server-stateless` is 21/25, with the misses named below.
 
 ### Fully passing, `2025-11-25`
 
 `server-initialize`, `server-session-lifecycle`, `ping`, `tools-list`,
 `tools-call-simple-text`, `tools-call-error`, the four `resources-*`
-read/list scenarios, `dns-rebinding-protection`, `json-schema-2020-12`
-and `server-sse-multiple-streams`.
+read/list scenarios, the five `prompts-*` scenarios,
+`dns-rebinding-protection`, `json-schema-2020-12` and
+`server-sse-multiple-streams`.
 
 `server-sse-polling` prints as a pass and is not one. It scores 0 of 0:
 every check it emitted is informational, and it raised two SHOULD-level
@@ -148,8 +156,9 @@ gateway and is the one to use when working on tasks or MRTR.
 
 ### 2. Features the gateway does not implement
 
-`prompts/*` (five scenarios, plus the `prompts/list` half of `caching` and
-of `sep-2549`), `completion/complete`, `logging/setLevel` and
+A `prompts/get` that asks for input first
+(`input-required-result-non-tool-request`: prompts have no MRTR hook),
+`completion/complete`, `logging/setLevel` and
 `tools-call-with-logging`, `tools-call-with-progress`, `tools-call-sampling`,
 the `elicitation-*` scenarios on the session era, and
 `resources-subscribe` / `resources-unsubscribe`, which stay authenticated

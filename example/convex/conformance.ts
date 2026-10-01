@@ -2,9 +2,11 @@ import { ConvexError, v } from "convex/values";
 import {
   defineMcpAction,
   defineMcpMutation,
+  defineMcpPrompt,
   defineMcpQuery,
   defineMcpResource,
   defineMcpResourceTemplate,
+  type McpPromptProvider,
   type McpResourceRegistration,
   type McpResourceTemplateProvider,
   type McpToolRegistration,
@@ -62,6 +64,14 @@ import { action, mutation, query } from "./_generated/server.js";
  * purpose (see `anonymousResources`). `test://watched-resource` exists
  * anyway, because the scenario subscribes to a URI the catalog is
  * expected to list.
+ *
+ * ## The prompt fixtures
+ *
+ * Same story as the resources: `anonymousPrompts` is set only under this
+ * switch, and the fixtures are named and shaped exactly as the
+ * `prompts-*` scenarios request. `input-required-result-non-tool-request`
+ * (a `prompts/get` that asks for input first) has no fixture: the gateway
+ * offers no MRTR hook for prompts.
  */
 
 /** Exactly the string the `tools-call-simple-text` scenario expects. */
@@ -387,5 +397,100 @@ export const conformanceResourceTemplates: McpResourceTemplateProvider[] = [
         text: `Data for template parameter ${params.id}.`,
       },
     ],
+  }),
+];
+
+/**
+ * Prompts the `prompts-*` scenarios request by name. Each has a
+ * `description`, which the spec makes optional and `prompts-list`
+ * requires. All four are public: `http.ts` serves them anonymously.
+ */
+export const conformancePrompts: McpPromptProvider[] = [
+  defineMcpPrompt({
+    name: "test_simple_prompt",
+    description: "A simple prompt without arguments",
+    get: () => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: "This is a simple prompt for testing.",
+          },
+        },
+      ],
+    }),
+  }),
+  defineMcpPrompt({
+    name: "test_prompt_with_arguments",
+    description: "A prompt with two required arguments",
+    arguments: [
+      { name: "arg1", description: "First test argument", required: true },
+      { name: "arg2", description: "Second test argument", required: true },
+    ],
+    get: (_ctx, { arguments: { arg1, arg2 } }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Prompt with arguments: arg1='${arg1}', arg2='${arg2}'`,
+          },
+        },
+      ],
+    }),
+  }),
+  defineMcpPrompt({
+    name: "test_prompt_with_embedded_resource",
+    description: "A prompt embedding the resource it is given",
+    arguments: [
+      {
+        name: "resourceUri",
+        description: "URI of the resource to embed",
+        required: true,
+      },
+    ],
+    get: (_ctx, { arguments: { resourceUri } }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "resource",
+            resource: {
+              uri: resourceUri!,
+              mimeType: "text/plain",
+              text: "Embedded resource content for testing.",
+            },
+          },
+        },
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: "Please process the embedded resource above.",
+          },
+        },
+      ],
+    }),
+  }),
+  defineMcpPrompt({
+    name: "test_prompt_with_image",
+    description: "A prompt carrying an image",
+    get: () => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "image",
+            data: ONE_PIXEL_PNG,
+            mimeType: "image/png",
+          },
+        },
+        {
+          role: "user",
+          content: { type: "text", text: "Please analyze the image above." },
+        },
+      ],
+    }),
   }),
 ];

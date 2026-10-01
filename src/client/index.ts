@@ -33,13 +33,18 @@ import {
 } from "../shared.js";
 import {
   describeIconsProblem,
+  describePromptProblem,
   describeResourceProblem,
   describeResourceTemplateProblem,
   describeToolHeaderSchemaProblem,
+  pickPromptFields,
   pickTemplateFields,
   handleMcpRequest as handleMcpRequestImpl,
   type HandleMcpRequestOptions,
   type McpHandlerCtx,
+  type McpPrompt,
+  type McpPromptGetHandler,
+  type McpPromptProvider,
   type McpResource,
   type McpResourceContent,
   type McpResourceCaller,
@@ -87,6 +92,19 @@ export type {
   McpAnonymousResourceAuthorizerArgs,
   McpCallerIdentity,
   McpIdentifiedResourceAuthorizerArgs,
+  McpAnonymousPromptAuthorizerArgs,
+  McpIdentifiedPromptAuthorizerArgs,
+  McpPrompt,
+  McpPromptArgument,
+  McpPromptAuthorizerArgs,
+  McpPromptAuthorizerHandler,
+  McpPromptCaller,
+  McpPromptContent,
+  McpPromptGetHandler,
+  McpPromptMessage,
+  McpPromptOperation,
+  McpPromptProvider,
+  McpPromptResult,
   McpResourceAuditOption,
   McpResourceAuthorizerArgs,
   McpResourceAuthorizerHandler,
@@ -771,6 +789,51 @@ export function defineMcpResourceTemplate(
     match,
     ...(config.read !== undefined ? { read: config.read } : {}),
   };
+}
+
+export type McpPromptConfig = McpPrompt & {
+  /**
+   * Build the prompt's messages. Called only for `prompts/get` of this
+   * prompt, after `authorizePrompt` allowed it and with `arguments`
+   * already checked against the declaration (strings only, no undeclared
+   * argument, every required one present).
+   */
+  get: McpPromptGetHandler;
+};
+
+/**
+ * Declare an MCP prompt. The returned provider can be passed to
+ * `gateway.handleMcpRequest({ prompts: [...] })`, which lists it in
+ * `prompts/list` and serves it from `prompts/get`.
+ *
+ * ```ts
+ * const reviewInvoice = defineMcpPrompt({
+ *   name: "review_invoice",
+ *   description: "Review one invoice before it is sent",
+ *   arguments: [{ name: "invoiceId", required: true }],
+ *   get: async (ctx, { arguments: { invoiceId } }) => ({
+ *     messages: [
+ *       {
+ *         role: "user",
+ *         content: { type: "text", text: `Review invoice ${invoiceId}.` },
+ *       },
+ *     ],
+ *   }),
+ * });
+ * ```
+ *
+ * The descriptor is validated here, so a malformed one fails at
+ * declaration time rather than on a client's `prompts/list`.
+ */
+export function defineMcpPrompt(config: McpPromptConfig): McpPromptProvider {
+  const problem = describePromptProblem(config);
+  if (problem) {
+    throw new Error(`MCP prompt is invalid: ${problem}`);
+  }
+  if (typeof config.get !== "function") {
+    throw new Error("MCP prompt get must be a function");
+  }
+  return { prompt: pickPromptFields(config), get: config.get };
 }
 
 function isStaticResourceProvider(

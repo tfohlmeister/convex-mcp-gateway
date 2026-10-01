@@ -6,11 +6,12 @@ import schema from "./schema.js";
 import { api, components, internal } from "./_generated/api.js";
 import { McpGateway } from "convex-mcp-gateway";
 import {
+  conformancePrompts,
   conformanceResourceTemplates,
   conformanceResources,
   conformanceTools,
 } from "./conformance.js";
-import { authorizeResource } from "./http.js";
+import { authorizePrompt, authorizeResource } from "./http.js";
 
 const modules = import.meta.glob(["./**/*.ts", "./**/*.js", "!**/*.test.ts"]);
 const componentModules = import.meta.glob([
@@ -4469,5 +4470,269 @@ describe("conformance fixtures (MCP_CONFORMANCE mount)", () => {
     expect(schema.then).toBeDefined();
     expect(schema.else).toBeDefined();
     expect(schema.$defs?.address?.$anchor).toBe("address");
+  });
+});
+
+describe("prompts (host-mounted /mcp/)", () => {
+  // Signed in without roles, and signed in with `finance.admin`, which
+  // `invoices_review` requires (see `authorizePrompt` in http.ts).
+  const AUTH = { authorization: "Bearer valid-userinfo-token" };
+  const ADMIN = { authorization: "Bearer valid-admin-token" };
+
+  type RpcBody = {
+    result?: Record<string, unknown>;
+    error?: { code: number; message: string };
+  };
+
+  test("initialize advertises prompts", async () => {
+    const t = newTest();
+    const res = await t.fetch("/mcp/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18" },
+      }),
+    });
+    const body = (await res.json()) as {
+      result: { capabilities: Record<string, unknown> };
+    };
+    expect(body.result.capabilities.prompts).toEqual({});
+  });
+
+  test("prompts/list requires auth, and shows the review prompt to admins only", async () => {
+    const t = newTest();
+    const session = await initialize(t);
+
+    const anon = (await (
+      await rpc(t, session, { jsonrpc: "2.0", id: 2, method: "prompts/list" })
+    ).json()) as RpcBody;
+    expect(anon.error?.code).toBe(-32001);
+
+    const member = (await (
+      await rpc(
+        t,
+        session,
+        { jsonrpc: "2.0", id: 3, method: "prompts/list" },
+        AUTH,
+      )
+    ).json()) as RpcBody;
+    expect(member.result).toEqual({ prompts: [] });
+
+    const listed = (await (
+      await rpc(
+        t,
+        session,
+        { jsonrpc: "2.0", id: 4, method: "prompts/list" },
+        ADMIN,
+      )
+    ).json()) as RpcBody;
+    expect(listed.result).toEqual({
+      prompts: [
+        {
+          name: "invoices_review",
+          title: "Review an invoice",
+          description: "Check one invoice for problems before it is sent.",
+          arguments: [
+            {
+              name: "invoiceId",
+              description: "The invoice to review",
+              required: true,
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  test("prompts/get embeds the invoice it is about", async () => {
+    const t = newTest();
+    const id = await t.mutation(api.invoices.seed, {});
+    const session = await initialize(t);
+    const body = (await (
+      await rpc(
+        t,
+        session,
+        {
+          jsonrpc: "2.0",
+          id: 4,
+          method: "prompts/get",
+          params: { name: "invoices_review", arguments: { invoiceId: id } },
+        },
+        ADMIN,
+      )
+    ).json()) as {
+      result: {
+        description: string;
+        messages: Array<{
+          role: string;
+          content: {
+            type: string;
+            text?: string;
+            resource?: { uri: string; text: string };
+          };
+        }>;
+      };
+    };
+    expect(body.result.description).toBe(`Review of invoice ${id}`);
+    const [embedded, instruction] = body.result.messages;
+    expect(embedded!.content.type).toBe("resource");
+    expect(embedded!.content.resource!.uri).toBe(`invoice://${id}`);
+    expect(JSON.parse(embedded!.content.resource!.text)).toMatchObject({
+      id,
+      amount: 42,
+    });
+    expect(instruction!.content).toMatchObject({ type: "text" });
+  });
+
+  test("prompts/get refuses the invoice to a caller without finance.admin", async () => {
+    const t = newTest();
+    const id = await t.mutation(api.invoices.seed, {});
+    const session = await initialize(t);
+    const res = await rpc(
+      t,
+      session,
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "prompts/get",
+        params: { name: "invoices_review", arguments: { invoiceId: id } },
+      },
+      AUTH,
+    );
+    const text = await res.text();
+    // The same answer `resources/read` of `invoice://{id}` gives this
+    // caller, and none of the invoice in it.
+    expect(JSON.parse(text)).toMatchObject({
+      error: {
+        code: -32003,
+        message: "Forbidden: finance.admin role required",
+      },
+    });
+    expect(text).not.toContain("42");
+  });
+
+  test("prompts/get answers a missing argument and a missing invoice", async () => {
+    const t = newTest();
+    const session = await initialize(t);
+
+    const missing = (await (
+      await rpc(
+        t,
+        session,
+        {
+          jsonrpc: "2.0",
+          id: 5,
+          method: "prompts/get",
+          params: { name: "invoices_review" },
+        },
+        ADMIN,
+      )
+    ).json()) as RpcBody;
+    expect(missing.error).toEqual({
+      code: -32602,
+      message:
+        'Missing required argument "invoiceId" for prompt "invoices_review"',
+    });
+
+    // The prompt throws `ConvexError`, so its message reaches the caller.
+    const unknown = (await (
+      await rpc(
+        t,
+        session,
+        {
+          jsonrpc: "2.0",
+          id: 6,
+          method: "prompts/get",
+          params: { name: "invoices_review", arguments: { invoiceId: "nope" } },
+        },
+        ADMIN,
+      )
+    ).json()) as RpcBody;
+    expect(unknown.error).toEqual({ code: -32603, message: "No invoice nope" });
+  });
+});
+
+describe("conformance prompt fixtures (MCP_CONFORMANCE mount)", () => {
+  // As with the resource fixtures above: the mount that serves these is
+  // gated on an env var no test sets, so this is what keeps the external
+  // suite's expectations from drifting unnoticed.
+  test("the anonymous branch allows every fixture, and only the fixtures", async () => {
+    for (const { prompt } of conformancePrompts) {
+      for (const operation of ["list", "get"] as const) {
+        expect(
+          await authorizePrompt({} as never, {
+            mode: "prompt_anonymous",
+            operation,
+            promptName: prompt.name,
+            arguments: {},
+            identity: null,
+          }),
+        ).toEqual({ allowed: true });
+      }
+    }
+    expect(
+      await authorizePrompt({} as never, {
+        mode: "prompt_anonymous",
+        operation: "get",
+        promptName: "invoices_review",
+        arguments: {},
+        identity: null,
+      }),
+    ).toMatchObject({ allowed: false });
+  });
+
+  test("each fixture answers what its scenario checks", async () => {
+    const byName = new Map(
+      conformancePrompts.map((provider) => [provider.prompt.name, provider]),
+    );
+    // `prompts-list` fails any prompt without a description.
+    for (const { prompt } of conformancePrompts) {
+      expect(prompt.description).toBeTruthy();
+    }
+    const get = async (name: string, args: Record<string, string> = {}) =>
+      await byName.get(name)!.get({} as never, {
+        name,
+        arguments: args,
+        identity: null,
+      });
+
+    expect((await get("test_simple_prompt")).messages).toEqual([
+      {
+        role: "user",
+        content: { type: "text", text: "This is a simple prompt for testing." },
+      },
+    ]);
+    expect(
+      JSON.stringify(
+        (
+          await get("test_prompt_with_arguments", {
+            arg1: "testValue1",
+            arg2: "testValue2",
+          })
+        ).messages,
+      ),
+    ).toMatch(/testValue1.*testValue2/);
+    expect(
+      (
+        await get("test_prompt_with_embedded_resource", {
+          resourceUri: "test://example-resource",
+        })
+      ).messages[0]!.content,
+    ).toMatchObject({
+      type: "resource",
+      resource: { uri: "test://example-resource" },
+    });
+    expect(
+      (await get("test_prompt_with_image")).messages[0]!.content,
+    ).toMatchObject({
+      type: "image",
+      mimeType: "image/png",
+    });
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import { ConvexError } from "convex/values";
 import type { ComponentApi } from "../component/_generated/component.js";
 import {
+  defineMcpPrompt,
   defineMcpResource,
   defineMcpResourceTemplate,
   McpGateway,
@@ -10,11 +11,14 @@ import {
 import {
   describeAnnotationsProblem,
   describeIconsProblem,
+  describePromptProblem,
+  describePromptResultProblem,
   describeResourceContentsProblem,
   describeResourceProblem,
   describeResourceTemplateProblem,
   describeServerInfoProblem,
   handleMcpRequest,
+  type McpPromptAuthorizerArgs,
   type McpResourceAuthorizerArgs,
   type McpResourceProvider,
   type McpResourceTemplateProvider,
@@ -6236,5 +6240,872 @@ describe("anonymous resources", () => {
     expect(state.resourceAuditEntries).toMatchObject([
       { outcome: "allowed", identitySubject: "user-1" },
     ]);
+  });
+});
+
+describe("prompts", () => {
+  const greeting = defineMcpPrompt({
+    name: "greeting",
+    title: "Greeting",
+    description: "Greet someone by name",
+    arguments: [
+      { name: "who", description: "Who to greet", required: true },
+      { name: "tone" },
+    ],
+    get: async (_ctx, { arguments: args }) => ({
+      description: "A greeting",
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Say hello to ${args.who}${args.tone ? `, ${args.tone}` : ""}.`,
+          },
+        },
+      ],
+    }),
+  });
+  const plain = defineMcpPrompt({
+    name: "plain",
+    description: "No arguments",
+    get: () => ({
+      messages: [{ role: "user", content: { type: "text", text: "Hi." } }],
+    }),
+  });
+
+  /** A caller with no identity at all, for the whole exchange. */
+  function anonymous(component: ReturnType<typeof createComponent>) {
+    const state = createCtx(component);
+    (
+      state.ctx.auth as { getUserIdentity: () => Promise<unknown> }
+    ).getUserIdentity = async () => null;
+    return state;
+  }
+
+  async function openSession(
+    state: ReturnType<typeof createCtx>,
+    component: ReturnType<typeof createComponent>,
+    options: Record<string, unknown>,
+  ) {
+    const init = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 1, method: "initialize" }),
+      component,
+      { authorize: async () => ({ allowed: true }), ...options } as never,
+    );
+    return {
+      sessionId: init.headers.get("mcp-session-id")!,
+      init: await readJson(init),
+    };
+  }
+
+  async function call(
+    state: ReturnType<typeof createCtx>,
+    component: ReturnType<typeof createComponent>,
+    options: Record<string, unknown>,
+    method: string,
+    params: Record<string, unknown> = {},
+  ) {
+    const { sessionId } = await openSession(state, component, options);
+    const response = await handleMcpRequest(
+      state.ctx,
+      jsonRpcRequest({ id: 2, method, params }, sessionId),
+      component,
+      { authorize: async () => ({ allowed: true }), ...options } as never,
+    );
+    return { response, body: await readJson(response) };
+  }
+
+  describe("declaration", () => {
+    test.each([
+      [{ name: "" }, "prompt.name must be a non-empty string"],
+      [{ name: "p", title: 3 }, "prompt.title must be a string"],
+      [{ name: "p", arguments: {} }, "prompt.arguments must be an array"],
+      [
+        { name: "p", arguments: [{ name: "a" }, { name: "a" }] },
+        'prompt.arguments declares "a" twice',
+      ],
+      [
+        { name: "p", arguments: [{ name: "a", required: "yes" }] },
+        "prompt.arguments[].required must be a boolean",
+      ],
+      [
+        { name: "p", icons: [{ src: "" }] },
+        "prompt.icons[].src must be a non-empty string",
+      ],
+    ])("defineMcpPrompt rejects %j", (config, problem) => {
+      expect(describePromptProblem(config)).toBe(problem);
+      expect(() =>
+        defineMcpPrompt({
+          ...(config as object),
+          get: () => ({ messages: [] }),
+        } as never),
+      ).toThrow(`MCP prompt is invalid: ${problem}`);
+    });
+
+    test("defineMcpPrompt requires a get function", () => {
+      expect(() => defineMcpPrompt({ name: "p" } as never)).toThrow(
+        "MCP prompt get must be a function",
+      );
+    });
+
+    test("keeps only the spec's fields on the descriptor", () => {
+      const prompt = defineMcpPrompt({
+        name: "p",
+        arguments: [{ name: "a", required: true, extra: 1 } as never],
+        extra: true,
+        get: () => ({ messages: [] }),
+      } as never);
+      expect(prompt.prompt).toEqual({
+        name: "p",
+        arguments: [{ name: "a", required: true }],
+      });
+    });
+
+    test.each([
+      [
+        { prompts: [greeting, { ...plain, prompt: { name: "greeting" } }] },
+        'MCP prompts: two prompts are named "greeting"',
+      ],
+      [
+        { prompts: [{ prompt: { name: "p" } }] },
+        'MCP prompts: prompt "p" has no get function',
+      ],
+      [
+        { prompts: [plain], anonymousPrompts: "false" },
+        "anonymousPrompts must be a boolean.",
+      ],
+      [
+        { prompts: [plain], anonymousPrompts: true },
+        "anonymousPrompts requires an authorizePrompt callback",
+      ],
+    ])(
+      "a misconfigured mount throws on its first request (%#)",
+      async (options, message) => {
+        const component = createComponent();
+        const { ctx } = createCtx(component);
+        await expect(
+          handleMcpRequest(
+            ctx,
+            jsonRpcRequest({ id: 1, method: "initialize" }),
+            component,
+            { authorize: async () => ({ allowed: true }), ...options } as never,
+          ),
+        ).rejects.toThrow(message);
+      },
+    );
+  });
+
+  describe("capability", () => {
+    test("initialize advertises prompts only when some are configured", async () => {
+      const component = createComponent();
+      const without = await openSession(createCtx(component), component, {});
+      expect(without.init.result?.capabilities).not.toHaveProperty("prompts");
+
+      const withPrompts = await openSession(createCtx(component), component, {
+        prompts: [plain],
+      });
+      expect(withPrompts.init.result?.capabilities).toMatchObject({
+        prompts: {},
+      });
+    });
+
+    test("server/discover declares prompts", async () => {
+      const component = createComponent();
+      const { ctx } = createCtx(component);
+      const response = await handleMcpRequest(
+        ctx,
+        statelessJsonRpcRequest({ id: 1, method: "server/discover" }),
+        component,
+        { authorize: async () => ({ allowed: true }), prompts: [plain] },
+      );
+      expect(await readJson(response)).toMatchObject({
+        result: { capabilities: { prompts: {} } },
+      });
+    });
+
+    test.each(["prompts/list", "prompts/get"])(
+      "%s is unsupported on a mount without prompts",
+      async (method) => {
+        const component = createComponent();
+        const { body } = await call(
+          createCtx(component),
+          component,
+          {},
+          method,
+          { name: "plain" },
+        );
+        expect(body.error).toMatchObject({ code: -32601 });
+
+        const { ctx } = createCtx(component);
+        const modern = await handleMcpRequest(
+          ctx,
+          withHeaders(
+            statelessJsonRpcRequest({
+              id: 1,
+              method,
+              params: { name: "plain" },
+            }),
+            method === "prompts/get" ? { "mcp-name": "plain" } : {},
+          ),
+          component,
+          { authorize: async () => ({ allowed: true }) },
+        );
+        expect(modern.status).toBe(404);
+      },
+    );
+  });
+
+  describe("prompts/list", () => {
+    test("lists every prompt's descriptor", async () => {
+      const component = createComponent();
+      const { body } = await call(
+        createCtx(component),
+        component,
+        { prompts: [greeting, plain] },
+        "prompts/list",
+      );
+      expect(body.result).toEqual({
+        prompts: [
+          {
+            name: "greeting",
+            title: "Greeting",
+            description: "Greet someone by name",
+            arguments: [
+              { name: "who", description: "Who to greet", required: true },
+              { name: "tone" },
+            ],
+          },
+          { name: "plain", description: "No arguments" },
+        ],
+      });
+    });
+
+    test("filters through authorizePrompt, one prompt_list decision each", async () => {
+      const component = createComponent();
+      const seen: McpPromptAuthorizerArgs[] = [];
+      const { body } = await call(
+        createCtx(component),
+        component,
+        {
+          prompts: [greeting, plain],
+          authorizePrompt: async (
+            _ctx: unknown,
+            args: McpPromptAuthorizerArgs,
+          ) => {
+            seen.push(args);
+            return { allowed: args.promptName === "plain" };
+          },
+        },
+        "prompts/list",
+      );
+      expect(body.result).toEqual({
+        prompts: [{ name: "plain", description: "No arguments" }],
+      });
+      expect(seen).toEqual([
+        {
+          mode: "prompt_list",
+          promptName: "greeting",
+          arguments: {},
+          identity: expect.objectContaining({ subject: "user-1" }),
+        },
+        {
+          mode: "prompt_list",
+          promptName: "plain",
+          arguments: {},
+          identity: expect.objectContaining({ subject: "user-1" }),
+        },
+      ]);
+    });
+
+    test("an authorizer that throws hides only that prompt", async () => {
+      const component = createComponent();
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const { body } = await call(
+          createCtx(component),
+          component,
+          {
+            prompts: [greeting, plain],
+            authorizePrompt: async (
+              _ctx: unknown,
+              args: McpPromptAuthorizerArgs,
+            ) => {
+              if (args.promptName === "greeting") throw new Error("boom");
+              return { allowed: true };
+            },
+          },
+          "prompts/list",
+        );
+        expect(body.result).toEqual({
+          prompts: [{ name: "plain", description: "No arguments" }],
+        });
+        expect(spy).toHaveBeenCalledWith(
+          "[mcp-gateway] prompt authorizer failed during prompts/list for prompt",
+          "greeting",
+          "Prompt authorizer threw: boom",
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test("a stateless list is sorted and carries the caching hints", async () => {
+      const component = createComponent();
+      const { ctx } = createCtx(component);
+      const response = await handleMcpRequest(
+        ctx,
+        statelessJsonRpcRequest({ id: 1, method: "prompts/list" }),
+        component,
+        {
+          authorize: async () => ({ allowed: true }),
+          prompts: [plain, greeting],
+        },
+      );
+      const body = await readJson(response);
+      expect(
+        (body.result?.prompts as Array<{ name: string }>).map((p) => p.name),
+      ).toEqual(["greeting", "plain"]);
+      expect(body.result).toMatchObject({
+        resultType: "complete",
+        ttlMs: 0,
+        cacheScope: "private",
+      });
+    });
+  });
+
+  describe("prompts/get", () => {
+    test("runs get with the arguments and the caller", async () => {
+      const component = createComponent();
+      const seen: unknown[] = [];
+      const echo = defineMcpPrompt({
+        name: "echo",
+        arguments: [{ name: "a" }],
+        get: (_ctx, args) => {
+          seen.push(args);
+          return {
+            messages: [{ role: "user", content: { type: "text", text: "x" } }],
+          };
+        },
+      });
+      const { body } = await call(
+        createCtx(component),
+        component,
+        { prompts: [echo] },
+        "prompts/get",
+        { name: "echo", arguments: { a: "1" } },
+      );
+      expect(body.result).toEqual({
+        messages: [{ role: "user", content: { type: "text", text: "x" } }],
+      });
+      expect(seen).toEqual([
+        {
+          name: "echo",
+          arguments: { a: "1" },
+          identity: expect.objectContaining({ subject: "user-1" }),
+        },
+      ]);
+    });
+
+    test("serves the result's description and messages", async () => {
+      const component = createComponent();
+      const { body } = await call(
+        createCtx(component),
+        component,
+        { prompts: [greeting] },
+        "prompts/get",
+        { name: "greeting", arguments: { who: "Ada", tone: "warmly" } },
+      );
+      expect(body.result).toEqual({
+        description: "A greeting",
+        messages: [
+          {
+            role: "user",
+            content: { type: "text", text: "Say hello to Ada, warmly." },
+          },
+        ],
+      });
+    });
+
+    test.each([
+      [{}, "Missing prompt name"],
+      [{ name: "nope" }, "Prompt not found: nope"],
+      [
+        { name: "greeting" },
+        'Missing required argument "who" for prompt "greeting"',
+      ],
+      [
+        { name: "greeting", arguments: { who: "Ada", mood: "x" } },
+        'Unknown argument "mood" for prompt "greeting"; it takes: who, tone',
+      ],
+      [
+        { name: "plain", arguments: { who: "Ada" } },
+        'Unknown argument "who" for prompt "plain"; it takes no arguments',
+      ],
+      [
+        { name: "greeting", arguments: { who: 7 } },
+        "Prompt arguments must be an object of strings",
+      ],
+      [
+        { name: "greeting", arguments: ["Ada"] },
+        "Prompt arguments must be an object of strings",
+      ],
+      [
+        { name: "plain", inputResponses: {} },
+        "This gateway does not support MRTR continuations for prompts/get",
+      ],
+    ])("refuses %j with -32602", async (params, message) => {
+      const component = createComponent();
+      let ran = false;
+      const watched = defineMcpPrompt({
+        ...greeting.prompt,
+        get: (ctx, args) => {
+          ran = true;
+          return greeting.get(ctx, args);
+        },
+      });
+      const { body } = await call(
+        createCtx(component),
+        component,
+        { prompts: [watched, plain] },
+        "prompts/get",
+        params,
+      );
+      expect(body.error).toEqual({ code: -32602, message });
+      expect(ran).toBe(false);
+    });
+
+    test("an argument named like an Object.prototype member is never inherited", async () => {
+      const component = createComponent();
+      const seen: Array<Record<string, string>> = [];
+      const tricky = defineMcpPrompt({
+        name: "tricky",
+        arguments: [
+          { name: "constructor", required: true },
+          { name: "toString" },
+        ],
+        get: (_ctx, { arguments: args }) => {
+          seen.push(args);
+          return {
+            messages: [
+              {
+                role: "user",
+                content: { type: "text", text: typeof args.toString },
+              },
+            ],
+          };
+        },
+      });
+
+      // A required one the client left out is missing, not `Object`.
+      const missing = await call(
+        createCtx(component),
+        component,
+        { prompts: [tricky] },
+        "prompts/get",
+        { name: "tricky" },
+      );
+      expect(missing.body.error).toEqual({
+        code: -32602,
+        message: 'Missing required argument "constructor" for prompt "tricky"',
+      });
+      expect(seen).toEqual([]);
+
+      // An optional one the client left out reaches `get` as undefined,
+      // not as `Object.prototype.toString`.
+      const served = await call(
+        createCtx(component),
+        component,
+        { prompts: [tricky] },
+        "prompts/get",
+        { name: "tricky", arguments: { constructor: "c" } },
+      );
+      expect(served.body.result).toMatchObject({
+        messages: [{ content: { type: "text", text: "undefined" } }],
+      });
+      expect(seen[0]!.constructor).toBe("c");
+    });
+
+    test("authorizes before the name is resolved", async () => {
+      const component = createComponent();
+      const seen: McpPromptAuthorizerArgs[] = [];
+      const options = {
+        prompts: [greeting],
+        authorizePrompt: async (
+          _ctx: unknown,
+          args: McpPromptAuthorizerArgs,
+        ) => {
+          seen.push(args);
+          return { allowed: false, reason: "Forbidden: not yours" };
+        },
+      };
+      // A missing prompt and a hidden one answer alike.
+      for (const name of ["greeting", "nope"]) {
+        const { body } = await call(
+          createCtx(component),
+          component,
+          options,
+          "prompts/get",
+          { name, arguments: { who: "Ada" } },
+        );
+        expect(body.error).toEqual({
+          code: -32003,
+          message: "Forbidden: not yours",
+        });
+      }
+      expect(seen[0]).toEqual({
+        mode: "prompt_get",
+        promptName: "greeting",
+        arguments: { who: "Ada" },
+        identity: expect.objectContaining({ subject: "user-1" }),
+      });
+    });
+
+    test("an unauth-shaped denial is -32001 for an authenticated caller", async () => {
+      const component = createComponent();
+      const { body } = await call(
+        createCtx(component),
+        component,
+        {
+          prompts: [plain],
+          authorizePrompt: () => ({
+            allowed: false,
+            reason: "Unauthorized: token lacks the prompts scope",
+          }),
+        },
+        "prompts/get",
+        { name: "plain" },
+      );
+      expect(body.error).toEqual({
+        code: -32001,
+        message: "Unauthorized: token lacks the prompts scope",
+      });
+    });
+
+    test.each([
+      [
+        "throws",
+        () => {
+          throw new Error("db password is hunter2");
+        },
+      ],
+      ["returns nothing", () => undefined as never],
+    ])(
+      "an authorizer that %s fails closed without leaking",
+      async (_label, authorizePrompt) => {
+        const component = createComponent();
+        const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const { body } = await call(
+            createCtx(component),
+            component,
+            { prompts: [plain], authorizePrompt },
+            "prompts/get",
+            { name: "plain" },
+          );
+          expect(body.error).toEqual({
+            code: -32603,
+            message: "Authorization check failed",
+          });
+          expect(spy).toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+      },
+    );
+
+    test("a get that throws answers generically, a ConvexError with its message", async () => {
+      const component = createComponent();
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const failing = defineMcpPrompt({
+          name: "failing",
+          arguments: [{ name: "how" }],
+          get: (_ctx, { arguments: { how } }) => {
+            if (how === "convex") throw new ConvexError("Invoice not found");
+            throw new Error("https://signed.example.com/?token=secret");
+          },
+        });
+        const accidental = await call(
+          createCtx(component),
+          component,
+          { prompts: [failing] },
+          "prompts/get",
+          { name: "failing", arguments: { how: "plain" } },
+        );
+        expect(accidental.body.error).toEqual({
+          code: -32603,
+          message: "Prompt retrieval failed",
+        });
+        const deliberate = await call(
+          createCtx(component),
+          component,
+          { prompts: [failing] },
+          "prompts/get",
+          { name: "failing", arguments: { how: "convex" } },
+        );
+        expect(deliberate.body.error).toEqual({
+          code: -32603,
+          message: "Invoice not found",
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test("an invalid result is a -32603 naming the field", async () => {
+      const component = createComponent();
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const broken = defineMcpPrompt({
+          name: "broken",
+          get: () =>
+            ({
+              messages: [
+                { role: "system", content: { type: "text", text: "" } },
+              ],
+            }) as never,
+        });
+        const { body } = await call(
+          createCtx(component),
+          component,
+          { prompts: [broken] },
+          "prompts/get",
+          { name: "broken" },
+        );
+        expect(body.error).toEqual({
+          code: -32603,
+          message:
+            'prompts/get handler returned an invalid result: message.role must be "user" or "assistant"',
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test("a stateless get needs a matching Mcp-Name, and gets no caching hints", async () => {
+      const component = createComponent();
+      const { ctx } = createCtx(component);
+      const options = {
+        authorize: async () => ({ allowed: true }),
+        prompts: [plain],
+      };
+      const ok = await handleMcpRequest(
+        ctx,
+        withHeaders(
+          statelessJsonRpcRequest({
+            id: 1,
+            method: "prompts/get",
+            params: { name: "plain" },
+          }),
+          { "mcp-name": "plain" },
+        ),
+        component,
+        options,
+      );
+      const body = await readJson(ok);
+      expect(body.result).toMatchObject({
+        resultType: "complete",
+        messages: [{ role: "user", content: { type: "text", text: "Hi." } }],
+      });
+      expect(body.result).not.toHaveProperty("ttlMs");
+
+      const mismatched = await handleMcpRequest(
+        ctx,
+        withHeaders(
+          statelessJsonRpcRequest({
+            id: 2,
+            method: "prompts/get",
+            params: { name: "plain" },
+          }),
+          { "mcp-name": "other" },
+        ),
+        component,
+        options,
+      );
+      expect(mismatched.status).toBe(400);
+    });
+  });
+
+  describe("anonymous callers", () => {
+    test.each(["prompts/list", "prompts/get"])(
+      "without anonymousPrompts %s refuses them before the authorizer",
+      async (method) => {
+        const component = createComponent();
+        let asked = false;
+        const { body } = await call(
+          anonymous(component),
+          component,
+          {
+            prompts: [plain],
+            authorizePrompt: () => {
+              asked = true;
+              return { allowed: true };
+            },
+          },
+          method,
+          { name: "plain" },
+        );
+        expect(body.error).toEqual({
+          code: -32001,
+          message: "Unauthorized: authentication required",
+        });
+        expect(asked).toBe(false);
+      },
+    );
+
+    test("with anonymousPrompts they reach the authorizer as prompt_anonymous", async () => {
+      const component = createComponent();
+      const seen: McpPromptAuthorizerArgs[] = [];
+      const identities: unknown[] = [];
+      const open = defineMcpPrompt({
+        name: "open",
+        get: (_ctx, { identity }) => {
+          identities.push(identity);
+          return {
+            messages: [{ role: "user", content: { type: "text", text: "o" } }],
+          };
+        },
+      });
+      const options = {
+        prompts: [open, plain],
+        anonymousPrompts: true,
+        authorizePrompt: (_ctx: unknown, args: McpPromptAuthorizerArgs) => {
+          seen.push(args);
+          return args.promptName === "open"
+            ? { allowed: true }
+            : { allowed: false, reason: "Forbidden: members only" };
+        },
+      };
+      const list = await call(
+        anonymous(component),
+        component,
+        options,
+        "prompts/list",
+      );
+      expect(list.body.result).toEqual({ prompts: [{ name: "open" }] });
+
+      const get = await call(
+        anonymous(component),
+        component,
+        options,
+        "prompts/get",
+        { name: "open" },
+      );
+      expect(get.body.result).toMatchObject({ messages: [{ role: "user" }] });
+      expect(identities).toEqual([null]);
+
+      const refused = await call(
+        anonymous(component),
+        component,
+        options,
+        "prompts/get",
+        { name: "plain" },
+      );
+      expect(refused.body.error).toEqual({
+        code: -32003,
+        message: "Forbidden: members only",
+      });
+
+      expect(
+        seen.map((args) => [
+          args.mode,
+          "operation" in args ? args.operation : undefined,
+          args.promptName,
+          args.identity,
+        ]),
+      ).toEqual([
+        ["prompt_anonymous", "list", "open", null],
+        ["prompt_anonymous", "list", "plain", null],
+        ["prompt_anonymous", "get", "open", null],
+        ["prompt_anonymous", "get", "plain", null],
+      ]);
+    });
+
+    test("an unauth-shaped denial is a 401 challenge, on get and on an empty list", async () => {
+      const component = createComponent();
+      const options = {
+        prompts: [plain],
+        anonymousPrompts: true,
+        authorizePrompt: (_ctx: unknown, args: McpPromptAuthorizerArgs) =>
+          args.mode === "prompt_anonymous"
+            ? { allowed: false, reason: "Unauthorized: sign in first" }
+            : { allowed: true },
+      };
+      const get = await call(
+        anonymous(component),
+        component,
+        options,
+        "prompts/get",
+        { name: "plain" },
+      );
+      expect(get.response.status).toBe(401);
+      expect(get.body.error).toMatchObject({
+        code: -32001,
+        message: "Unauthorized: sign in first",
+      });
+
+      const list = await call(
+        anonymous(component),
+        component,
+        options,
+        "prompts/list",
+      );
+      expect(list.response.status).toBe(401);
+    });
+  });
+
+  describe("result validation", () => {
+    test.each([
+      [{ type: "image", data: "aGk=", mimeType: "image/png" }, null],
+      [{ type: "audio", data: "aGk=", mimeType: "audio/wav" }, null],
+      [
+        {
+          type: "resource",
+          resource: { uri: "test://r", mimeType: "text/plain", text: "r" },
+        },
+        null,
+      ],
+      [{ type: "resource_link", uri: "test://r", name: "R" }, null],
+      [{ type: "text", text: "t", annotations: { priority: 0.5 } }, null],
+      [
+        { type: "image", data: "", mimeType: "image/png" },
+        "image content.data must be a non-empty base64 string",
+      ],
+      [
+        { type: "resource", resource: { uri: "test://r" } },
+        "resource content: content item must include text or blob",
+      ],
+      [
+        { type: "resource_link", uri: "test://r" },
+        "resource_link content: resource.name must be a non-empty string",
+      ],
+      [
+        { type: "text", text: "t", annotations: { priority: 2 } },
+        "annotations.priority must be a number between 0 and 1",
+      ],
+      [
+        { type: "video", uri: "x" },
+        "message.content.type must be text, image, audio, resource_link or resource",
+      ],
+    ])("content %j", (content, problem) => {
+      expect(
+        describePromptResultProblem({
+          messages: [{ role: "assistant", content }],
+        }),
+      ).toBe(problem);
+    });
+
+    test.each([
+      [null, "prompt result must be an object"],
+      [{}, "prompt result.messages must be an array"],
+      [
+        { messages: [], description: 1 },
+        "prompt result.description must be a string",
+      ],
+      [{ messages: ["hi"] }, "each message must be an object"],
+    ])("result %j", (result, problem) => {
+      expect(describePromptResultProblem(result)).toBe(problem);
+    });
   });
 });

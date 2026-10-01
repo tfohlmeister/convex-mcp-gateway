@@ -188,6 +188,16 @@ authenticated, and a failed anonymous outcome is not audited. See
 [Public resources](./resources.md#public-resources-opt-in-anonymous-access)
 for the full contract.
 
+### Prompts
+
+Prompts have their own hook, `authorizePrompt`, shaped like
+`authorizeResource`: `"prompt_list"` filters `prompts/list` one prompt at a
+time, `"prompt_get"` runs before a prompt's `get`, and anonymous callers
+arrive as `"prompt_anonymous"` only on a mount that sets
+`anonymousPrompts` (which, like `anonymousResources`, requires the hook).
+Without it, every authenticated caller can use every prompt. See
+[Prompts](./prompts.md#authorization).
+
 ### Role-based access via JWT claims
 
 Most JWT issuers expose a `roles` (or `groups`) claim. Convex makes
