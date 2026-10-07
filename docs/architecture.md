@@ -495,8 +495,20 @@ is just a character, and `tools/list` serves that.
 ```
 authored schema ─┬─ JSON string ──────────► tools/list (the client's view)
                  │
-                 └─ resolve $ref ─► strip $ ─► Convex object ─► Mcp-Param-* walk
+                 └─ resolve $ref ─► strip $ ─► object or JSON string ─► decode ─► Mcp-Param-* walk
 ```
+
+Convex limits stored documents to 16 container levels. Reference expansion
+can exceed that even when the authored schema is shallow. Resolved schemas
+with more than 12 levels therefore cross the component boundary as JSON
+strings, leaving room for the catalog's argument and result wrappers. The
+host decodes them after the registry query, before header enforcement or
+advertising a resolved fallback. Encoding happens before the mutation call,
+so deeply nested schemas are safe in its arguments as well as in storage.
+The existing UTF-8 byte and traversal budgets still apply. Existing object
+rows remain readable without a backfill; invalid encoded rows fail closed.
+Raw registry queries expose this storage representation, while MCP clients
+continue to receive JSON Schema objects (or boolean schemas).
 
 Rows written before the authored field exists advertise the resolved
 copy, exactly as they did before; bumping the resolver version re-syncs

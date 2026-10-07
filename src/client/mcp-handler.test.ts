@@ -7109,3 +7109,108 @@ describe("prompts", () => {
     });
   });
 });
+
+describe("JSON-encoded registry schemas", () => {
+  test.each([false, true])(
+    "tools/list decodes deep schemas (authored copy: %s)",
+    async (authored) => {
+      const component = createComponent();
+      let schema: unknown = { type: "string" };
+      for (let i = 0; i < 11; i++)
+        schema = { type: "object", properties: { child: schema } };
+      const state = createCtx(component, [
+        {
+          name: "deep",
+          description: "Deep",
+          kind: "query",
+          functionHandle: "handle",
+          inputSchema: JSON.stringify(schema),
+          outputSchema: JSON.stringify(schema),
+          ...(authored
+            ? {
+                authoredInputSchemaJson: JSON.stringify(schema),
+                authoredOutputSchemaJson: JSON.stringify(schema),
+              }
+            : {}),
+        },
+      ]);
+      const response = await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({
+          id: 1,
+          method: "tools/list",
+        }),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      );
+      expect(response.status).toBe(200);
+      expect(await readJson(response)).toMatchObject({
+        result: { tools: [{ inputSchema: schema, outputSchema: schema }] },
+      });
+    },
+  );
+
+  test("header bindings in encoded input schemas still prevent mismatched calls", async () => {
+    const component = createComponent();
+    let child: unknown = { type: "string", "x-mcp-header": "Leaf" };
+    let args: unknown = "value";
+    for (let i = 0; i < 11; i++) {
+      child = { type: "object", properties: { child } };
+      args = { child: args };
+    }
+    const state = createCtx(component, [
+      {
+        name: "deep",
+        description: "Deep",
+        kind: "query",
+        functionHandle: "handle",
+        inputSchema: JSON.stringify(child),
+      },
+    ]);
+    let authorized = false;
+    const response = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({
+        id: 1,
+        method: "tools/call",
+        params: { name: "deep", arguments: args },
+      }),
+      component,
+      {
+        authorize: async () => {
+          authorized = true;
+          return { allowed: true };
+        },
+      },
+    );
+    expect(response.status).toBe(400);
+    expect(await readJson(response)).toMatchObject({ error: { code: -32020 } });
+    expect(authorized).toBe(false);
+
+    state.setDispatchResult({ ok: true, data: { value: "accepted" } });
+    const matching = statelessJsonRpcRequest({
+      id: 2,
+      method: "tools/call",
+      params: { name: "deep", arguments: args },
+    });
+    matching.headers.set("Mcp-Param-Leaf", "value");
+    const accepted = await handleMcpRequest(state.ctx, matching, component, {
+      authorize: async () => {
+        authorized = true;
+        return { allowed: true };
+      },
+    });
+    expect(accepted.status).toBe(200);
+    expect(await readJson(accepted)).toMatchObject({
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ value: "accepted" }, null, 2),
+          },
+        ],
+      },
+    });
+    expect(authorized).toBe(true);
+  });
+});
