@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v2.1.0...v2.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* harden JSON-encoded registry schemas ([#81](https://github.com/tfohlmeister/convex-mcp-gateway/issues/81)) ([3f9f9c7](https://github.com/tfohlmeister/convex-mcp-gateway/commit/3f9f9c7859f2809a4c712d4c9a190ab0b5677723))
+* serialize deep tool schemas before catalog persistence ([#79](https://github.com/tfohlmeister/convex-mcp-gateway/issues/79)) ([31db8ff](https://github.com/tfohlmeister/convex-mcp-gateway/commit/31db8ff9722e25ef96bfedf804c6b15631542c3b))
+
 ## [2.1.0](https://github.com/tfohlmeister/convex-mcp-gateway/compare/v2.0.1...v2.1.0) (2026-10-01)
 
 
