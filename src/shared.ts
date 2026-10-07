@@ -1365,10 +1365,12 @@ export function prepareSchemaForStorage(schema: unknown): {
 
   const storable = walk(schema, 0, "", false);
   if (problem !== null) return { problem };
-  // Convex's document limit is 16 containers. A replaceTools call adds
-  // args -> tools array -> tool row, and listTools adds an array on read.
-  // Reserve those wrappers before sending the schema across the boundary;
-  // encoding only inside the mutation is too late for argument validation.
+  // Convex caps a stored document at 16 nested containers and any other
+  // value (function arguments, return values) at 64. Only the stored row
+  // counts against 16: the row object plus the schema, so 12 leaves
+  // headroom. Encoding here, before the mutation call, also keeps schemas
+  // past 64 levels (the storage budget allows up to 128) out of the
+  // argument limit.
   if (containerDepth > 12) {
     const json = JSON.stringify(storable);
     const size = utf8ByteLength(json);
@@ -1392,7 +1394,9 @@ export function schemaFromStorage(stored: unknown): unknown {
   if (typeof stored !== "string") return stored;
   const decoded: unknown = JSON.parse(stored);
   if (!isRecord(decoded) && typeof decoded !== "boolean") {
-    throw new Error("Invalid JSON-encoded registry schema: expected an object or boolean");
+    throw new Error(
+      "Invalid JSON-encoded registry schema: expected an object or boolean",
+    );
   }
   return decoded;
 }

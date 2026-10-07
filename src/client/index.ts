@@ -997,7 +997,7 @@ function protocolMetadataField(tool: McpToolRegistration) {
 function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
   for (const tool of tools) {
     const problem = describeToolHeaderSchemaProblem(
-      schemaFromStorage(resolveToolSchemas(tool).inputSchema),
+      resolveToolSchemas(tool).headerSchema,
     );
     if (problem) {
       throw new Error(
@@ -1100,10 +1100,23 @@ function assertNoUngatedAlias(
   }
 }
 
+function decodeListedSchema(stored: unknown): unknown {
+  try {
+    return schemaFromStorage(stored);
+  } catch {
+    return stored;
+  }
+}
+
 type ResolvedToolSchemas = {
   /** Resolved internal view: object or JSON string for deep schemas. */
   inputSchema: unknown;
   outputSchema: unknown;
+  /**
+   * `inputSchema` decoded once, as the runtime `Mcp-Param-*` walk will
+   * read it back: what `assertToolHeaderSchemas` validates on every sync.
+   */
+  headerSchema: unknown;
   /** Authored verbatim, JSON-encoded: what the client is shown. */
   authoredInputSchemaJson: string | undefined;
   authoredOutputSchemaJson: string | undefined;
@@ -1177,12 +1190,14 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
       `MCP tool "${tool.name}" has an unstorable inputSchema: ${storableInput.problem}.`,
     );
   }
+  const headerSchema = schemaFromStorage(storableInput.storable);
   const authoredInputSchemaJson = authoredSchemaJson(tool, "inputSchema");
   let resolved: ResolvedToolSchemas;
   if (tool.outputSchema === undefined) {
     resolved = {
       inputSchema: storableInput.storable,
       outputSchema: undefined,
+      headerSchema,
       authoredInputSchemaJson,
       authoredOutputSchemaJson: undefined,
     };
@@ -1202,6 +1217,7 @@ function resolveToolSchemas(tool: McpToolRegistration): ResolvedToolSchemas {
     resolved = {
       inputSchema: storableInput.storable,
       outputSchema: storableOutput.storable,
+      headerSchema,
       authoredInputSchemaJson,
       authoredOutputSchemaJson: authoredSchemaJson(tool, "outputSchema"),
     };
@@ -1566,14 +1582,24 @@ export class McpGateway {
   }
 
   /**
-   * List every tool currently in the registry, raw rows from the
-   * component table. Useful for debugging or building admin UIs.
+   * List every tool currently in the registry, rows from the component
+   * table. Useful for debugging or building admin UIs. `inputSchema` and
+   * `outputSchema` are the resolved internal copies, decoded to objects
+   * even where a deep schema is stored as a JSON string; an encoded value
+   * that does not decode is returned as stored.
    * For the spec-compliant, authorize-filtered catalog that MCP
    * clients see, use the gateway's `tools/list` JSON-RPC method via
    * `handleMcpRequest` instead.
    */
   async listTools(ctx: RunQueryCtx) {
-    return await ctx.runQuery(this.component.registry.listTools, {});
+    const rows = await ctx.runQuery(this.component.registry.listTools, {});
+    return rows.map((row): typeof row => ({
+      ...row,
+      inputSchema: decodeListedSchema(row.inputSchema),
+      ...(row.outputSchema !== undefined
+        ? { outputSchema: decodeListedSchema(row.outputSchema) }
+        : {}),
+    }));
   }
 
   /**

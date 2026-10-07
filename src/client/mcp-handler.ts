@@ -1513,6 +1513,8 @@ function mayAdvertiseOutputSchema(
  * is exactly what they advertised before. A row whose JSON does not parse
  * can only come from a caller writing to the component mutation directly;
  * it falls back too rather than dropping the tool from the catalog.
+ * Throws only when the resolved fallback is itself a JSON-encoded schema
+ * that does not decode.
  */
 function advertisedSchema(
   authoredJson: unknown,
@@ -1528,6 +1530,35 @@ function advertisedSchema(
       toolName,
     );
     return schemaFromStorage(stored);
+  }
+}
+
+/**
+ * The `structuredContent` half of `mayAdvertiseOutputSchema`, for a call
+ * that has already dispatched. A stored output schema that does not decode
+ * is omitted from `tools/list`, so the client was shown no schema and gets
+ * no block; the tool's side effects have run, so this must not throw.
+ */
+function mayShipStructuredContent(
+  tool: RegisteredTool,
+  isStateless: boolean,
+): boolean {
+  try {
+    return mayAdvertiseOutputSchema(
+      advertisedSchema(
+        tool.authoredOutputSchemaJson,
+        tool.outputSchema,
+        tool.name,
+      ),
+      isStateless,
+    );
+  } catch (error) {
+    console.error(
+      "[mcp-gateway] tool has an undecodable stored outputSchema",
+      tool.name,
+      error instanceof Error ? error.message : String(error),
+    );
+    return false;
   }
 }
 
@@ -5608,11 +5639,31 @@ async function handlePost(
           );
         }
         if (decision.allowed) {
-          const advertisedOutputSchema = advertisedSchema(
-            tool.authoredOutputSchemaJson,
-            tool.outputSchema,
-            tool.name,
-          );
+          let advertisedInputSchema: unknown;
+          let advertisedOutputSchema: unknown;
+          try {
+            advertisedInputSchema = advertisedSchema(
+              tool.authoredInputSchemaJson,
+              tool.inputSchema,
+              tool.name,
+            );
+            advertisedOutputSchema = advertisedSchema(
+              tool.authoredOutputSchemaJson,
+              tool.outputSchema,
+              tool.name,
+            );
+          } catch (error) {
+            // Only a row written past the client API can carry an encoded
+            // schema that does not decode. Omitting that one tool keeps
+            // the rest of the list served; a call to it is still answered
+            // (see the tools/call header check and mayShipStructuredContent).
+            console.error(
+              "[mcp-gateway] tool has an undecodable stored schema, omitting it from tools/list",
+              tool.name,
+              error instanceof Error ? error.message : String(error),
+            );
+            continue;
+          }
           visible.push({
             // Spread first so the registry's own columns always win.
             // `protocolMetadata` is stored as `v.any()`, so a caller
@@ -5621,11 +5672,7 @@ async function handlePost(
             ...(tool.protocolMetadata ?? {}),
             name: tool.name,
             description: tool.description,
-            inputSchema: advertisedSchema(
-              tool.authoredInputSchemaJson,
-              tool.inputSchema,
-              tool.name,
-            ),
+            inputSchema: advertisedInputSchema,
             // Only emit `outputSchema` when the tool actually declared
             // one, some MCP clients (Inspector older versions) are
             // strict about the field being absent vs null vs {}. A
@@ -5685,9 +5732,29 @@ async function handlePost(
       }
 
       if (isStateless) {
+        let headerSchema: unknown;
+        try {
+          headerSchema = schemaFromStorage(tool.inputSchema);
+        } catch (error) {
+          // Same server configuration error as the malformed annotation
+          // below, and failing closed for the same reason: the header
+          // bindings this schema declares cannot be checked.
+          console.error(
+            "[mcp-gateway] tool has an undecodable stored inputSchema",
+            tool.name,
+            error instanceof Error ? error.message : String(error),
+          );
+          return statelessErrorResponse(
+            message.id,
+            INTERNAL_ERROR,
+            "Tool input schema is invalid",
+            {},
+            500,
+          );
+        }
         const headerProblem = validateStatelessToolParameterHeaders(
           request,
-          schemaFromStorage(tool.inputSchema),
+          headerSchema,
           message.params?.arguments,
         );
         if (headerProblem) {
@@ -6757,14 +6824,7 @@ async function handlePost(
         // that was not shown a schema rejects a scalar block against its
         // own revision's type. Deciding both with one predicate is what
         // keeps the two halves from contradicting each other.
-        ...(mayAdvertiseOutputSchema(
-          advertisedSchema(
-            tool.authoredOutputSchemaJson,
-            tool.outputSchema,
-            tool.name,
-          ),
-          isStateless,
-        )
+        ...(mayShipStructuredContent(tool, isStateless)
           ? { structuredContent: dispatched.data }
           : {}),
         isError: false,

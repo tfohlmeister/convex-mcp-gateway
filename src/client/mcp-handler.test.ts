@@ -4872,6 +4872,31 @@ describe("structuredContent shape on a dispatch", () => {
     expect(body.result?.structuredContent).toEqual({ total: 2 });
   });
 
+  test("a legacy client sees a JSON-encoded object outputSchema decoded", async () => {
+    // Rows without an authored copy fall back to the stored resolved
+    // schema, and a deep one is stored as a JSON string. Only the decoded
+    // object passes the legacy `type: "object"` check, which decides both
+    // the advertisement and the structuredContent block.
+    const schema = { type: "object", properties: { total: { type: "number" } } };
+    const listComponent = createComponent();
+    const listed = await legacyCall(
+      createCtx(listComponent, [scalarTool(JSON.stringify(schema))]),
+      listComponent,
+      "tools/list",
+    );
+    expect(
+      listed.result?.tools?.find((t) => t.name === "scalar_tool")?.outputSchema,
+    ).toEqual(schema);
+
+    const callComponent = createComponent();
+    const callState = createCtx(callComponent, [
+      scalarTool(JSON.stringify(schema)),
+    ]);
+    callState.setDispatchResult({ ok: true, data: { total: 2 } });
+    const called = await legacyCall(callState, callComponent);
+    expect(called.result?.structuredContent).toEqual({ total: 2 });
+  });
+
   test("an object return still ships structuredContent", async () => {
     const component = createComponent();
     const state = createCtx(component, [
@@ -7212,5 +7237,150 @@ describe("JSON-encoded registry schemas", () => {
       },
     });
     expect(authorized).toBe(true);
+  });
+
+  function corruptTool(overrides: Partial<RegisteredTool>): RegisteredTool {
+    return {
+      name: "corrupt",
+      description: "Corrupt",
+      kind: "query",
+      functionHandle: "handle",
+      inputSchema: { type: "object" },
+      ...overrides,
+    };
+  }
+
+  test("tools/list omits only the tool whose encoded schema does not decode", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    for (const overrides of [
+      { inputSchema: "{not json" },
+      { outputSchema: JSON.stringify("not a schema") },
+    ]) {
+      const component = createComponent();
+      const state = createCtx(component, [
+        corruptTool(overrides),
+        {
+          name: "healthy",
+          description: "Healthy",
+          kind: "query",
+          functionHandle: "handle",
+          inputSchema: { type: "object" },
+        },
+      ]);
+      const response = await handleMcpRequest(
+        state.ctx,
+        statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
+        component,
+        { authorize: async () => ({ allowed: true }) },
+      );
+      expect(response.status).toBe(200);
+      const body = (await readJson(response)) as {
+        result: { tools: { name: string }[] };
+      };
+      expect(body.result.tools.map((t) => t.name)).toEqual(["healthy"]);
+    }
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining("undecodable stored schema"),
+      "corrupt",
+      expect.any(String),
+    );
+    logged.mockRestore();
+  });
+
+  test("an undecodable encoded inputSchema fails the call closed with an envelope", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const component = createComponent();
+    const state = createCtx(component, [corruptTool({ inputSchema: "{not json" })]);
+    let authorized = false;
+    const response = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({
+        id: 1,
+        method: "tools/call",
+        params: { name: "corrupt", arguments: {} },
+      }),
+      component,
+      {
+        authorize: async () => {
+          authorized = true;
+          return { allowed: true };
+        },
+      },
+    );
+    expect(response.status).toBe(500);
+    expect(await readJson(response)).toMatchObject({
+      id: 1,
+      error: { code: -32603, message: "Tool input schema is invalid" },
+    });
+    expect(authorized).toBe(false);
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining("undecodable stored inputSchema"),
+      "corrupt",
+      expect.any(String),
+    );
+    logged.mockRestore();
+  });
+
+  test("a corrupt encoded inputSchema with an authored copy stays listed but fails its calls closed", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const component = createComponent();
+    const state = createCtx(component, [
+      corruptTool({
+        inputSchema: "{not json",
+        authoredInputSchemaJson: JSON.stringify({ type: "object" }),
+      }),
+    ]);
+    const options = { authorize: async () => ({ allowed: true as const }) };
+    const listed = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({ id: 1, method: "tools/list" }),
+      component,
+      options,
+    );
+    expect(await readJson(listed)).toMatchObject({
+      result: { tools: [{ name: "corrupt", inputSchema: { type: "object" } }] },
+    });
+    const called = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({
+        id: 2,
+        method: "tools/call",
+        params: { name: "corrupt", arguments: {} },
+      }),
+      component,
+      options,
+    );
+    expect(called.status).toBe(500);
+    expect(await readJson(called)).toMatchObject({ error: { code: -32603 } });
+    logged.mockRestore();
+  });
+
+  test("an undecodable encoded outputSchema withholds structuredContent instead of throwing after dispatch", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const component = createComponent();
+    const state = createCtx(component, [
+      corruptTool({ outputSchema: "{not json" }),
+    ]);
+    state.setDispatchResult({ ok: true, data: { value: 1 } });
+    const response = await handleMcpRequest(
+      state.ctx,
+      statelessJsonRpcRequest({
+        id: 1,
+        method: "tools/call",
+        params: { name: "corrupt", arguments: {} },
+      }),
+      component,
+      { authorize: async () => ({ allowed: true }) },
+    );
+    expect(response.status).toBe(200);
+    const body = (await readJson(response)) as { result: object };
+    expect(body.result).toMatchObject({ isError: false });
+    expect(body.result).not.toHaveProperty("structuredContent");
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining("undecodable stored outputSchema"),
+      "corrupt",
+      expect.any(String),
+    );
+    logged.mockRestore();
   });
 });

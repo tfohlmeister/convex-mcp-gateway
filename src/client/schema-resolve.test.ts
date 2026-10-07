@@ -688,14 +688,14 @@ describe("deep schema transport and storage", () => {
   }
 
   test.each([5, 6, 7, 11, 30])(
-    "round-trips %i levels with room for catalog wrappers",
+    "round-trips %i levels within the document nesting limit",
     async (levels) => {
       const authored = deepSchema(levels);
       const prepared = prepareSchemaForStorage(authored);
       expect(prepared.problem).toBeUndefined();
-      expect(
-        nesting({ tools: [{ inputSchema: prepared.storable }] }),
-      ).toBeLessThanOrEqual(16);
+      expect(nesting({ inputSchema: prepared.storable })).toBeLessThanOrEqual(
+        16,
+      );
       expect(schemaFromStorage(prepared.storable)).toEqual(authored);
       expect(
         describeToolHeaderSchemaProblem(schemaFromStorage(prepared.storable)),
@@ -704,9 +704,14 @@ describe("deep schema transport and storage", () => {
     },
   );
 
-  test("register and registerTool write deep input/output schemas without changing metadata", async () => {
-    const authored = deepSchema(11);
-    expect(nesting({ outputSchema: authored })).toBe(24);
+  test.each([
+    // Past the document limit (16) but within the argument limit (64).
+    [11, 24],
+    // Past the argument limit too: only encoding before the call fits it.
+    [33, 68],
+  ])("register and registerTool write %i-level input/output schemas without changing metadata", async (levels, rowNesting) => {
+    const authored = deepSchema(levels);
+    expect(nesting({ outputSchema: authored })).toBe(rowNesting);
     const t = convexTest(componentSchema, componentModules);
     const gateway = new McpGateway(componentApi as never);
     const tool = {
@@ -720,8 +725,9 @@ describe("deep schema transport and storage", () => {
       identityArg: "caller",
       metadata: { requiredRole: "validator" },
     } as McpToolRegistration;
-    // convex-test does not model the backend's document nesting limit:
-    // assert the actual boundary payload as well as the stored row.
+    // convex-test does not model the backend's nesting limits: assert
+    // the mutation arguments against Convex's value limit (64) and the
+    // stored row against its document limit (16).
     for (const register of [
       gateway.registerTool.bind(gateway),
       async (
@@ -734,7 +740,7 @@ describe("deep schema transport and storage", () => {
           {
             ...ctx,
             runMutation: async (ref, args) => {
-              expect(nesting(args)).toBeLessThanOrEqual(16);
+              expect(nesting(args)).toBeLessThanOrEqual(64);
               return ctx.runMutation(ref, args);
             },
           },
@@ -751,6 +757,11 @@ describe("deep schema transport and storage", () => {
       expect(stored).toMatchObject({
         identityArg: "caller",
         metadata: tool.metadata,
+      });
+      const listed = await t.run((ctx) => gateway.listTools(ctx));
+      expect(listed.find((row) => row.name === tool.name)).toMatchObject({
+        inputSchema: authored,
+        outputSchema: authored,
       });
     }
   });
