@@ -16,6 +16,7 @@ import {
   buildResourceUrl,
   convexValidatorToJsonSchema,
   prepareSchemaForStorage,
+  schemaFromStorage,
   resolveJsonSchemaBounded,
   resourcePathFromWellKnownRequest,
   SCHEMA_MAX_RESOLVED_BYTES,
@@ -996,7 +997,7 @@ function protocolMetadataField(tool: McpToolRegistration) {
 function assertToolHeaderSchemas(tools: McpToolRegistration[]): void {
   for (const tool of tools) {
     const problem = describeToolHeaderSchemaProblem(
-      resolveToolSchemas(tool).inputSchema,
+      schemaFromStorage(resolveToolSchemas(tool).inputSchema),
     );
     if (problem) {
       throw new Error(
@@ -1100,7 +1101,7 @@ function assertNoUngatedAlias(
 }
 
 type ResolvedToolSchemas = {
-  /** Resolved and stripped of `$` keywords: the gateway's own view. */
+  /** Resolved internal view: object or JSON string for deep schemas. */
   inputSchema: unknown;
   outputSchema: unknown;
   /** Authored verbatim, JSON-encoded: what the client is shown. */
@@ -1127,8 +1128,8 @@ const resolvedSchemaCache = new WeakMap<object, ResolvedToolSchemas>();
 /**
  * Resolve a tool's `inputSchema`/`outputSchema` within the bounded
  * `$ref` budgets, failing loudly with the tool named. The RESOLVED
- * input schema is what gets validated for `x-mcp-header` reachability,
- * stored, and advertised: inlining at registration means the runtime
+ * input schema is validated for `x-mcp-header` reachability and stored
+ * (JSON-encoded when deep): inlining at registration means the runtime
  * `Mcp-Param-*` walk (which does not follow references) sees exactly
  * what was validated here, so an annotation behind a `$ref` can never
  * end up declared-but-silently-unenforced. Schemas without `$ref`s are

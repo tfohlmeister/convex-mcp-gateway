@@ -47,6 +47,7 @@ export default defineSchema({
     description: v.string(),
     kind: toolKindValidator,
     functionHandle: v.string(),
+    /** Resolved schema: legacy object, or JSON string when deeply nested. */
     inputSchema: v.any(),
     /**
      * Optional MCP `outputSchema` (JSON Schema). When set, tools/list
@@ -67,8 +68,8 @@ export default defineSchema({
      *   the gateway's own `Mcp-Param-*` walk and wrong for the wire:
      *   SEP-1613 asks that those keywords reach the client.
      *
-     * So the resolved objects above stay the gateway's internal view and
-     * these carry the client's. Rows written before this field fall back
+     * The resolved schemas above (objects or JSON strings) stay the gateway's
+     * internal view and these carry the client's. Rows written before this field fall back
      * to advertising the resolved form, which is what they did before.
      */
     authoredInputSchemaJson: v.optional(v.string()),

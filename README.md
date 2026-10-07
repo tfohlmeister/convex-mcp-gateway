@@ -246,9 +246,9 @@ Tool schemas may use local `#/$defs/<name>` references: registration
 resolves them within hard budgets (traversal depth 64, one unit per
 nesting level of the schema tree; 64 `$ref` expansions; and 64 KiB of
 UTF-8 in the resolved result; cycles rejected by name) and
-stores/advertises the **inlined**, self-contained schema, so clients
-never need `$ref` support and the runtime `Mcp-Param-*` walk sees exactly
-what registration validated. An `x-mcp-header` annotation authored behind
+stores an **inlined**, self-contained internal copy so the runtime
+`Mcp-Param-*` walk sees exactly what registration validated. `tools/list`
+preserves the authored schema, including its `$defs` and `$ref` keywords. An `x-mcp-header` annotation authored behind
 such a reference therefore works, as long as it lands on a plain
 `properties` chain after inlining.
 
@@ -257,7 +257,7 @@ Resolution is **reachability-driven**: definition containers (`$defs`,
 output, so an unused authoring artefact in a generated bundle (a
 self-referential type, a remote `$ref`, or simply many definitions)
 cannot fail a schema whose resolved form is fine, and the expansion
-budget counts only what ends up advertised. Everything else stays
+budget counts only the resolved internal copy. Everything else stays
 deliberately out: remote (`https:`) references are never fetched, `$ref`
 with adjacent keywords is rejected (2020-12 gives it `allOf` semantics,
 and composition is where static reachability ends), and annotations under
@@ -274,6 +274,12 @@ storage boundary, so a schema declaring a property literally named
 `$ref` is unstorable regardless of how this resolver treats it. Budget or
 resolution failures fail the registration/sync loudly with the tool
 named, never as a per-request error.
+
+Deep resolved schemas are JSON-encoded before crossing the Convex component
+boundary and decoded host-side, avoiding Convex's document nesting limit.
+This does not change the schemas advertised by `tools/list` or header
+validation. Existing object-based registry rows remain readable. See
+[the schema storage details](docs/architecture.md#two-schemas-per-tool).
 
 ### Origin validation
 

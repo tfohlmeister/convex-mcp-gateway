@@ -5,6 +5,7 @@ import {
   isDeliberateConvexError,
   AUTHORIZER_INVALID_SHAPE_REASON,
   parseAuthorizerDecision,
+  schemaFromStorage,
   type McpAuthorizerArgs,
   type McpAuthorizerDecision,
   type McpAuthorizerHandler,
@@ -1518,7 +1519,7 @@ function advertisedSchema(
   stored: unknown,
   toolName: string,
 ): unknown {
-  if (typeof authoredJson !== "string") return stored;
+  if (typeof authoredJson !== "string") return schemaFromStorage(stored);
   try {
     return JSON.parse(authoredJson);
   } catch {
@@ -1526,7 +1527,7 @@ function advertisedSchema(
       "[mcp-gateway] tool has an unparsable authored schema, advertising the resolved one",
       toolName,
     );
-    return stored;
+    return schemaFromStorage(stored);
   }
 }
 
@@ -5686,7 +5687,7 @@ async function handlePost(
       if (isStateless) {
         const headerProblem = validateStatelessToolParameterHeaders(
           request,
-          tool.inputSchema,
+          schemaFromStorage(tool.inputSchema),
           message.params?.arguments,
         );
         if (headerProblem) {

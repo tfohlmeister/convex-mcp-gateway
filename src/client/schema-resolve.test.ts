@@ -8,6 +8,7 @@ import { api as componentApi } from "../component/_generated/api.js";
 import {
   convexValidatorToJsonSchema,
   prepareSchemaForStorage,
+  schemaFromStorage,
   resolveJsonSchemaBounded,
   SCHEMA_MAX_REF_EXPANSIONS,
   SCHEMA_MAX_RESOLVED_BYTES,
@@ -668,5 +669,108 @@ describe("registration stores a schema Convex can hold", () => {
         inputSchema: { type: "object", properties: { "ünï": { type: "string" } } },
       } as unknown as McpToolRegistration),
     ).rejects.toThrow(/"regional_lookup" has an unstorable inputSchema.*"ünï"/);
+  });
+});
+
+describe("deep schema transport and storage", () => {
+  function deepSchema(levels: number): unknown {
+    let schema: unknown = { type: "string", "x-mcp-header": "leaf" };
+    for (let i = 0; i < levels; i++) {
+      schema = { type: "object", properties: { child: schema } };
+    }
+    return schema;
+  }
+
+  function nesting(value: unknown): number {
+    if (value === null || typeof value !== "object") return 0;
+    const children = Array.isArray(value) ? value : Object.values(value);
+    return 1 + Math.max(0, ...children.map(nesting));
+  }
+
+  test.each([5, 6, 7, 11, 30])(
+    "round-trips %i levels with room for catalog wrappers",
+    async (levels) => {
+      const authored = deepSchema(levels);
+      const prepared = prepareSchemaForStorage(authored);
+      expect(prepared.problem).toBeUndefined();
+      expect(
+        nesting({ tools: [{ inputSchema: prepared.storable }] }),
+      ).toBeLessThanOrEqual(16);
+      expect(schemaFromStorage(prepared.storable)).toEqual(authored);
+      expect(
+        describeToolHeaderSchemaProblem(schemaFromStorage(prepared.storable)),
+      ).toBeNull();
+      if (levels >= 6) expect(typeof prepared.storable).toBe("string");
+    },
+  );
+
+  test("register and registerTool write deep input/output schemas without changing metadata", async () => {
+    const authored = deepSchema(11);
+    expect(nesting({ outputSchema: authored })).toBe(24);
+    const t = convexTest(componentSchema, componentModules);
+    const gateway = new McpGateway(componentApi as never);
+    const tool = {
+      name: "deep_tool",
+      description: "Deep",
+      kind: "query" as const,
+      fn: componentApi.registry.listTools,
+      functionReference: {},
+      inputSchema: authored,
+      outputSchema: authored,
+      identityArg: "caller",
+      metadata: { requiredRole: "validator" },
+    } as McpToolRegistration;
+    // convex-test does not model the backend's document nesting limit:
+    // assert the actual boundary payload as well as the stored row.
+    for (const register of [
+      gateway.registerTool.bind(gateway),
+      async (
+        ctx: Parameters<typeof gateway.registerTool>[0],
+        registration: McpToolRegistration,
+      ) => gateway.register(ctx, [registration]),
+    ]) {
+      await t.run(async (ctx) => {
+        await register(
+          {
+            ...ctx,
+            runMutation: async (ref, args) => {
+              expect(nesting(args)).toBeLessThanOrEqual(16);
+              return ctx.runMutation(ref, args);
+            },
+          },
+          tool,
+        );
+      });
+      const stored = await t.query(componentApi.registry.getTool, {
+        name: tool.name,
+      });
+      expect(nesting(stored)).toBeLessThanOrEqual(16);
+      expect(schemaFromStorage(stored!.inputSchema)).toEqual(authored);
+      expect(schemaFromStorage(stored!.outputSchema)).toEqual(authored);
+      expect(JSON.parse(stored!.authoredOutputSchemaJson!)).toEqual(authored);
+      expect(stored).toMatchObject({
+        identityArg: "caller",
+        metadata: tool.metadata,
+      });
+    }
+  });
+
+  test("deep serialized schemas keep the existing UTF-8 size budget", () => {
+    const schema = deepSchema(11) as Record<string, unknown>;
+    schema.description = "è".repeat(SCHEMA_MAX_RESOLVED_BYTES);
+    expect(prepareSchemaForStorage(schema).problem).toMatch(/size budget/);
+  });
+
+  test("legacy objects still decode unchanged and corrupt strings fail closed", () => {
+    const schema = { type: "object" };
+    expect(schemaFromStorage(schema)).toBe(schema);
+    expect(schemaFromStorage(false)).toBe(false);
+    expect(() => schemaFromStorage("invalid-json")).toThrow();
+    expect(() => schemaFromStorage("123")).toThrow(
+      /expected an object or boolean/,
+    );
+    expect(() => schemaFromStorage(JSON.stringify("not a schema"))).toThrow(
+      /expected an object or boolean/,
+    );
   });
 });

@@ -893,7 +893,7 @@ export const SCHEMA_MAX_RESOLVED_BYTES = 64 * 1024;
  * behavior change (new supported ref position, different budget
  * accounting, changed drop rules).
  */
-export const SCHEMA_RESOLVER_VERSION = 3;
+export const SCHEMA_RESOLVER_VERSION = 4;
 
 const LOCAL_DEFS_REF = /^#\/\$defs\/(.+)$/;
 
@@ -1282,7 +1282,8 @@ const PROPERTY_NAME_KEYWORDS = new Set([
 const STORAGE_MAX_JSON_DEPTH = SCHEMA_MAX_STRUCTURAL_DEPTH * 2;
 
 /**
- * Make a resolved schema storable as a Convex object.
+ * Make a resolved schema safe for Convex storage and function transport.
+ * Deep schemas are JSON-encoded strings; decode them host-side on read.
  *
  * Convex reserves field names beginning with `$`, which is fatal for a
  * schema that declares its dialect: the write throws from inside Convex
@@ -1306,6 +1307,7 @@ export function prepareSchemaForStorage(schema: unknown): {
   problem?: string;
 } {
   let problem: string | null = null;
+  let containerDepth = 0;
 
   function fail(key: string, path: string, reason: string): undefined {
     problem ??=
@@ -1324,6 +1326,9 @@ export function prepareSchemaForStorage(schema: unknown): {
     if (depth > STORAGE_MAX_JSON_DEPTH) {
       problem = `schema exceeds the storage depth budget (${STORAGE_MAX_JSON_DEPTH})`;
       return undefined;
+    }
+    if (node !== null && typeof node === "object") {
+      containerDepth = Math.max(containerDepth, depth + 1);
     }
     if (Array.isArray(node)) {
       return node.map((item, index) =>
@@ -1359,7 +1364,37 @@ export function prepareSchemaForStorage(schema: unknown): {
   }
 
   const storable = walk(schema, 0, "", false);
-  return problem !== null ? { problem } : { storable };
+  if (problem !== null) return { problem };
+  // Convex's document limit is 16 containers. A replaceTools call adds
+  // args -> tools array -> tool row, and listTools adds an array on read.
+  // Reserve those wrappers before sending the schema across the boundary;
+  // encoding only inside the mutation is too late for argument validation.
+  if (containerDepth > 12) {
+    const json = JSON.stringify(storable);
+    const size = utf8ByteLength(json);
+    if (size > SCHEMA_MAX_RESOLVED_BYTES) {
+      return {
+        problem: `stored schema exceeds the size budget (${size} > ${SCHEMA_MAX_RESOLVED_BYTES} UTF-8 bytes)`,
+      };
+    }
+    return { storable: json };
+  }
+  return { storable };
+}
+
+/**
+ * Decode only on the host side, after the Convex query has returned.
+ * JSON Schema roots are objects or booleans, so strings unambiguously
+ * identify this storage representation. Existing object rows stay valid.
+ * Malformed encoded rows fail closed instead of skipping header checks.
+ */
+export function schemaFromStorage(stored: unknown): unknown {
+  if (typeof stored !== "string") return stored;
+  const decoded: unknown = JSON.parse(stored);
+  if (!isRecord(decoded) && typeof decoded !== "boolean") {
+    throw new Error("Invalid JSON-encoded registry schema: expected an object or boolean");
+  }
+  return decoded;
 }
 
 /**
