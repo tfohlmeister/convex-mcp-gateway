@@ -247,10 +247,11 @@ resolves them within hard budgets (traversal depth 64, one unit per
 nesting level of the schema tree; 64 `$ref` expansions; and 64 KiB of
 UTF-8 in the resolved result; cycles rejected by name) and
 stores an **inlined**, self-contained internal copy so the runtime
-`Mcp-Param-*` walk sees exactly what registration validated. `tools/list`
-preserves the authored schema, including its `$defs` and `$ref` keywords. An `x-mcp-header` annotation authored behind
-such a reference therefore works, as long as it lands on a plain
-`properties` chain after inlining.
+`Mcp-Param-*` walk sees exactly what registration validated. An
+`x-mcp-header` annotation authored behind such a reference therefore
+works, as long as it lands on a plain `properties` chain after inlining.
+`tools/list` still serves the authored schema, including its `$defs` and
+`$ref` keywords.
 
 Resolution is **reachability-driven**: definition containers (`$defs`,
 `definitions`) are pulled from only when referenced and dropped from the
@@ -277,8 +278,12 @@ named, never as a per-request error.
 
 Deep resolved schemas are JSON-encoded before crossing the Convex component
 boundary and decoded host-side, avoiding Convex's document nesting limit.
-This does not change the schemas advertised by `tools/list` or header
-validation. Existing object-based registry rows remain readable. See
+This does not change the schemas advertised by `tools/list`, header
+validation, or what `gateway.listTools()` returns. Existing object-based
+registry rows remain readable. Versions before this encoding do not decode
+it: after a downgrade, re-register tools with deep schemas that were
+registered imperatively (`register`/`registerTool`), or their
+`Mcp-Param-*` bindings go unchecked. See
 [the schema storage details](docs/architecture.md#two-schemas-per-tool).
 
 ### Origin validation

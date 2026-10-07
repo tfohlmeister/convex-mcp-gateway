@@ -498,17 +498,32 @@ authored schema ─┬─ JSON string ──────────► tools/li
                  └─ resolve $ref ─► strip $ ─► object or JSON string ─► decode ─► Mcp-Param-* walk
 ```
 
-Convex limits stored documents to 16 container levels. Reference expansion
-can exceed that even when the authored schema is shallow. Resolved schemas
-with more than 12 levels therefore cross the component boundary as JSON
-strings, leaving room for the catalog's argument and result wrappers. The
-host decodes them after the registry query, before header enforcement or
-advertising a resolved fallback. Encoding happens before the mutation call,
-so deeply nested schemas are safe in its arguments as well as in storage.
-The existing UTF-8 byte and traversal budgets still apply. Existing object
-rows remain readable without a backfill; invalid encoded rows fail closed.
-Raw registry queries expose this storage representation, while MCP clients
-continue to receive JSON Schema objects (or boolean schemas).
+Convex limits stored documents to 16 container levels (other values,
+including function arguments, to 64). Reference expansion can exceed that
+even when the authored schema is shallow. Resolved schemas with more than
+12 levels are therefore stored as JSON strings, which leaves room for the
+row object around them. Encoding happens before the mutation call, so a
+schema past 64 levels (the storage budget allows 128) is safe in its
+arguments too. The host decodes the string after the registry query,
+before header enforcement, advertising a resolved fallback, or returning
+rows from `gateway.listTools()`. The existing UTF-8 byte and traversal
+budgets still apply, and existing object rows remain readable without a
+backfill.
+
+An encoded row that does not decode can only come from a write past the
+client API, and it is only read where the row has no usable authored
+copy, or for the header walk. A stateless `tools/call` then answers a
+JSON-RPC internal error before authorization, whether or not the tool is
+listed. Without an authored copy, `tools/list` omits that one tool and a
+call that already dispatched ships no `structuredContent`. Querying the
+component directly still shows the storage representation.
+
+Versions before this encoding read the string as a schema without
+properties. After a downgrade, a declarative catalog re-syncs under the
+older resolver version: schemas shallow enough to store as objects are
+rewritten, deeper ones fail the sync loudly. Tools registered
+imperatively keep their encoded rows and lose `Mcp-Param-*` enforcement
+until they are registered again.
 
 Rows written before the authored field exists advertise the resolved
 copy, exactly as they did before; bumping the resolver version re-syncs
