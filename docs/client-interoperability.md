@@ -1,4 +1,4 @@
-# Client interoperability: Claude, Codex, and transports
+# Client interoperability: Claude Code, Claude Desktop, Codex, and transports
 
 ## Transport
 
@@ -20,11 +20,11 @@ and [gateway transport behavior](./architecture.md#mcp-streamable-http-transport
 
 ## Three URLs with different jobs
 
-| URL                         | Job                                             | Example                             |
-| --------------------------- | ----------------------------------------------- | ----------------------------------- |
-| MCP endpoint                | Receives tool requests                          | `https://api.example.com/mcp/codex` |
-| Resource identifier         | Identifies the protected API and token audience | `https://api.example.com/mcp`       |
-| Authorization-server issuer | Identifies the login/token provider             | `https://id.example.com`            |
+| URL                         | Job                                             | Example                       |
+| --------------------------- | ----------------------------------------------- | ----------------------------- |
+| MCP endpoint                | Receives tool requests                          | `https://api.example.com/mcp` |
+| Resource identifier         | Identifies the protected API and token audience | `https://api.example.com/mcp` |
+| Authorization-server issuer | Identifies the login/token provider             | `https://id.example.com`      |
 
 An alias may expose the same protected resource at another endpoint. Keep its
 discovery metadata, authorization request, and audience validation consistent.
@@ -40,8 +40,24 @@ Use [OAuth setup](./oauth.md) with `authServerUrl` pointing at the IdP. Configur
 
 The gateway's bridge defaults to its own origin as metadata `issuer`. Overriding
 that to an upstream origin is a legacy OIDC-client workaround, not a generally
-compatible setup. Codex 0.153.4 rejects the resulting metadata-origin mismatch
-before login. See [bridge issuer pitfalls](./oauth-bridge.md#issuer-mismatch-with-upstream-token-claims).
+compatible setup. Clients built on a current MCP SDK reject the resulting
+metadata-origin mismatch before login: Codex 0.153.4, and `mcp-remote` 0.14.3
+with `IssuerMismatchError ... (RFC 8414 §3.3)`. Claude Code 2.1.29x stores an
+issuer with every MCP credential and logs `SEP-2352` for credentials without
+one. See [bridge issuer pitfalls](./oauth-bridge.md#issuer-mismatch-with-upstream-token-claims).
+
+Keeping the bridge's own origin as issuer does not help with an IdP that sends
+RFC 9207's `iss` parameter in the authorization response
+(`authorization_response_iss_parameter_supported: true`, as Pocket-ID does):
+current SDK clients compare that `iss` with the metadata issuer too, and the
+IdP names itself. With such an IdP, direct discovery is the only setup that
+passes both checks.
+
+`serveProtectedResourceMetadata` does not advertise `scopes_supported`. If the
+IdP refuses an authorization request without `scope` (Pocket-ID does), serve
+the protected-resource document from the host with `scopes_supported`, as in
+the alias recipe below; clients then request exactly those scopes. Include
+`offline_access` when the IdP issues refresh tokens only for it.
 
 Neither direct discovery nor the bridge replaces token validation. In
 particular, an IdP userinfo response alone does not bind a token to this MCP
@@ -102,35 +118,98 @@ correct resource. Codex 0.153.4 was observed to send two `resource` parameters
 in this configuration, causing Pocket-ID to reject the request with
 `invalid_target: Only a single 'resource' parameter is supported`.
 
-## Claude Code and claude.ai
+## Claude Code
 
-For an existing bridge-backed deployment:
+With direct discovery, give Claude Code the pre-registered client:
 
 ```sh
-claude mcp add --scope user --transport http example https://api.example.com/mcp
+claude mcp add --scope user --transport http \
+  --client-id YOUR_PUBLIC_PKCE_CLIENT_ID \
+  example https://api.example.com/mcp
 claude mcp login example
 claude mcp get example
 ```
 
-Complete login in an interactive terminal/browser. In claude.ai, keep the
-existing connector URL `https://api.example.com/mcp`. Its remote connector is
+`claude mcp login` needs an interactive terminal; it refuses when stdin is not
+a TTY. Claude Code's callback is `http://localhost:<random port>/callback`, so
+the IdP must accept a loopback callback with a variable port
+(`--callback-port` fixes the port where it does not). It requests the
+protected-resource document's `scopes_supported`. Without `--client-id` it
+looks for a registration endpoint and fails against an IdP without dynamic
+client registration.
+
+For an existing bridge-backed deployment, the same commands without
+`--client-id` register through the bridge's DCR endpoint.
+
+## claude.ai
+
+claude.ai remote connectors are opened from Anthropic's cloud, not from the
+user's machine, so they only reach a publicly routable endpoint. Keep an
+existing connector's URL `https://api.example.com/mcp`. Its remote connector is
 not automatically a local Claude Code configuration entry.
+
+## Claude Desktop
+
+Claude Desktop's custom connector dialog is the same cloud-side connector as
+claude.ai. For an endpoint on a private network, register a local stdio server
+in `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/`) that bridges to Streamable HTTP with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "example": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://api.example.com/mcp",
+        "--host",
+        "127.0.0.1",
+        "--callback-path",
+        "/callback",
+        "--static-oauth-client-info",
+        "{\"client_id\": \"YOUR_PUBLIC_PKCE_CLIENT_ID\"}"
+      ]
+    }
+  }
+}
+```
+
+`--static-oauth-client-info` skips dynamic client registration; `--host` and
+`--callback-path` make the callback `http://127.0.0.1:<port>/callback`, so one
+loopback callback registration at the IdP serves Codex and Claude Desktop. The
+port is derived from the server URL. Restart the app; `mcp-remote` opens the
+login in the browser and keeps tokens in `~/.mcp-auth/`. Its log is
+`~/Library/Logs/Claude/mcp-server-example.log`. On macOS the app asks once for
+local network access; without it the log shows `EHOSTUNREACH`. Use an absolute
+`command` path, or set `PATH` in the entry's `env`, when `npx` comes from a
+version manager the app does not see.
 
 ## Verification and troubleshooting
 
-The host recipe above was verified on 2026-09-07 with Codex 0.153.4 and Pocket-ID:
+The alias recipe was verified on 2026-09-07 with Codex 0.153.4 and Pocket-ID:
 Codex completed OAuth and loaded 15 tools, and Claude Code completed a fresh
-bridge-backed login and reported Connected. The existing claude.ai bridge was
-preserved; that browser client's session was not separately retested.
+bridge-backed login and reported Connected.
 
-| Symptom                               | Check                                                          |
-| ------------------------------------- | -------------------------------------------------------------- |
-| 404 before login                      | Stale deployment URL or missing metadata route                 |
-| Issuer does not match metadata origin | Upstream issuer override on a bridge-hosted document           |
-| `invalid_target`, duplicate resource  | Redundant Codex `oauth_resource` override                      |
-| Invalid callback                      | Exact callback host/path and variable loopback port acceptance |
-| Login succeeds, MCP returns 401       | Token validity and canonical resource audience                 |
-| GET returns 405                       | Expected: this gateway has no persistent GET SSE channel       |
+Direct discovery on a single endpoint, without the bridge, was verified on
+2026-10-13 with Pocket-ID 2.14: Claude Code 2.1.29x with `--client-id`,
+Claude Desktop through `mcp-remote` 0.14.3, and Codex each logged in and
+called tools; Claude Code received a refresh token for `offline_access`.
+
+| Symptom                                        | Check                                                           |
+| ---------------------------------------------- | --------------------------------------------------------------- |
+| 404 before login                               | Stale deployment URL or missing metadata route                  |
+| Issuer does not match metadata origin          | Upstream issuer override on a bridge-hosted document            |
+| `IssuerMismatchError` (`mcp-remote`)           | Same; use direct discovery                                      |
+| "does not support dynamic client registration" | Missing client id (`--client-id`, `--static-oauth-client-info`) |
+| IdP: "Scope is required"                       | `scopes_supported` missing from the protected-resource document |
+| `EHOSTUNREACH` from Claude Desktop             | macOS local network permission for the app                      |
+| `invalid_target`, duplicate resource           | Redundant Codex `oauth_resource` override                       |
+| Invalid callback                               | Exact callback host/path and variable loopback port acceptance  |
+| Login succeeds, MCP returns 401                | Token validity and canonical resource audience                  |
+| GET returns 405                                | Expected: this gateway has no persistent GET SSE channel        |
 
 Verify discovery, anonymous 401 challenges, authentication, and tool loading
 separately. Start a fresh client session after changing configuration if its

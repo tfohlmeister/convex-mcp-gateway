@@ -262,7 +262,8 @@ overrides: {
 
 **Do not apply this override as a general recommendation.** It makes discovery
 inconsistent: Codex 0.153.4 rejects it before opening the login page with
-`OAuth authorization server issuer does not match authorization metadata origin`.
+`OAuth authorization server issuer does not match authorization metadata origin`,
+and `mcp-remote` 0.14.3 with `IssuerMismatchError` (RFC 8414 §3.3).
 Changing HTTP to another transport does not fix that OAuth error.
 
 Prefer direct discovery of the upstream authorization server when clients can
