@@ -22,8 +22,8 @@ import { action, mutation, query } from "./_generated/server.js";
  * mount when `MCP_CONFORMANCE=1`, see the switch in `http.ts`.
  *
  * ```sh
- * npx convex env set MCP_CONFORMANCE 1   # then redeploy
- * npx @modelcontextprotocol/conformance server --url <site-url>/mcp
+ * pnpm exec convex env set MCP_CONFORMANCE 1   # then redeploy
+ * pnpm dlx @modelcontextprotocol/conformance server --url <site-url>/mcp
  * ```
  *
  * Kept out of `mcp.ts` on purpose: `test_*` tools teach a reader nothing

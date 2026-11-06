@@ -441,7 +441,7 @@ when you want to iterate without touching a real deployment:
 ```sh
 pnpm local:start                      # in one shell
 # in another shell:
-npx convex dev --once
+pnpm exec convex dev --once
 # No registration step: the example's /mcp/ mount declares `tools`, so
 # the registry syncs on the initialize below.
 SESSION=$(curl -sSD - -X POST http://127.0.0.1:3311/mcp/ \

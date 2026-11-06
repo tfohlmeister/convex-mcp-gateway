@@ -17,9 +17,11 @@
     {
       "matchDepTypes": ["devDependencies"],
       "automerge": true
+    },
+    {
+      "description": "pnpm is pinned to its major only (devEngines.packageManager ^12); the exact version lives in pnpm-lock.yaml (packageManagerDependencies) and moves with lock file maintenance. replace keeps ^12 as written and opens a PR only when a new major falls outside it.",
+      "matchDepTypes": ["devEngines.packageManager"],
+      "rangeStrategy": "replace"
     }
-  ],
-  "constraints": {
-    "pnpm": "^10"
-  }
+  ]
 }

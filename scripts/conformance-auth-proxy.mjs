@@ -17,7 +17,7 @@
  *
  * ```sh
  * pnpm conformance:proxy                       # in one shell
- * npx @modelcontextprotocol/conformance@alpha server \
+ * pnpm dlx @modelcontextprotocol/conformance@alpha server \
  *   --url http://127.0.0.1:3399/mcp --requirements 2026-07-28
  * ```
  *

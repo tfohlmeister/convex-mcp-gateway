@@ -181,8 +181,8 @@ const resolveIdentity = async (token: string) => {
  * running the official MCP conformance suite against this deployment:
  *
  * ```sh
- * npx convex env set MCP_CONFORMANCE 1   # then redeploy
- * npx @modelcontextprotocol/conformance server --url <site-url>/mcp
+ * pnpm exec convex env set MCP_CONFORMANCE 1   # then redeploy
+ * pnpm dlx @modelcontextprotocol/conformance server --url <site-url>/mcp
  * ```
  *
  * A switch rather than a second mount, and that is forced rather than
