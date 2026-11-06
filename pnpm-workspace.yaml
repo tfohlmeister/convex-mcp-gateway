@@ -15,7 +15,13 @@ allowBuilds:
 #                   `vite` / `vitest`.
 #   brace-expansion DoS via exponential-time expansion. Enters via
 #                   `minimatch` under `eslint`.
+#   minimatch       GHSA-g3hv-75wg-m249, fixed only in minimatch 11.
+#                   `eslint`, `@eslint/config-array` and
+#                   `@typescript-eslint/typescript-estree` still declare
+#                   ^10, so only that line is lifted. Remove once they
+#                   accept ^11.
 overrides:
   ws: ^8.21.3
   postcss: ^8.5.26
   brace-expansion: ^5.0.9
+  "minimatch@^10": ^11.0.1
