@@ -325,12 +325,12 @@ pnpm local:start
 npx convex dev --once
 npx convex run mcp:registerDefaults
 # Terminal 3: smoke tests
-npx @modelcontextprotocol/inspector --cli \
+pnpm dlx @modelcontextprotocol/inspector --cli \
   http://127.0.0.1:3311/mcp/ \
   --transport http \
   --method tools/list
 
-npx @modelcontextprotocol/inspector --cli \
+pnpm dlx @modelcontextprotocol/inspector --cli \
   http://127.0.0.1:3311/mcp/ \
   --transport http \
   --method tools/call \
@@ -361,7 +361,8 @@ an agent runtime, or any chat app that speaks MCP over Streamable
 HTTP):
 
 1. Deploy the playground (or your host) to a Convex project that has a
-   reachable HTTPS URL (`npx convex deploy`).
+   reachable HTTPS URL (`pnpm exec convex deploy` in the playground,
+   `npx convex deploy` in an npm-based host).
 2. In the client's MCP-server configuration, add an HTTP-transport
    entry pointing at `https://<your-deployment>.convex.site/mcp/`.
    The exact UI varies by client (config file, settings panel, or

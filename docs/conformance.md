@@ -11,8 +11,8 @@ handler-level tests.
 The example app serves a fixture catalog when `MCP_CONFORMANCE=1`:
 
 ```sh
-npx convex env set MCP_CONFORMANCE 1
-npx convex dev --once                    # redeploy with the switch on
+pnpm exec convex env set MCP_CONFORMANCE 1
+pnpm exec convex dev --once  # redeploy with the switch on
 ```
 
 The suite scores against one spec revision at a time, and this gateway
@@ -20,19 +20,19 @@ serves two eras, so both runs matter:
 
 ```sh
 # The 2026-07-28 wire: stateless, MRTR, caching, routing headers, tasks.
-npx @modelcontextprotocol/conformance@alpha server \
+pnpm dlx @modelcontextprotocol/conformance@alpha server \
   --url <site-url>/mcp --requirements 2026-07-28
 
 # The session era.
-npx @modelcontextprotocol/conformance@alpha server \
+pnpm dlx @modelcontextprotocol/conformance@alpha server \
   --url <site-url>/mcp --requirements 2025-11-25
 
 # One scenario, with the raw JSON:
-npx @modelcontextprotocol/conformance@alpha server \
+pnpm dlx @modelcontextprotocol/conformance@alpha server \
   --url <site-url>/mcp --scenario tools-call-simple-text --verbose
 
 # Per-check results as files, which is what the tables below were read from:
-npx @modelcontextprotocol/conformance@alpha server \
+pnpm dlx @modelcontextprotocol/conformance@alpha server \
   --url <site-url>/mcp --requirements 2026-07-28 -o ./conformance-out
 ```
 
@@ -42,7 +42,7 @@ the time of writing) defines 32 server scenarios, none of them tagged
 defines 62, and `--requirements 2026-07-28` freezes the 37 that revision
 requires. `conformance list --requirements 2026-07-28` prints the set.
 
-Turn it off again with `npx convex env remove MCP_CONFORMANCE` and
+Turn it off again with `pnpm exec convex env remove MCP_CONFORMANCE` and
 redeploy, or the example serves `test_*` tools instead of the invoice
 ones.
 
@@ -145,7 +145,7 @@ it and the scenarios above run for real.
 pnpm conformance:proxy    # in one shell, defaults to the example's
                           # valid-admin-token fixture
 
-npx @modelcontextprotocol/conformance@alpha server \
+pnpm dlx @modelcontextprotocol/conformance@alpha server \
   --url http://127.0.0.1:3399/mcp --requirements 2026-07-28
 ```
 

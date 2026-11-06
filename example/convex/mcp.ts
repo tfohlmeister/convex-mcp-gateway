@@ -352,7 +352,7 @@ export const prompts: McpPromptProvider[] = [
  * to `handleMcpRequest` do not need to run this.
  *
  * ```sh
- * npx convex run mcp:registerDefaults
+ * pnpm exec convex run mcp:registerDefaults
  * ```
  */
 export const registerDefaults = internalMutation({

@@ -83,5 +83,8 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
+      # pnpm publishes natively and performs the trusted-publishing OIDC
+      # token exchange itself. npm cannot run here: it rejects the
+      # `devEngines.packageManager: pnpm` declaration in package.json.
       - name: Publish to npm
         run: pnpm publish --no-git-checks --provenance --access public --tag latest
